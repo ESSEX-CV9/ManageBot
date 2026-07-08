@@ -1,0 +1,11 @@
+node_modules/
+dist/
+data/
+.env
+src/commands/debugPermissions.js
+.vscode/settings.json
+temp/
+.limcode/
+.claude/
+
+docs/

@@ -1,0 +1,27 @@
+{
+  "compilerOptions": {
+    // 编译目标：Node 18+ 支持的现代语法
+    "target": "ES2022",
+    "lib": ["ES2022"],
+
+    // 输出 CommonJS（与 require 生态、better-sqlite3、__dirname 无缝兼容）
+    "module": "CommonJS",
+    "moduleResolution": "node",
+
+    // 源码在 src/，编译结果输出到 dist/
+    "rootDir": "src",
+    "outDir": "dist",
+
+    // 严格模式：尽早在编辑器里发现类型错误
+    "strict": true,
+
+    // 常用互操作/便利项
+    "esModuleInterop": true,
+    "forceConsistentCasingInFileNames": true,
+    "resolveJsonModule": true,
+    "skipLibCheck": true,
+    "sourceMap": true
+  },
+  "include": ["src/**/*"],
+  "exclude": ["node_modules", "dist"]
+}
