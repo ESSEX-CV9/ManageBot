@@ -16,7 +16,7 @@ import type { Command } from '../../../core/types';
 import { canManageElection, isElectionTestMode } from '../services/electionPermission';
 import { buildConfigHub } from '../components/electionConfig';
 import { buildEntryMessage } from '../components/electionRound';
-import { openVoting, settleRound, publishPending } from '../services/electionRunner';
+import { openPublicity, openVoting, settleRound, publishPending, disqualifyCandidate, restoreCandidate } from '../services/electionRunner';
 import {
     getSettings,
     syncPool,
@@ -36,6 +36,7 @@ import { resolveNames, nameTag } from '../services/nameResolver';
 
 const STATUS_LABEL: Record<RoundStatus, string> = {
     nominating: '自荐中',
+    publicity: '公示中',
     voting: '投票中',
     pending_confirm: '待确认公示',
     closed: '已结束',
@@ -59,7 +60,8 @@ const data = new SlashCommandBuilder()
             .addStringOption(o => o.setName('标题').setDescription('空位/职位名称').setRequired(true))
             .addIntegerOption(o => o.setName('空位数').setDescription('录取名额，同时是每票最多可选数').setRequired(true).setMinValue(1).setMaxValue(25))
             .addNumberOption(o => o.setName('自荐时长小时').setDescription('自荐阶段持续小时数').setRequired(true).setMinValue(0.1))
-            .addNumberOption(o => o.setName('投票时长小时').setDescription('自荐截止后投票持续小时数').setRequired(true).setMinValue(0.1))
+            .addNumberOption(o => o.setName('投票时长小时').setDescription('公示截止后投票持续小时数').setRequired(true).setMinValue(0.1))
+            .addNumberOption(o => o.setName('公示时长天数').setDescription('自荐截止后的公示/审核期天数，默认 3').setRequired(false).setMinValue(0))
             .addBooleanOption(o => o.setName('启用大众投票').setDescription('默认取配置值'))
             .addBooleanOption(o => o.setName('启用管理投票').setDescription('默认取配置值')))
     .addSubcommand(sub =>
@@ -73,8 +75,23 @@ const data = new SlashCommandBuilder()
     .addSubcommand(sub =>
         sub.setName('列表').setDescription('列出进行中的募选'))
     .addSubcommand(sub =>
+        sub.setName('打回')
+            .setDescription('（公示期）打回某候选人，取消其本场参选资格并私信通知')
+            .addIntegerOption(o => o.setName('场次id').setDescription('募选编号').setRequired(true))
+            .addUserOption(o => o.setName('用户').setDescription('要打回的候选人').setRequired(true))
+            .addStringOption(o => o.setName('理由').setDescription('打回理由（会私信告知本人）').setRequired(false)))
+    .addSubcommand(sub =>
+        sub.setName('恢复')
+            .setDescription('（公示期）恢复某被打回候选人的参选资格并私信通知')
+            .addIntegerOption(o => o.setName('场次id').setDescription('募选编号').setRequired(true))
+            .addUserOption(o => o.setName('用户').setDescription('要恢复的候选人').setRequired(true)))
+    .addSubcommand(sub =>
+        sub.setName('开启公示')
+            .setDescription('（手动）立即结束自荐，进入公示期')
+            .addIntegerOption(o => o.setName('场次id').setDescription('募选编号').setRequired(true)))
+    .addSubcommand(sub =>
         sub.setName('开启投票')
-            .setDescription('（手动）立即结束自荐并开启投票')
+            .setDescription('（手动）立即结束公示并开启投票')
             .addIntegerOption(o => o.setName('场次id').setDescription('募选编号').setRequired(true)))
     .addSubcommand(sub =>
         sub.setName('结算')
@@ -222,9 +239,11 @@ const command: Command = {
             const vacancy = interaction.options.getInteger('空位数', true);
             const nominateHours = interaction.options.getNumber('自荐时长小时', true);
             const voteHours = interaction.options.getNumber('投票时长小时', true);
+            const publicityDays = interaction.options.getNumber('公示时长天数') ?? 3;
             const now = Date.now();
             const nominateDeadline = now + Math.round(nominateHours * 3600_000);
-            const voteDeadline = nominateDeadline + Math.round(voteHours * 3600_000);
+            const publicityDeadline = nominateDeadline + Math.round(publicityDays * 86400_000);
+            const voteDeadline = publicityDeadline + Math.round(voteHours * 3600_000);
 
             await interaction.deferReply({ flags: MessageFlags.Ephemeral });
 
@@ -251,6 +270,7 @@ const command: Command = {
                 title,
                 createdBy: interaction.user.id,
                 nominateDeadline,
+                publicityDeadline,
                 voteDeadline,
                 enablePublic,
                 enableAdmin,
@@ -276,7 +296,9 @@ const command: Command = {
             }
 
             return interaction.editReply(
-                `✅ 已发起募选 **#${roundId}｜${title}**（空位 ${vacancy}），自荐面板已发到 ${entryChannel.toString()}。\n${sent.url}${poolNote}`,
+                `✅ 已发起募选 **#${roundId}｜${title}**（空位 ${vacancy}），自荐面板已发到 ${entryChannel.toString()}。\n`
+                + `⏳ 自荐截止 <t:${Math.floor(nominateDeadline / 1000)}:R> → 公示 ${publicityDays} 天（可打回候选人）→ 投票截止 <t:${Math.floor(voteDeadline / 1000)}:R>\n`
+                + `${sent.url}${poolNote}`,
             );
         }
 
@@ -323,36 +345,60 @@ const command: Command = {
             const nomNames = await resolveNames(interaction.guild, noms.map(n => n.userId));
             const lines = noms.map((n, i) => {
                 const preview = (n.statement ?? '').replace(/\s+/g, ' ').slice(0, 60);
-                return `${i + 1}. ${nameTag(nomNames, n.userId)}${preview ? `｜${preview}${(n.statement ?? '').length > 60 ? '…' : ''}` : ''}`;
+                const tag = n.rejected ? '🚫【已打回】' : '';
+                const reason = n.rejected && n.rejectReason ? `（理由：${n.rejectReason}）` : '';
+                return `${i + 1}. ${tag}${nameTag(nomNames, n.userId)}${preview ? `｜${preview}${(n.statement ?? '').length > 60 ? '…' : ''}` : ''}${reason}`;
             });
-            const header = `📋 **募选 #${id}｜${round.title} 自荐名单（${noms.length} 人）**\n`;
+            const activeCount = noms.filter(n => !n.rejected).length;
+            const rejectedCount = noms.length - activeCount;
+            const header = `📋 **募选 #${id}｜${round.title} 自荐名单（有效 ${activeCount} 人${rejectedCount ? `，已打回 ${rejectedCount} 人` : ''}）**\n`;
             return interaction.editReply(header + lines.join('\n').slice(0, 1800));
         }
 
         // ---- 列表 ----
         if (sub === '列表') {
-            const rounds = listRounds(guildId, ['nominating', 'voting', 'pending_confirm']);
+            const rounds = listRounds(guildId, ['nominating', 'publicity', 'voting', 'pending_confirm']);
             if (!rounds.length) {
                 return interaction.reply({ content: '当前没有进行中的募选。', flags: MessageFlags.Ephemeral });
             }
             const lines = rounds.map(r => {
                 const stage = r.status === 'nominating'
                     ? `自荐截止 <t:${Math.floor(r.nominateDeadline / 1000)}:R>`
-                    : `投票截止 <t:${Math.floor(r.voteDeadline / 1000)}:R>`;
+                    : r.status === 'publicity'
+                        ? `公示截止 <t:${Math.floor(r.publicityDeadline / 1000)}:R>`
+                        : `投票截止 <t:${Math.floor(r.voteDeadline / 1000)}:R>`;
                 return `**#${r.id}** ${r.title}｜${STATUS_LABEL[r.status]}｜空位 ${r.vacancyCount}｜自荐 ${countNominations(r.id)} 人｜${stage}`;
             });
             return interaction.reply({ content: `🗳️ **进行中的募选**\n${lines.join('\n')}`, flags: MessageFlags.Ephemeral });
         }
 
-        // ---- 开启投票 / 结算 / 公示（手动触发 runner） ----
-        if (sub === '开启投票' || sub === '结算' || sub === '公示') {
+        // ---- 打回 / 恢复（公示期，针对单个候选人） ----
+        if (sub === '打回' || sub === '恢复') {
+            const id = interaction.options.getInteger('场次id', true);
+            const round = getRound(id);
+            if (!round || round.guildId !== guildId) {
+                return interaction.reply({ content: `❌ 未找到募选 #${id}。`, flags: MessageFlags.Ephemeral });
+            }
+            const target = interaction.options.getUser('用户', true);
+            await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+            const res = sub === '打回'
+                ? await disqualifyCandidate(interaction.client, round, target.id, interaction.user.id, interaction.options.getString('理由'))
+                : await restoreCandidate(interaction.client, round, target.id);
+            return interaction.editReply(res.ok ? `✅ ${target.toString()}：${res.message}` : `⚠️ ${res.message}`);
+        }
+
+        // ---- 开启公示 / 开启投票 / 结算 / 公示（手动触发 runner） ----
+        if (sub === '开启公示' || sub === '开启投票' || sub === '结算' || sub === '公示') {
             const id = interaction.options.getInteger('场次id', true);
             const round = getRound(id);
             if (!round || round.guildId !== guildId) {
                 return interaction.reply({ content: `❌ 未找到募选 #${id}。`, flags: MessageFlags.Ephemeral });
             }
             await interaction.deferReply({ flags: MessageFlags.Ephemeral });
-            const runner = sub === '开启投票' ? openVoting : sub === '结算' ? settleRound : publishPending;
+            const runner = sub === '开启公示' ? openPublicity
+                : sub === '开启投票' ? openVoting
+                    : sub === '结算' ? settleRound
+                        : publishPending;
             const res = await runner(interaction.client, round);
             return interaction.editReply(res.ok ? `✅ 场次 #${id}：${res.message}` : `⚠️ 场次 #${id}：${res.message}`);
         }

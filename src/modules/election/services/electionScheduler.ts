@@ -1,7 +1,8 @@
 // src/modules/election/services/electionScheduler.ts
 //
 // 募选后台调度器：周期扫描到点的场次，自动推进状态。
-//   nominating 且过自荐截止 → openVoting
+//   nominating 且过自荐截止 → openPublicity（进入公示期）
+//   publicity  且过公示截止 → openVoting
 //   voting     且过投票截止 → settleRound
 // pending_confirm 不自动处理（等待管理员确认）。
 //
@@ -10,7 +11,7 @@
 import type { Client } from 'discord.js';
 import { getCheckIntervals } from '../../../core/config/timeconfig';
 import { listRoundsAll, getSettings } from './electionDatabase';
-import { openVoting, settleRound } from './electionRunner';
+import { openPublicity, openVoting, settleRound } from './electionRunner';
 import { syncPoolViaApi } from './poolSync';
 import { isElectionTestMode } from './electionPermission';
 
@@ -46,8 +47,21 @@ async function tick(client: Client): Promise<void> {
         if (now < round.nominateDeadline || processing.has(round.id)) continue;
         processing.add(round.id);
         try {
+            const r = await openPublicity(client, round);
+            console.log(`[Election] 场次 #${round.id} 自荐截止 → 公示期：${r.message}`);
+        } catch (err) {
+            console.error(`[Election] 场次 #${round.id} 进公示期出错：`, err);
+        } finally {
+            processing.delete(round.id);
+        }
+    }
+
+    for (const round of listRoundsAll(['publicity'])) {
+        if (now < round.publicityDeadline || processing.has(round.id)) continue;
+        processing.add(round.id);
+        try {
             const r = await openVoting(client, round);
-            console.log(`[Election] 场次 #${round.id} 自荐截止 → 开投票：${r.message}`);
+            console.log(`[Election] 场次 #${round.id} 公示截止 → 开投票：${r.message}`);
         } catch (err) {
             console.error(`[Election] 场次 #${round.id} 开投票出错：`, err);
         } finally {

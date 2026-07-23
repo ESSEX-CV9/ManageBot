@@ -35,10 +35,11 @@ db.exec(`
         id                 INTEGER PRIMARY KEY AUTOINCREMENT,
         guild_id           TEXT NOT NULL,
         title              TEXT NOT NULL,
-        status             TEXT NOT NULL,   -- nominating / voting / pending_confirm / closed / cancelled
+        status             TEXT NOT NULL,   -- nominating / publicity / voting / pending_confirm / closed / cancelled
         created_by         TEXT NOT NULL,
         created_at         INTEGER NOT NULL,
         nominate_deadline  INTEGER NOT NULL,
+        publicity_deadline INTEGER,          -- 公示期截止（自荐截止~投票开始之间的审核/公示窗口）
         vote_deadline      INTEGER NOT NULL,
         enable_public      INTEGER NOT NULL,
         enable_admin       INTEGER NOT NULL,
@@ -51,6 +52,8 @@ db.exec(`
         entry_message_id   TEXT,
         public_channel_id  TEXT,
         public_message_id  TEXT,
+        publicity_channel_id TEXT,           -- 公示名单消息所在频道
+        publicity_message_id TEXT,           -- 公示名单消息 id（打回/恢复时刷新，进投票时改文案）
         result_channel_id  TEXT,
         result_message_id  TEXT,
         nominate_notify_message_id TEXT,    -- 自荐开放通知消息（入口频道），阶段结束时改文案
@@ -60,10 +63,14 @@ db.exec(`
     CREATE INDEX IF NOT EXISTS idx_round_guild_status ON election_round(guild_id, status);
 
     CREATE TABLE IF NOT EXISTS election_nomination (
-        round_id    INTEGER NOT NULL,
-        user_id     TEXT NOT NULL,
-        statement   TEXT,
-        created_at  INTEGER NOT NULL,
+        round_id      INTEGER NOT NULL,
+        user_id       TEXT NOT NULL,
+        statement     TEXT,
+        created_at    INTEGER NOT NULL,
+        rejected      INTEGER NOT NULL DEFAULT 0,  -- 1=被管理员打回（本场作废参选资格）
+        reject_reason TEXT,                        -- 打回理由（可空）
+        rejected_by   TEXT,                        -- 打回操作者 user id
+        rejected_at   INTEGER,                     -- 打回时间
         PRIMARY KEY (round_id, user_id)
     );
 
@@ -88,8 +95,29 @@ db.exec(`
 `);
 
 // --- 迁移：给旧库补新列（列已存在时 ALTER 会抛错，忽略即可） ---
-for (const col of ['nominate_notify_message_id', 'vote_notify_message_id']) {
+for (const col of ['nominate_notify_message_id', 'vote_notify_message_id', 'publicity_channel_id', 'publicity_message_id']) {
     try { db.exec(`ALTER TABLE election_round ADD COLUMN ${col} TEXT`); } catch { /* 列已存在 */ }
+}
+// 公示期截止列：首次添加时做一次性回填（try 块只在真正新增列那次执行）。
+//   · 进行中「自荐中」的旧场次 → 中间补 3 天公示，投票截止顺延 3 天（保住原本投票时长）。
+//   · 已投票/已结束等其它场次 → 公示截止等于自荐截止（相当于没有公示期，不影响进行中的场次）。
+try {
+    db.exec(`ALTER TABLE election_round ADD COLUMN publicity_deadline INTEGER`);
+    const THREE_DAYS = 3 * 24 * 3600 * 1000;
+    db.exec(`UPDATE election_round SET publicity_deadline = nominate_deadline WHERE status != 'nominating'`);
+    db.exec(`UPDATE election_round
+        SET publicity_deadline = nominate_deadline + ${THREE_DAYS},
+            vote_deadline = vote_deadline + ${THREE_DAYS}
+        WHERE status = 'nominating'`);
+} catch { /* 列已存在，跳过回填 */ }
+// 自荐表打回相关列
+for (const [col, def] of [
+    ['rejected', 'INTEGER NOT NULL DEFAULT 0'],
+    ['reject_reason', 'TEXT'],
+    ['rejected_by', 'TEXT'],
+    ['rejected_at', 'INTEGER'],
+] as const) {
+    try { db.exec(`ALTER TABLE election_nomination ADD COLUMN ${col} ${def}`); } catch { /* 列已存在 */ }
 }
 
 // ============================ 配置 ============================
@@ -302,7 +330,7 @@ export function isInPool(guildId: string, userId: string): boolean {
 
 // ============================ 募选场次（round） ============================
 
-export type RoundStatus = 'nominating' | 'voting' | 'pending_confirm' | 'closed' | 'cancelled';
+export type RoundStatus = 'nominating' | 'publicity' | 'voting' | 'pending_confirm' | 'closed' | 'cancelled';
 
 export interface ElectionRound {
     id: number;
@@ -312,6 +340,8 @@ export interface ElectionRound {
     createdBy: string;
     createdAt: number;
     nominateDeadline: number;
+    /** 公示期截止（自荐截止~投票开始之间的审核/公示窗口）。旧数据缺省时回退为自荐截止。 */
+    publicityDeadline: number;
     voteDeadline: number;
     enablePublic: boolean;
     enableAdmin: boolean;
@@ -324,6 +354,8 @@ export interface ElectionRound {
     entryMessageId: string | null;
     publicChannelId: string | null;
     publicMessageId: string | null;
+    publicityChannelId: string | null;
+    publicityMessageId: string | null;
     resultChannelId: string | null;
     resultMessageId: string | null;
     nominateNotifyMessageId: string | null;
@@ -339,6 +371,7 @@ interface RoundRow {
     created_by: string;
     created_at: number;
     nominate_deadline: number;
+    publicity_deadline: number | null;
     vote_deadline: number;
     enable_public: number;
     enable_admin: number;
@@ -351,6 +384,8 @@ interface RoundRow {
     entry_message_id: string | null;
     public_channel_id: string | null;
     public_message_id: string | null;
+    publicity_channel_id: string | null;
+    publicity_message_id: string | null;
     result_channel_id: string | null;
     result_message_id: string | null;
     nominate_notify_message_id: string | null;
@@ -375,6 +410,8 @@ function rowToRound(r: RoundRow): ElectionRound {
         createdBy: r.created_by,
         createdAt: r.created_at,
         nominateDeadline: r.nominate_deadline,
+        // 旧数据 publicity_deadline 可能为 null（回填前），回退为自荐截止（等于无公示期）。
+        publicityDeadline: r.publicity_deadline ?? r.nominate_deadline,
         voteDeadline: r.vote_deadline,
         enablePublic: r.enable_public === 1,
         enableAdmin: r.enable_admin === 1,
@@ -387,6 +424,8 @@ function rowToRound(r: RoundRow): ElectionRound {
         entryMessageId: r.entry_message_id,
         publicChannelId: r.public_channel_id,
         publicMessageId: r.public_message_id,
+        publicityChannelId: r.publicity_channel_id,
+        publicityMessageId: r.publicity_message_id,
         resultChannelId: r.result_channel_id,
         resultMessageId: r.result_message_id,
         nominateNotifyMessageId: r.nominate_notify_message_id,
@@ -400,6 +439,7 @@ export interface CreateRoundInput {
     title: string;
     createdBy: string;
     nominateDeadline: number;
+    publicityDeadline: number;
     voteDeadline: number;
     enablePublic: boolean;
     enableAdmin: boolean;
@@ -414,12 +454,12 @@ export interface CreateRoundInput {
 const insertRoundStmt = db.prepare(`
     INSERT INTO election_round (
         guild_id, title, status, created_by, created_at,
-        nominate_deadline, vote_deadline, enable_public, enable_admin,
+        nominate_deadline, publicity_deadline, vote_deadline, enable_public, enable_admin,
         weight_public, weight_admin, vacancy_count, tie_break, require_confirm,
         entry_channel_id
     ) VALUES (
         @guild_id, @title, 'nominating', @created_by, @created_at,
-        @nominate_deadline, @vote_deadline, @enable_public, @enable_admin,
+        @nominate_deadline, @publicity_deadline, @vote_deadline, @enable_public, @enable_admin,
         @weight_public, @weight_admin, @vacancy_count, @tie_break, @require_confirm,
         @entry_channel_id
     )
@@ -438,6 +478,7 @@ export function createRound(input: CreateRoundInput): number {
         created_by: input.createdBy,
         created_at: Date.now(),
         nominate_deadline: input.nominateDeadline,
+        publicity_deadline: input.publicityDeadline,
         vote_deadline: input.voteDeadline,
         enable_public: input.enablePublic ? 1 : 0,
         enable_admin: input.enableAdmin ? 1 : 0,
@@ -469,6 +510,8 @@ const ROUND_COL: Record<string, string> = {
     entryMessageId: 'entry_message_id',
     publicChannelId: 'public_channel_id',
     publicMessageId: 'public_message_id',
+    publicityChannelId: 'publicity_channel_id',
+    publicityMessageId: 'publicity_message_id',
     resultChannelId: 'result_channel_id',
     resultMessageId: 'result_message_id',
     nominateNotifyMessageId: 'nominate_notify_message_id',
@@ -479,7 +522,8 @@ const ROUND_COL: Record<string, string> = {
 export function updateRound(
     id: number,
     patch: Partial<Pick<ElectionRound,
-        'status' | 'entryMessageId' | 'publicChannelId' | 'publicMessageId' | 'resultChannelId' | 'resultMessageId'
+        'status' | 'entryMessageId' | 'publicChannelId' | 'publicMessageId'
+        | 'publicityChannelId' | 'publicityMessageId' | 'resultChannelId' | 'resultMessageId'
         | 'nominateNotifyMessageId' | 'voteNotifyMessageId'>>,
 ): void {
     const sets: string[] = [];
@@ -507,6 +551,11 @@ export interface Nomination {
     userId: string;
     statement: string | null;
     createdAt: number;
+    /** 是否被管理员打回（本场作废参选资格）。 */
+    rejected: boolean;
+    rejectReason: string | null;
+    rejectedBy: string | null;
+    rejectedAt: number | null;
 }
 
 interface NominationRow {
@@ -514,6 +563,22 @@ interface NominationRow {
     user_id: string;
     statement: string | null;
     created_at: number;
+    rejected: number;
+    reject_reason: string | null;
+    rejected_by: string | null;
+    rejected_at: number | null;
+}
+
+function rowToNomination(r: NominationRow): Nomination {
+    return {
+        userId: r.user_id,
+        statement: r.statement,
+        createdAt: r.created_at,
+        rejected: r.rejected === 1,
+        rejectReason: r.reject_reason,
+        rejectedBy: r.rejected_by,
+        rejectedAt: r.rejected_at,
+    };
 }
 
 const upsertNominationStmt = db.prepare(`
@@ -522,15 +587,27 @@ const upsertNominationStmt = db.prepare(`
     ON CONFLICT(round_id, user_id) DO UPDATE SET statement = excluded.statement
 `);
 const listNominationsStmt = db.prepare(`
-    SELECT round_id, user_id, statement, created_at FROM election_nomination
-    WHERE round_id = ? ORDER BY created_at ASC
+    SELECT * FROM election_nomination WHERE round_id = ? ORDER BY created_at ASC
+`);
+const listActiveNominationsStmt = db.prepare(`
+    SELECT * FROM election_nomination WHERE round_id = ? AND rejected = 0 ORDER BY created_at ASC
 `);
 const getNominationStmt = db.prepare(`
-    SELECT round_id, user_id, statement, created_at FROM election_nomination
-    WHERE round_id = ? AND user_id = ?
+    SELECT * FROM election_nomination WHERE round_id = ? AND user_id = ?
 `);
 const countNominationsStmt = db.prepare(`
     SELECT COUNT(*) AS c FROM election_nomination WHERE round_id = ?
+`);
+const countActiveNominationsStmt = db.prepare(`
+    SELECT COUNT(*) AS c FROM election_nomination WHERE round_id = ? AND rejected = 0
+`);
+const rejectNominationStmt = db.prepare(`
+    UPDATE election_nomination SET rejected = 1, reject_reason = ?, rejected_by = ?, rejected_at = ?
+    WHERE round_id = ? AND user_id = ? AND rejected = 0
+`);
+const restoreNominationStmt = db.prepare(`
+    UPDATE election_nomination SET rejected = 0, reject_reason = NULL, rejected_by = NULL, rejected_at = NULL
+    WHERE round_id = ? AND user_id = ? AND rejected = 1
 `);
 
 /** 新增/更新一条自荐（改自荐宣言时保留原时间）。 */
@@ -538,24 +615,46 @@ export function upsertNomination(roundId: number, userId: string, statement: str
     upsertNominationStmt.run(roundId, userId, statement, Date.now());
 }
 
-/** 列出一场募选的所有自荐。 */
+/** 列出一场募选的所有自荐（含被打回的，供管理查看）。 */
 export function listNominations(roundId: number): Nomination[] {
-    return (listNominationsStmt.all(roundId) as NominationRow[]).map(r => ({
-        userId: r.user_id,
-        statement: r.statement,
-        createdAt: r.created_at,
-    }));
+    return (listNominationsStmt.all(roundId) as NominationRow[]).map(rowToNomination);
+}
+
+/** 列出一场募选中未被打回的自荐（用于投票器/计票/自动当选判断）。 */
+export function listActiveNominations(roundId: number): Nomination[] {
+    return (listActiveNominationsStmt.all(roundId) as NominationRow[]).map(rowToNomination);
 }
 
 /** 读取某人的自荐（判断是否已自荐）。 */
 export function getNomination(roundId: number, userId: string): Nomination | null {
     const r = getNominationStmt.get(roundId, userId) as NominationRow | undefined;
-    return r ? { userId: r.user_id, statement: r.statement, createdAt: r.created_at } : null;
+    return r ? rowToNomination(r) : null;
 }
 
-/** 统计自荐人数。 */
+/** 统计自荐人数（含被打回的）。 */
 export function countNominations(roundId: number): number {
     return (countNominationsStmt.get(roundId) as { c: number }).c;
+}
+
+/** 统计未被打回的自荐人数。 */
+export function countActiveNominations(roundId: number): number {
+    return (countActiveNominationsStmt.get(roundId) as { c: number }).c;
+}
+
+/**
+ * 打回一名候选人（本场作废其参选资格）。
+ * @returns 是否发生变更（false = 不存在该自荐 / 已是打回状态）。
+ */
+export function rejectNomination(roundId: number, userId: string, byUserId: string, reason: string | null): boolean {
+    return rejectNominationStmt.run(reason, byUserId, Date.now(), roundId, userId).changes > 0;
+}
+
+/**
+ * 恢复一名被打回的候选人。
+ * @returns 是否发生变更（false = 不存在该自荐 / 本就未被打回）。
+ */
+export function restoreNomination(roundId: number, userId: string): boolean {
+    return restoreNominationStmt.run(roundId, userId).changes > 0;
 }
 
 // ============================ 投票（vote） ============================

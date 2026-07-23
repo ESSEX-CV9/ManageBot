@@ -23,7 +23,7 @@ import {
 import {
     getRound,
     getSettings,
-    listNominations,
+    listActiveNominations,
     getVoterSelections,
     replaceVotes,
     type ElectionRound,
@@ -152,7 +152,7 @@ export async function handleVoteButton(interaction: ButtonInteraction): Promise<
     }
 
     const round = votable.round;
-    const candidates = listNominations(roundId).slice(0, MAX_OPTIONS);
+    const candidates = listActiveNominations(roundId).slice(0, MAX_OPTIONS);
     if (!candidates.length) {
         await interaction.reply({ content: '⚠️ 本场没有候选人。', flags: MessageFlags.Ephemeral });
         return;
@@ -200,8 +200,8 @@ export async function handleBallotSelect(interaction: StringSelectMenuInteractio
         return;
     }
 
-    // 只接受本场候选人，防越权/脏值
-    const validIds = new Set(listNominations(roundId).map(n => n.userId));
+    // 只接受本场有效候选人（未被打回），防越权/脏值
+    const validIds = new Set(listActiveNominations(roundId).map(n => n.userId));
     const picks = interaction.values.filter(v => validIds.has(v)).slice(0, votable.round.vacancyCount);
     if (!picks.length) {
         await interaction.update({ content: '⚠️ 未选择有效候选人，投票未记录。', components: [] });

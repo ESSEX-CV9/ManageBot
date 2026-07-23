@@ -54,9 +54,10 @@ export function buildEntryMessage(round: ElectionRound, nomineeCount: number, cl
                 `**空位数**：${round.vacancyCount}（可选/录取名额）`,
                 `**投票方式**：${votes.join(' + ') || '（待定）'}`,
                 `**自荐截止**：<t:${sec(round.nominateDeadline)}:f>（<t:${sec(round.nominateDeadline)}:R>）`,
-                `**投票时间**：<t:${sec(round.nominateDeadline)}:f> 至 <t:${sec(round.voteDeadline)}:f>`,
+                `**公示期**：<t:${sec(round.nominateDeadline)}:f> 至 <t:${sec(round.publicityDeadline)}:f>（管理组审核阶段）`,
+                `**投票时间**：<t:${sec(round.publicityDeadline)}:f> 至 <t:${sec(round.voteDeadline)}:f>`,
                 '',
-                '候选池成员点击下方按钮自荐并填写自荐宣言；截止后系统据此建立投票。',
+                '候选池成员点击下方按钮自荐并填写自荐宣言；自荐截止后进入公示期，再开启投票。',
             ].join('\n'),
         )
         .addFields({ name: '当前自荐人数', value: String(nomineeCount), inline: true })

@@ -25,12 +25,19 @@ import {
     setRoundWinners,
     getSettings,
     listNominations,
+    listActiveNominations,
     countNominations,
+    countActiveNominations,
+    getNomination,
+    rejectNomination,
+    restoreNomination,
     tallyVotes,
     getVotersByCandidate,
     listAdminThreads,
     saveAdminThread,
     type ElectionRound,
+    type RoundStatus,
+    type Nomination,
 } from './electionDatabase';
 import { computeResults, type CandidateResult } from './electionTally';
 import { buildVotePanel } from '../components/electionVote';
@@ -56,9 +63,9 @@ async function fetchGuild(client: Client, guildId: string) {
 
 // --------------------------- 计票 ---------------------------
 
-/** 重新读取票数并计算某场的完整排名（投票已冻结，随时可复算）。 */
+/** 重新读取票数并计算某场的完整排名（投票已冻结，随时可复算）。仅计入未被打回的候选人。 */
 export function computeRoundResults(round: ElectionRound): CandidateResult[] {
-    const candidateIds = listNominations(round.id).map(n => n.userId);
+    const candidateIds = listActiveNominations(round.id).map(n => n.userId);
     const pub = tallyVotes(round.id, 'public');
     const adm = tallyVotes(round.id, 'admin');
     return computeResults(round, candidateIds, pub, adm);
@@ -113,23 +120,22 @@ async function disableVotePanels(client: Client, round: ElectionRound): Promise<
     }
 }
 
-// --------------------------- 开启投票 ---------------------------
+// --------------------------- 开启公示 ---------------------------
 
 /**
- * 到点/手动：结束自荐、锁定候选、建立投票器。
- * @param force 测试用：强制进入投票，忽略「无人自荐流选」「人数≤空位自动当选」这两个捷径。
+ * 到点/手动：结束自荐、锁定候选名单，进入公示期。
+ * 公示期内管理员可用 `/募选管理 打回` 剔除不合适的候选人；到点自动开投票。
+ * 无人自荐则直接流选（公示无意义，跳过）。
  */
-export async function openVoting(client: Client, round: ElectionRound, force = false): Promise<RunResult> {
+export async function openPublicity(client: Client, round: ElectionRound): Promise<RunResult> {
     const fresh = getRound(round.id);
     if (!fresh) return { ok: false, message: '募选不存在。' };
-    if (fresh.status !== 'nominating') return { ok: false, message: `当前状态为「${fresh.status}」，无法开启投票。` };
+    if (fresh.status !== 'nominating') return { ok: false, message: `当前状态为「${fresh.status}」，无法进入公示期。` };
 
-    const candidates = listNominations(fresh.id);
+    const candidates = listActiveNominations(fresh.id);
 
-    // 无候选人：无法投票
+    // 无候选人：直接流选（没有可公示/可投的对象）
     if (candidates.length === 0) {
-        if (force) return { ok: false, message: '没有候选人，无法开启投票（先注入自荐）。' };
-        // 流选：无人自荐
         updateRound(fresh.id, { status: 'closed' });
         setRoundWinners(fresh.id, []);
         await closeEntryPanel(client, fresh, '🔒 已结束（无人自荐）');
@@ -138,8 +144,46 @@ export async function openVoting(client: Client, round: ElectionRound, force = f
         return { ok: true, message: '无人自荐，已流选关闭。' };
     }
 
-    // 自荐即将结束：更新自荐开放通知消息
-    await editNotify(client, fresh.entryChannelId, fresh.nominateNotifyMessageId, `📢 **${fresh.title}** 自荐已结束，进入投票阶段。`);
+    updateRound(fresh.id, { status: 'publicity' });
+    await closeEntryPanel(client, fresh, '🔒 自荐已结束，公示中');
+    await editNotify(client, fresh.entryChannelId, fresh.nominateNotifyMessageId,
+        `📢 **${fresh.title}** 自荐已结束，进入公示期，投票 <t:${sec(fresh.publicityDeadline)}:R> 开始。`);
+
+    // 公示名单发到结果公示频道（无频道则静默跳过）
+    await postPublicity(client, getRound(fresh.id)!);
+
+    return { ok: true, message: `已进入公示期（候选 ${candidates.length} 人），投票将于公示截止后开启。` };
+}
+
+// --------------------------- 开启投票 ---------------------------
+
+/**
+ * 到点/手动：结束公示、锁定候选、建立投票器。
+ * @param force 测试用：强制开投票（可从自荐/公示态直接进），忽略「无候选流选」「人数≤空位自动当选」两个捷径。
+ */
+export async function openVoting(client: Client, round: ElectionRound, force = false): Promise<RunResult> {
+    const fresh = getRound(round.id);
+    if (!fresh) return { ok: false, message: '募选不存在。' };
+    // 正常从公示期进投票；force（测试）允许从自荐期直接强开、跳过公示。
+    const allowed: RoundStatus[] = force ? ['nominating', 'publicity'] : ['publicity'];
+    if (!allowed.includes(fresh.status)) return { ok: false, message: `当前状态为「${fresh.status}」，无法开启投票。` };
+
+    const candidates = listActiveNominations(fresh.id);
+
+    // 无候选人：无法投票（公示期把人全打回了，或强开时没有候选）
+    if (candidates.length === 0) {
+        if (force) return { ok: false, message: '没有候选人，无法开启投票（先注入自荐）。' };
+        // 流选：无有效候选
+        updateRound(fresh.id, { status: 'closed' });
+        setRoundWinners(fresh.id, []);
+        await closeEntryPanel(client, fresh, '🔒 已结束（无有效候选）');
+        await editNotify(client, fresh.entryChannelId, fresh.nominateNotifyMessageId, `📢 **${fresh.title}** 已结束（无有效候选人）。`);
+        await announce(client, fresh, `📢 募选 **#${fresh.id}｜${fresh.title}** 流选：无有效候选人（可能均已被打回）。`);
+        return { ok: true, message: '无有效候选人，已流选关闭。' };
+    }
+
+    // 公示即将结束：更新自荐/公示通知消息
+    await editNotify(client, fresh.entryChannelId, fresh.nominateNotifyMessageId, `📢 **${fresh.title}** 公示已结束，进入投票阶段。`);
 
     // 解析候选人昵称，供面板/公告以「昵称 <@id>」展示
     const guild = await fetchGuild(client, fresh.guildId);
@@ -446,6 +490,141 @@ async function announce(client: Client, round: ElectionRound, content: string): 
         const ch = await client.channels.fetch(settings.resultChannelId);
         if (ch?.isTextBased() && ch.isSendable()) await ch.send({ content });
     } catch { /* 忽略 */ }
+}
+
+// --------------------------- 公示期：名单展示 + 打回/恢复 ---------------------------
+
+/** 构建公示名单消息（发到结果公示频道；打回/恢复后据此刷新）。candidates 含被打回者。 */
+function buildPublicityMessage(round: ElectionRound, candidates: Nomination[], names: Map<string, string>) {
+    const active = candidates.filter(c => !c.rejected);
+    const rejected = candidates.filter(c => c.rejected);
+    const lines = active.map((c, i) => {
+        const preview = (c.statement ?? '').replace(/\s+/g, ' ').trim();
+        const shown = preview ? `\n> ${preview.slice(0, 120)}${preview.length > 120 ? '…' : ''}` : '';
+        return `**${i + 1}.** ${nameTag(names, c.userId)}${shown}`;
+    });
+    const rejectedLines = rejected.map(c =>
+        `~~${nameTag(names, c.userId)}~~${c.rejectReason ? `｜${c.rejectReason}` : ''}`);
+
+    const embed = new EmbedBuilder()
+        .setTitle(`📋 候选人公示：${round.title}`)
+        .setColor(0x5865f2)
+        .setDescription(
+            [
+                `**空位数**：${round.vacancyCount}｜**有效候选**：${active.length} 人`,
+                `**投票开始**：<t:${sec(round.publicityDeadline)}:f>（<t:${sec(round.publicityDeadline)}:R>）`,
+                '',
+                '以下为本场候选人名单，正在公示。管理员如认为某人不宜参选，可用 `/募选管理 打回` 处理。',
+                '',
+                '**候选人：**',
+                ...(lines.length ? lines : ['（暂无有效候选人）']),
+                ...(rejectedLines.length ? ['', '**已打回（不参与投票）：**', ...rejectedLines] : []),
+            ].join('\n').slice(0, 4000),
+        )
+        .setFooter({ text: `募选 #${round.id}` });
+    return { embeds: [embed] };
+}
+
+/** 把公示名单发到结果公示频道，并记下频道/消息 id（无公示频道则静默跳过）。 */
+async function postPublicity(client: Client, round: ElectionRound): Promise<void> {
+    const settings = getSettings(round.guildId);
+    if (!settings.resultChannelId) {
+        console.warn(`[Election] 募选 #${round.id} 进入公示期，但未配置结果公示频道，名单未发出。`);
+        return;
+    }
+    const guild = await fetchGuild(client, round.guildId);
+    const candidates = listNominations(round.id);
+    const names = guild ? await resolveNames(guild, candidates.map(c => c.userId)) : new Map<string, string>();
+    try {
+        const ch = await client.channels.fetch(settings.resultChannelId);
+        if (ch?.isTextBased() && ch.isSendable()) {
+            const msg = await ch.send(buildPublicityMessage(round, candidates, names));
+            updateRound(round.id, { publicityChannelId: ch.id, publicityMessageId: msg.id });
+        }
+    } catch { /* 忽略，公示名单发送失败不阻塞流程 */ }
+}
+
+/** 打回/恢复后刷新公示名单消息（失败静默）。 */
+async function refreshPublicityMessage(client: Client, round: ElectionRound): Promise<void> {
+    const fresh = getRound(round.id);
+    if (!fresh?.publicityChannelId || !fresh.publicityMessageId) return;
+    const guild = await fetchGuild(client, fresh.guildId);
+    const candidates = listNominations(fresh.id);
+    const names = guild ? await resolveNames(guild, candidates.map(c => c.userId)) : new Map<string, string>();
+    try {
+        const ch = await client.channels.fetch(fresh.publicityChannelId);
+        if (ch?.isTextBased()) {
+            const msg = await ch.messages.fetch(fresh.publicityMessageId);
+            await msg.edit(buildPublicityMessage(fresh, candidates, names));
+        }
+    } catch { /* 忽略 */ }
+}
+
+/** 给某用户发私信通知（不 ping、失败返回 false）。 */
+async function dmUser(client: Client, userId: string, content: string): Promise<boolean> {
+    try {
+        const user = await client.users.fetch(userId);
+        await user.send({ content, allowedMentions: { parse: [] } });
+        return true;
+    } catch {
+        return false;
+    }
+}
+
+/**
+ * 打回一名候选人（仅公示期）：作废其本场参选资格 → 刷新公示名单 → 私信通知本人。
+ */
+export async function disqualifyCandidate(
+    client: Client, round: ElectionRound, userId: string, byUserId: string, reason: string | null,
+): Promise<RunResult> {
+    const fresh = getRound(round.id);
+    if (!fresh) return { ok: false, message: '募选不存在。' };
+    if (fresh.status !== 'publicity') {
+        return { ok: false, message: `只有公示期可以打回候选人（当前状态「${fresh.status}」）。` };
+    }
+    const nom = getNomination(fresh.id, userId);
+    if (!nom) return { ok: false, message: '该用户不是本场候选人。' };
+    if (nom.rejected) return { ok: false, message: '该候选人已被打回，无需重复操作。' };
+
+    rejectNomination(fresh.id, userId, byUserId, reason);
+    await refreshPublicityMessage(client, fresh);
+    const dmOk = await dmUser(client, userId,
+        `📢 关于募选 **#${fresh.id}｜${fresh.title}**：\n很遗憾，管理组在公示期审核后决定**暂不通过你本场的参选**。`
+        + (reason ? `\n理由：${reason}` : '')
+        + `\n如有疑问可联系管理组；管理员也可在公示结束前恢复你的参选资格。`);
+
+    const left = countActiveNominations(fresh.id);
+    return {
+        ok: true,
+        message: `已打回该候选人，本场剩余有效候选 ${left} 人。`
+            + (dmOk ? '已私信通知本人。' : '（私信未送达，可能对方关闭了私信。）'),
+    };
+}
+
+/**
+ * 恢复一名被打回的候选人（仅公示期）：恢复参选资格 → 刷新公示名单 → 私信通知本人。
+ */
+export async function restoreCandidate(client: Client, round: ElectionRound, userId: string): Promise<RunResult> {
+    const fresh = getRound(round.id);
+    if (!fresh) return { ok: false, message: '募选不存在。' };
+    if (fresh.status !== 'publicity') {
+        return { ok: false, message: `只有公示期可以恢复候选人（当前状态「${fresh.status}」）。` };
+    }
+    const nom = getNomination(fresh.id, userId);
+    if (!nom) return { ok: false, message: '该用户不是本场候选人。' };
+    if (!nom.rejected) return { ok: false, message: '该候选人未被打回，无需恢复。' };
+
+    restoreNomination(fresh.id, userId);
+    await refreshPublicityMessage(client, fresh);
+    const dmOk = await dmUser(client, userId,
+        `📢 关于募选 **#${fresh.id}｜${fresh.title}**：\n好消息，管理组已**恢复你本场的参选资格**，你将进入接下来的投票环节。`);
+
+    const left = countActiveNominations(fresh.id);
+    return {
+        ok: true,
+        message: `已恢复该候选人，本场有效候选 ${left} 人。`
+            + (dmOk ? '已私信通知本人。' : '（私信未送达，可能对方关闭了私信。）'),
+    };
 }
 
 // --------------------------- 确认/作废按钮 ---------------------------
