@@ -80,7 +80,7 @@ async function closeEntryPanel(client: Client, round: ElectionRound, buttonLabel
         const ch = await client.channels.fetch(round.entryChannelId);
         if (ch?.isTextBased()) {
             const msg = await ch.messages.fetch(round.entryMessageId);
-            await msg.edit(buildEntryMessage(round, countNominations(round.id), buttonLabel));
+            await msg.edit(buildEntryMessage(round, countActiveNominations(round.id), buttonLabel));
         }
     } catch { /* 忽略 */ }
 }
@@ -134,14 +134,16 @@ export async function openPublicity(client: Client, round: ElectionRound): Promi
 
     const candidates = listActiveNominations(fresh.id);
 
-    // 无候选人：直接流选（没有可公示/可投的对象）
+    // 无有效候选人：直接流选（没有可公示/可投的对象）。区分「无人报名」与「报名者均被打回」。
     if (candidates.length === 0) {
+        const allRejected = countNominations(fresh.id) > 0;
+        const why = allRejected ? '报名者均被打回' : '无人报名';
         updateRound(fresh.id, { status: 'closed' });
         setRoundWinners(fresh.id, []);
-        await closeEntryPanel(client, fresh, '🔒 已结束（无人自荐）');
-        await editNotify(client, fresh.entryChannelId, fresh.nominateNotifyMessageId, `📢 **${fresh.title}** 自荐已结束（无人报名）。`);
-        await announce(client, fresh, `📢 募选 **#${fresh.id}｜${fresh.title}** 流选：自荐阶段无人报名。`);
-        return { ok: true, message: '无人自荐，已流选关闭。' };
+        await closeEntryPanel(client, fresh, `🔒 已结束（${why}）`);
+        await editNotify(client, fresh.entryChannelId, fresh.nominateNotifyMessageId, `📢 **${fresh.title}** 自荐已结束（${why}）。`);
+        await announce(client, fresh, `📢 募选 **#${fresh.id}｜${fresh.title}** 流选：自荐阶段${why}。`);
+        return { ok: true, message: `${why}，已流选关闭。` };
     }
 
     updateRound(fresh.id, { status: 'publicity' });
@@ -504,7 +506,7 @@ function buildPublicityMessage(round: ElectionRound, candidates: Nomination[], n
         return `**${i + 1}.** ${nameTag(names, c.userId)}${shown}`;
     });
     const rejectedLines = rejected.map(c =>
-        `~~${nameTag(names, c.userId)}~~${c.rejectReason ? `｜${c.rejectReason}` : ''}`);
+        `~~${nameTag(names, c.userId)}~~ — ${c.rejectReason ? `因「${c.rejectReason}」被管理组打回` : '已被管理组打回'}`);
 
     const embed = new EmbedBuilder()
         .setTitle(`📋 候选人公示：${round.title}`)
@@ -571,16 +573,19 @@ async function dmUser(client: Client, userId: string, content: string): Promise<
     }
 }
 
+// 打回/恢复允许的阶段：投票开始前（自荐期 + 公示期）都可以操作。
+const REJECTABLE_STATUS: RoundStatus[] = ['nominating', 'publicity'];
+
 /**
- * 打回一名候选人（仅公示期）：作废其本场参选资格 → 刷新公示名单 → 私信通知本人。
+ * 打回一名候选人（投票开始前均可）：作废其本场参选资格 → 刷新公示名单（若已公示）→ 私信通知本人。
  */
 export async function disqualifyCandidate(
     client: Client, round: ElectionRound, userId: string, byUserId: string, reason: string | null,
 ): Promise<RunResult> {
     const fresh = getRound(round.id);
     if (!fresh) return { ok: false, message: '募选不存在。' };
-    if (fresh.status !== 'publicity') {
-        return { ok: false, message: `只有公示期可以打回候选人（当前状态「${fresh.status}」）。` };
+    if (!REJECTABLE_STATUS.includes(fresh.status)) {
+        return { ok: false, message: `投票开始后无法打回候选人（当前状态「${fresh.status}」）。` };
     }
     const nom = getNomination(fresh.id, userId);
     if (!nom) return { ok: false, message: '该用户不是本场候选人。' };
@@ -589,9 +594,9 @@ export async function disqualifyCandidate(
     rejectNomination(fresh.id, userId, byUserId, reason);
     await refreshPublicityMessage(client, fresh);
     const dmOk = await dmUser(client, userId,
-        `📢 关于募选 **#${fresh.id}｜${fresh.title}**：\n很遗憾，管理组在公示期审核后决定**暂不通过你本场的参选**。`
+        `📢 关于募选 **#${fresh.id}｜${fresh.title}**：\n很遗憾，管理组审核后决定**暂不通过你本场的参选**。`
         + (reason ? `\n理由：${reason}` : '')
-        + `\n如有疑问可联系管理组；管理员也可在公示结束前恢复你的参选资格。`);
+        + `\n如有疑问可联系管理组；管理员也可在投票开始前恢复你的参选资格。`);
 
     const left = countActiveNominations(fresh.id);
     return {
@@ -602,13 +607,13 @@ export async function disqualifyCandidate(
 }
 
 /**
- * 恢复一名被打回的候选人（仅公示期）：恢复参选资格 → 刷新公示名单 → 私信通知本人。
+ * 恢复一名被打回的候选人（投票开始前均可）：恢复参选资格 → 刷新公示名单（若已公示）→ 私信通知本人。
  */
 export async function restoreCandidate(client: Client, round: ElectionRound, userId: string): Promise<RunResult> {
     const fresh = getRound(round.id);
     if (!fresh) return { ok: false, message: '募选不存在。' };
-    if (fresh.status !== 'publicity') {
-        return { ok: false, message: `只有公示期可以恢复候选人（当前状态「${fresh.status}」）。` };
+    if (!REJECTABLE_STATUS.includes(fresh.status)) {
+        return { ok: false, message: `投票开始后无法恢复候选人（当前状态「${fresh.status}」）。` };
     }
     const nom = getNomination(fresh.id, userId);
     if (!nom) return { ok: false, message: '该用户不是本场候选人。' };

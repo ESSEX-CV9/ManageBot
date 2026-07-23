@@ -23,7 +23,7 @@ import {
     isInPool,
     upsertNomination,
     getNomination,
-    countNominations,
+    countActiveNominations,
     type ElectionRound,
 } from '../services/electionDatabase';
 
@@ -82,7 +82,7 @@ async function refreshEntry(interaction: ButtonInteraction | ModalSubmitInteract
         const channel = await interaction.client.channels.fetch(round.entryChannelId);
         if (!channel || !channel.isTextBased()) return;
         const msg = await channel.messages.fetch(round.entryMessageId);
-        await msg.edit(buildEntryMessage(round, countNominations(round.id)));
+        await msg.edit(buildEntryMessage(round, countActiveNominations(round.id)));
     } catch {
         /* 面板可能被删/无权限，忽略 */
     }
@@ -126,6 +126,14 @@ export async function handleNominateButton(interaction: ButtonInteraction): Prom
     }
 
     const existing = getNomination(roundId, interaction.user.id);
+    // 已被管理组打回的人不能重新报名（恢复需管理员操作 /募选管理 恢复）
+    if (existing?.rejected) {
+        await interaction.reply({
+            content: '❌ 你本场的参选资格已被管理组打回，无法自荐。如有疑问请联系管理组。',
+            flags: MessageFlags.Ephemeral,
+        });
+        return;
+    }
     const modal = new ModalBuilder()
         .setCustomId(nominateModalId(roundId))
         .setTitle(existing ? '修改自荐宣言' : '自荐');
@@ -159,7 +167,14 @@ export async function handleNominateModal(interaction: ModalSubmitInteraction): 
         return;
     }
 
-    const first = !getNomination(roundId, interaction.user.id);
+    const existing = getNomination(roundId, interaction.user.id);
+    // 二次校验未被打回（打开 Modal 到提交之间可能被管理员打回）
+    if (existing?.rejected) {
+        await interaction.reply({ content: '❌ 你本场的参选资格已被管理组打回，无法自荐。', flags: MessageFlags.Ephemeral });
+        return;
+    }
+
+    const first = !existing;
     const statement = interaction.fields.getTextInputValue(NOMINATE_INPUT).trim();
     upsertNomination(roundId, interaction.user.id, statement);
 

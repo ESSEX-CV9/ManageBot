@@ -76,13 +76,13 @@ const data = new SlashCommandBuilder()
         sub.setName('列表').setDescription('列出进行中的募选'))
     .addSubcommand(sub =>
         sub.setName('打回')
-            .setDescription('（公示期）打回某候选人，取消其本场参选资格并私信通知')
+            .setDescription('（投票开始前）打回某候选人，取消其本场参选资格并私信通知')
             .addIntegerOption(o => o.setName('场次id').setDescription('募选编号').setRequired(true))
             .addUserOption(o => o.setName('用户').setDescription('要打回的候选人').setRequired(true))
-            .addStringOption(o => o.setName('理由').setDescription('打回理由（会私信告知本人）').setRequired(false)))
+            .addStringOption(o => o.setName('理由').setDescription('打回理由（会私信告知本人，并展示在公示名单）').setRequired(false)))
     .addSubcommand(sub =>
         sub.setName('恢复')
-            .setDescription('（公示期）恢复某被打回候选人的参选资格并私信通知')
+            .setDescription('（投票开始前）恢复某被打回候选人的参选资格并私信通知')
             .addIntegerOption(o => o.setName('场次id').setDescription('募选编号').setRequired(true))
             .addUserOption(o => o.setName('用户').setDescription('要恢复的候选人').setRequired(true)))
     .addSubcommand(sub =>
@@ -372,7 +372,7 @@ const command: Command = {
             return interaction.reply({ content: `🗳️ **进行中的募选**\n${lines.join('\n')}`, flags: MessageFlags.Ephemeral });
         }
 
-        // ---- 打回 / 恢复（公示期，针对单个候选人） ----
+        // ---- 打回 / 恢复（投票开始前，针对单个候选人） ----
         if (sub === '打回' || sub === '恢复') {
             const id = interaction.options.getInteger('场次id', true);
             const round = getRound(id);
