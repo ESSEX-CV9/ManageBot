@@ -6,6 +6,7 @@
 
 import {
     ChannelType,
+    PermissionFlagsBits,
     ThreadAutoArchiveDuration,
     EmbedBuilder,
     ActionRowBuilder,
@@ -16,6 +17,7 @@ import {
     type Client,
     type ButtonInteraction,
     type GuildMember,
+    type GuildTextBasedChannel,
     type Message,
 } from 'discord.js';
 
@@ -73,8 +75,8 @@ export function computeRoundResults(round: ElectionRound): CandidateResult[] {
 
 // --------------------------- 小工具 ---------------------------
 
-/** 自荐结束时：保持入口消息不变，只把自荐按钮变灰并改文字（失败静默）。 */
-async function closeEntryPanel(client: Client, round: ElectionRound, buttonLabel: string): Promise<void> {
+/** 自荐结束时：保持入口消息不变，只把自荐按钮变灰并改文字；不传文字则还原成可用的自荐按钮（失败静默）。 */
+async function closeEntryPanel(client: Client, round: ElectionRound, buttonLabel?: string): Promise<void> {
     if (!round.entryChannelId || !round.entryMessageId) return;
     try {
         const ch = await client.channels.fetch(round.entryChannelId);
@@ -157,6 +159,202 @@ export async function openPublicity(client: Client, round: ElectionRound): Promi
     return { ok: true, message: `已进入公示期（候选 ${candidates.length} 人），投票将于公示截止后开启。` };
 }
 
+// --------------------------- 投票面板：发送 / 补发 ---------------------------
+
+const errText = (e: unknown) => (e instanceof Error ? e.message : String(e));
+
+/** [权限位, 中文名]，用于把「发送失败」翻译成管理员能直接去改的权限项。 */
+type PermNeed = readonly [bigint, string];
+
+const PERM_SEND: PermNeed[] = [
+    [PermissionFlagsBits.ViewChannel, '查看频道'],
+    [PermissionFlagsBits.SendMessages, '发送消息'],
+    [PermissionFlagsBits.EmbedLinks, '嵌入链接'],
+];
+const PERM_THREAD: PermNeed[] = [
+    [PermissionFlagsBits.CreatePublicThreads, '创建公开子区'],
+    [PermissionFlagsBits.SendMessagesInThreads, '在子区发言'],
+];
+
+/** 列出机器人在该频道缺少的权限中文名（拿不到成员/权限时返回空，交给真正的发送去报错）。 */
+function missingPerms(ch: GuildTextBasedChannel, me: GuildMember | null, needs: PermNeed[]): string[] {
+    if (!me) return [];
+    const perms = ch.permissionsFor(me);
+    if (!perms) return [];
+    return needs.filter(([bit]) => !perms.has(bit)).map(([, label]) => label);
+}
+
+/** 取回一条已记录的面板消息；频道/消息被删或没权限读则返回 null（视作面板不在位）。 */
+async function fetchPanelMessage(client: Client, channelId: string | null, messageId: string | null): Promise<Message | null> {
+    if (!channelId || !messageId) return null;
+    try {
+        const ch = await client.channels.fetch(channelId);
+        if (!ch?.isTextBased()) return null;
+        return await ch.messages.fetch(messageId);
+    } catch {
+        return null;
+    }
+}
+
+export interface PanelReport {
+    /** 失败/降级说明，逐条给管理员看。 */
+    notes: string[];
+    /** 大众面板当前是否在位（本次新发或此前已存在）。 */
+    publicOk: boolean;
+    /** 面板在位的管理频道数 / 已配置的管理频道数。 */
+    adminOk: number;
+    adminTotal: number;
+}
+
+/**
+ * 发送投票面板（大众频道 + 各管理频道）。
+ * 幂等：已存在的面板只刷新内容不重发，因此开投票失败后可以反复重跑来补发。
+ * 单个频道失败不影响其它频道；失败原因（含缺失的权限）写进 notes 并打日志。
+ * 管理频道没有建子区权限时，降级为直接在频道内发面板，而不是整个管理投票丢失。
+ */
+async function sendVotePanels(
+    client: Client, round: ElectionRound, candidates: Nomination[], names: Map<string, string>,
+): Promise<PanelReport> {
+    const settings = getSettings(round.guildId);
+    const notes: string[] = [];
+    let publicOk = false;
+    let adminOk = 0;
+
+    const guild = await fetchGuild(client, round.guildId);
+    const me = guild ? (guild.members.me ?? await guild.members.fetchMe().catch(() => null)) : null;
+
+    // ---- 大众投票面板 ----
+    if (round.enablePublic) {
+        const chId = settings.publicVoteChannelId;
+        if (!chId) {
+            notes.push('未配置大众投票频道，跳过大众投票面板。');
+        } else {
+            const existing = await fetchPanelMessage(client, round.publicChannelId, round.publicMessageId);
+            if (existing) {
+                await existing.edit(buildVotePanel(round, 'public', candidates, names)).catch(() => {});
+                publicOk = true;
+            } else {
+                try {
+                    const ch = await client.channels.fetch(chId);
+                    if (!ch?.isTextBased() || ch.isDMBased()) throw new Error('频道不存在或不是服务器文字频道');
+                    const lack = missingPerms(ch, me, PERM_SEND);
+                    if (lack.length) throw new Error(`机器人缺少权限：${lack.join('、')}`);
+                    if (!ch.isSendable()) throw new Error('机器人在该频道无法发送消息');
+
+                    const msg = await ch.send(buildVotePanel(round, 'public', candidates, names));
+                    updateRound(round.id, { publicChannelId: ch.id, publicMessageId: msg.id });
+                    publicOk = true;
+
+                    // 投票开始通知：额外 @ 通知身份组，并记下消息 id 便于结束时改文案
+                    if (settings.voteNotifyRoleIds.length) {
+                        const mentions = settings.voteNotifyRoleIds.map(id => `<@&${id}>`).join(' ');
+                        const notifyMsg = await ch.send({
+                            content: `${mentions}\n🗳️ **${round.title}** 大众投票开始！\n👉 前往投票：${msg.url}\n投票截止 <t:${sec(round.voteDeadline)}:R>`,
+                            allowedMentions: { roles: settings.voteNotifyRoleIds },
+                        }).catch(() => null);
+                        if (notifyMsg) updateRound(round.id, { voteNotifyMessageId: notifyMsg.id });
+                    }
+                } catch (e) {
+                    notes.push(`大众投票面板发送失败（<#${chId}>：${errText(e)}）。`);
+                    console.error(`[Election] 募选 #${round.id} 大众投票面板发送失败（频道 ${chId}）：`, e);
+                }
+            }
+        }
+    }
+
+    // ---- 管理内投面板：每个管理频道一个子区（不行则直接发频道） ----
+    const adminChannels = round.enableAdmin ? settings.adminVoteChannelIds : [];
+    if (round.enableAdmin && !adminChannels.length) notes.push('未配置管理内投频道，跳过管理投票。');
+
+    const recorded = new Map(listAdminThreads(round.id).map(t => [t.channelId, t]));
+    for (const chId of adminChannels) {
+        const rec = recorded.get(chId);
+        const existing = rec ? await fetchPanelMessage(client, rec.threadId, rec.messageId) : null;
+        if (existing) {
+            await existing.edit(buildVotePanel(round, 'admin', candidates, names)).catch(() => {});
+            adminOk++;
+            continue;
+        }
+        try {
+            const ch = await client.channels.fetch(chId);
+            if (!ch?.isTextBased() || ch.isDMBased()) throw new Error('频道不存在或不是服务器文字频道');
+
+            // 优先开子区；没权限或建失败就退回频道内直接发面板（投票功能不受影响）
+            let target: GuildTextBasedChannel = ch;
+            let threadId = ch.id;
+            if (ch.type === ChannelType.GuildText || ch.type === ChannelType.GuildAnnouncement) {
+                const lackThread = missingPerms(ch, me, PERM_THREAD);
+                if (lackThread.length) {
+                    notes.push(`<#${chId}> 缺少${lackThread.join('、')}权限，管理投票面板已改为直接发在频道里。`);
+                } else {
+                    try {
+                        const thread = await ch.threads.create({
+                            name: `募选#${round.id}-管理投票`,
+                            autoArchiveDuration: ThreadAutoArchiveDuration.OneWeek,
+                        });
+                        target = thread;
+                        threadId = thread.id;
+                    } catch (e) {
+                        notes.push(`<#${chId}> 建子区失败（${errText(e)}），管理投票面板已改为直接发在频道里。`);
+                        console.error(`[Election] 募选 #${round.id} 建管理投票子区失败（频道 ${chId}）：`, e);
+                    }
+                }
+            }
+
+            if (target.id === ch.id) {
+                const lack = missingPerms(ch, me, PERM_SEND);
+                if (lack.length) throw new Error(`机器人缺少权限：${lack.join('、')}`);
+            }
+            const msg = await target.send(buildVotePanel(round, 'admin', candidates, names));
+            saveAdminThread(round.id, chId, threadId, msg.id);
+            adminOk++;
+        } catch (e) {
+            notes.push(`<#${chId}> 管理投票面板发送失败（${errText(e)}）。`);
+            console.error(`[Election] 募选 #${round.id} 管理投票面板发送失败（频道 ${chId}）：`, e);
+        }
+    }
+
+    return { notes, publicOk, adminOk, adminTotal: adminChannels.length };
+}
+
+/** 把面板发送结果拼成给管理员看的一句话。 */
+function panelSummary(round: ElectionRound, rep: PanelReport): string {
+    const parts: string[] = [];
+    if (round.enablePublic) parts.push(`大众面板${rep.publicOk ? '已就绪' : '未发出'}`);
+    if (round.enableAdmin) parts.push(`管理面板 ${rep.adminOk}/${rep.adminTotal} 个频道就绪`);
+    return parts.join('，');
+}
+
+/**
+ * 补发/刷新一场投票中募选的面板。
+ * 用于「开投票时因权限等原因面板没发出去，但状态已经变成投票中」的修复：
+ * 已在位的面板只刷新，缺的补发，因此可以安全重复执行。
+ */
+export async function resendVotePanels(client: Client, round: ElectionRound): Promise<RunResult> {
+    const fresh = getRound(round.id);
+    if (!fresh) return { ok: false, message: '募选不存在。' };
+    if (fresh.status !== 'voting') {
+        return { ok: false, message: `当前状态为「${fresh.status}」，只有投票中的场次才需要补发投票面板。` };
+    }
+    const candidates = listActiveNominations(fresh.id);
+    if (!candidates.length) return { ok: false, message: '本场没有有效候选人（可能已全部被打回），无法发出投票面板。' };
+
+    const guild = await fetchGuild(client, fresh.guildId);
+    const names = guild ? await resolveNames(guild, candidates.map(c => c.userId)) : new Map<string, string>();
+    const rep = await sendVotePanels(client, fresh, candidates, names);
+    await closeEntryPanel(client, fresh, '🔒 自荐已结束，投票已开启');
+
+    const overdue = Date.now() > fresh.voteDeadline
+        ? ' ⚠️ 本场投票截止时间已过，面板发出也无法投票，请先用 `/募选管理 顺延投票截止` 延长。'
+        : '';
+    const ok = (!fresh.enablePublic || rep.publicOk) && (!fresh.enableAdmin || rep.adminOk > 0);
+    return {
+        ok,
+        message: `投票面板已检查补发（候选 ${candidates.length} 人）：${panelSummary(fresh, rep)}。`
+            + (rep.notes.length ? ` 注意：${rep.notes.join(' ')}` : '') + overdue,
+    };
+}
+
 // --------------------------- 开启投票 ---------------------------
 
 /**
@@ -166,6 +364,8 @@ export async function openPublicity(client: Client, round: ElectionRound): Promi
 export async function openVoting(client: Client, round: ElectionRound, force = false): Promise<RunResult> {
     const fresh = getRound(round.id);
     if (!fresh) return { ok: false, message: '募选不存在。' };
+    // 已经是投票中：多半是上次开投票时面板没发成功。别再拦着，直接走补发逻辑修复。
+    if (fresh.status === 'voting') return resendVotePanels(client, fresh);
     // 正常从公示期进投票；force（测试）允许从自荐期直接强开、跳过公示。
     const allowed: RoundStatus[] = force ? ['nominating', 'publicity'] : ['publicity'];
     if (!allowed.includes(fresh.status)) return { ok: false, message: `当前状态为「${fresh.status}」，无法开启投票。` };
@@ -204,53 +404,33 @@ export async function openVoting(client: Client, round: ElectionRound, force = f
     }
 
     // 正常进入投票
+    const prevStatus = fresh.status;
     updateRound(fresh.id, { status: 'voting' });
-    const settings = getSettings(fresh.guildId);
-    const notes: string[] = [];
-
-    // 大众投票面板
-    if (fresh.enablePublic) {
-        if (settings.publicVoteChannelId) {
-            try {
-                const ch = await client.channels.fetch(settings.publicVoteChannelId);
-                if (ch?.isTextBased() && ch.isSendable()) {
-                    const msg = await ch.send(buildVotePanel(fresh, 'public', candidates, names));
-                    updateRound(fresh.id, { publicChannelId: ch.id, publicMessageId: msg.id });
-                    // 投票开始通知：额外 @ 通知身份组，并记下消息 id 便于结束时改文案
-                    if (settings.voteNotifyRoleIds.length) {
-                        const mentions = settings.voteNotifyRoleIds.map(id => `<@&${id}>`).join(' ');
-                        const notifyMsg = await ch.send({
-                            content: `${mentions}\n🗳️ **${fresh.title}** 大众投票开始！\n👉 前往投票：${msg.url}\n投票截止 <t:${sec(fresh.voteDeadline)}:R>`,
-                            allowedMentions: { roles: settings.voteNotifyRoleIds },
-                        }).catch(() => null);
-                        if (notifyMsg) updateRound(fresh.id, { voteNotifyMessageId: notifyMsg.id });
-                    }
-                } else notes.push('大众投票频道不可发送。');
-            } catch { notes.push('大众投票面板发送失败。'); }
-        } else notes.push('未配置大众投票频道，跳过大众投票面板。');
-    }
-
-    // 管理内投：每个管理频道建 thread + 面板
-    if (fresh.enableAdmin) {
-        if (settings.adminVoteChannelIds.length) {
-            for (const chId of settings.adminVoteChannelIds) {
-                try {
-                    const ch = await client.channels.fetch(chId);
-                    if (ch?.type !== ChannelType.GuildText) { notes.push(`频道 <#${chId}> 不支持子区，跳过。`); continue; }
-                    const thread = await ch.threads.create({
-                        name: `募选#${fresh.id}-管理投票`,
-                        autoArchiveDuration: ThreadAutoArchiveDuration.OneWeek,
-                    });
-                    const msg = await thread.send(buildVotePanel(fresh, 'admin', candidates, names));
-                    saveAdminThread(fresh.id, chId, thread.id, msg.id);
-                } catch { notes.push(`频道 <#${chId}> 建子区失败。`); }
-            }
-        } else notes.push('未配置管理内投频道，跳过管理投票。');
-    }
-
+    const rep = await sendVotePanels(client, fresh, candidates, names);
     await closeEntryPanel(client, fresh, '🔒 自荐已结束，投票已开启');
 
-    return { ok: true, message: `已开启投票（候选 ${candidates.length} 人）。${notes.length ? '注意：' + notes.join(' ') : ''}` };
+    // 一个面板都没发出去：状态回退到开投票前，避免「状态已投票但没人能投」的死局。
+    const anyPanel = (fresh.enablePublic && rep.publicOk) || (fresh.enableAdmin && rep.adminOk > 0);
+    if (!anyPanel) {
+        updateRound(fresh.id, { status: prevStatus });
+        const backToNominating = prevStatus === 'nominating';
+        await closeEntryPanel(client, fresh, backToNominating ? undefined : '🔒 自荐已结束，公示中');
+        await editNotify(client, fresh.entryChannelId, fresh.nominateNotifyMessageId,
+            backToNominating
+                ? `📢 **${fresh.title}** 自荐进行中，截止 <t:${sec(fresh.nominateDeadline)}:R>。`
+                : `📢 **${fresh.title}** 自荐已结束，投票即将开始。`);
+        console.error(`[Election] 募选 #${fresh.id} 开投票失败：没有任何面板发送成功，已回退到公示期。`, rep.notes);
+        return {
+            ok: false,
+            message: `开启投票失败：一个投票面板都没能发出，已回退到公示期，修好后可重新执行。原因：${rep.notes.join(' ') || '未知'}`,
+        };
+    }
+
+    return {
+        ok: true,
+        message: `已开启投票（候选 ${candidates.length} 人）：${panelSummary(fresh, rep)}。`
+            + (rep.notes.length ? ` 注意：${rep.notes.join(' ')}` : ''),
+    };
 }
 
 // --------------------------- 结算 / 公示 ---------------------------

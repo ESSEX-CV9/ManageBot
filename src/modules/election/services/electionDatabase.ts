@@ -507,6 +507,7 @@ export function listRounds(guildId: string, statuses: RoundStatus[]): ElectionRo
 // 允许被更新的列白名单（防止拼错列名）
 const ROUND_COL: Record<string, string> = {
     status: 'status',
+    voteDeadline: 'vote_deadline',
     entryMessageId: 'entry_message_id',
     publicChannelId: 'public_channel_id',
     publicMessageId: 'public_message_id',
@@ -522,7 +523,7 @@ const ROUND_COL: Record<string, string> = {
 export function updateRound(
     id: number,
     patch: Partial<Pick<ElectionRound,
-        'status' | 'entryMessageId' | 'publicChannelId' | 'publicMessageId'
+        'status' | 'voteDeadline' | 'entryMessageId' | 'publicChannelId' | 'publicMessageId'
         | 'publicityChannelId' | 'publicityMessageId' | 'resultChannelId' | 'resultMessageId'
         | 'nominateNotifyMessageId' | 'voteNotifyMessageId'>>,
 ): void {

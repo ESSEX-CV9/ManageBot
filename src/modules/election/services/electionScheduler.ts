@@ -20,6 +20,11 @@ const processing = new Set<number>();
 const lastPoll = new Map<string, number>();
 const MIN_POLL_MINUTES = 10;
 
+// 开投票失败（例如面板因权限发不出去，场次被回退到公示期）后的重试冷却：
+// 既保证权限修好后能自动恢复，又不至于每个 tick 都去撞一次 Discord。
+const VOTE_RETRY_COOLDOWN_MS = 5 * 60_000;
+const voteRetryAfter = new Map<number, number>();
+
 /** 候选池定时自动拉取：仅对开启了轮询的服务器，按各自间隔同步。 */
 async function pollPools(client: Client): Promise<void> {
     if (isElectionTestMode()) return; // 测试模式下不自动拉取，避免覆盖注入的候选池
@@ -58,11 +63,15 @@ async function tick(client: Client): Promise<void> {
 
     for (const round of listRoundsAll(['publicity'])) {
         if (now < round.publicityDeadline || processing.has(round.id)) continue;
+        if (now < (voteRetryAfter.get(round.id) ?? 0)) continue; // 上次开投票失败，冷却中
         processing.add(round.id);
         try {
             const r = await openVoting(client, round);
+            if (r.ok) voteRetryAfter.delete(round.id);
+            else voteRetryAfter.set(round.id, now + VOTE_RETRY_COOLDOWN_MS);
             console.log(`[Election] 场次 #${round.id} 公示截止 → 开投票：${r.message}`);
         } catch (err) {
+            voteRetryAfter.set(round.id, now + VOTE_RETRY_COOLDOWN_MS);
             console.error(`[Election] 场次 #${round.id} 开投票出错：`, err);
         } finally {
             processing.delete(round.id);

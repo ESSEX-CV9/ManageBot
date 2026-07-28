@@ -1,8 +1,8 @@
 // src/modules/election/commands/electionCommand.ts
 //
 // 募选模块的管理斜杠命令 /募选管理。
-// 子命令：配置 / 导入候选池 / 查看候选池 / 发起 / 取消 / 查看报名 / 列表。
-// （后续阶段追加：开启投票 / 结算 等）
+// 子命令：配置 / 导入候选池 / 查看候选池 / 发起 / 取消 / 查看报名 / 列表 /
+//         打回 / 恢复 / 开启公示 / 开启投票 / 补发投票面板 / 顺延投票截止 / 结算 / 公示。
 
 import {
     SlashCommandBuilder,
@@ -16,7 +16,10 @@ import type { Command } from '../../../core/types';
 import { canManageElection, isElectionTestMode } from '../services/electionPermission';
 import { buildConfigHub } from '../components/electionConfig';
 import { buildEntryMessage } from '../components/electionRound';
-import { openPublicity, openVoting, settleRound, publishPending, disqualifyCandidate, restoreCandidate } from '../services/electionRunner';
+import {
+    openPublicity, openVoting, resendVotePanels, settleRound, publishPending,
+    disqualifyCandidate, restoreCandidate,
+} from '../services/electionRunner';
 import {
     getSettings,
     syncPool,
@@ -93,6 +96,15 @@ const data = new SlashCommandBuilder()
         sub.setName('开启投票')
             .setDescription('（手动）立即结束公示并开启投票')
             .addIntegerOption(o => o.setName('场次id').setDescription('募选编号').setRequired(true)))
+    .addSubcommand(sub =>
+        sub.setName('补发投票面板')
+            .setDescription('（修复用）投票中但面板没发出来时，检查并补发投票面板')
+            .addIntegerOption(o => o.setName('场次id').setDescription('募选编号').setRequired(true)))
+    .addSubcommand(sub =>
+        sub.setName('顺延投票截止')
+            .setDescription('（修复用）延长投票截止时间，并刷新投票面板上的时间')
+            .addIntegerOption(o => o.setName('场次id').setDescription('募选编号').setRequired(true))
+            .addNumberOption(o => o.setName('小时').setDescription('顺延多少小时（已过期则从现在起算）').setRequired(true).setMinValue(0.1)))
     .addSubcommand(sub =>
         sub.setName('结算')
             .setDescription('（手动）立即结算投票并出结果')
@@ -387,8 +399,39 @@ const command: Command = {
             return interaction.editReply(res.ok ? `✅ ${target.toString()}：${res.message}` : `⚠️ ${res.message}`);
         }
 
-        // ---- 开启公示 / 开启投票 / 结算 / 公示（手动触发 runner） ----
-        if (sub === '开启公示' || sub === '开启投票' || sub === '结算' || sub === '公示') {
+        // ---- 顺延投票截止（面板发晚了/投票被耽误时补时间） ----
+        if (sub === '顺延投票截止') {
+            const id = interaction.options.getInteger('场次id', true);
+            const round = getRound(id);
+            if (!round || round.guildId !== guildId) {
+                return interaction.reply({ content: `❌ 未找到募选 #${id}。`, flags: MessageFlags.Ephemeral });
+            }
+            if (round.status !== 'voting' && round.status !== 'publicity') {
+                return interaction.reply({
+                    content: `⚠️ 募选 #${id} 当前是「${STATUS_LABEL[round.status]}」，只有公示中/投票中的场次能顺延投票截止。`,
+                    flags: MessageFlags.Ephemeral,
+                });
+            }
+            await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+            const hours = interaction.options.getNumber('小时', true);
+            // 已过期的场次从现在起算，避免顺延后仍是过去时间
+            const base = Math.max(Date.now(), round.voteDeadline);
+            const voteDeadline = base + Math.round(hours * 3600_000);
+            updateRound(id, { voteDeadline });
+
+            // 投票中的场次顺手刷新面板（同时会补发缺失的面板）
+            let extra = '';
+            if (round.status === 'voting') {
+                const res = await resendVotePanels(interaction.client, getRound(id)!);
+                extra = `\n${res.ok ? '🔄' : '⚠️'} ${res.message}`;
+            }
+            return interaction.editReply(
+                `✅ 募选 #${id} 投票截止已顺延至 <t:${Math.floor(voteDeadline / 1000)}:f>（<t:${Math.floor(voteDeadline / 1000)}:R>）。${extra}`,
+            );
+        }
+
+        // ---- 开启公示 / 开启投票 / 补发投票面板 / 结算 / 公示（手动触发 runner） ----
+        if (sub === '开启公示' || sub === '开启投票' || sub === '补发投票面板' || sub === '结算' || sub === '公示') {
             const id = interaction.options.getInteger('场次id', true);
             const round = getRound(id);
             if (!round || round.guildId !== guildId) {
@@ -397,8 +440,9 @@ const command: Command = {
             await interaction.deferReply({ flags: MessageFlags.Ephemeral });
             const runner = sub === '开启公示' ? openPublicity
                 : sub === '开启投票' ? openVoting
-                    : sub === '结算' ? settleRound
-                        : publishPending;
+                    : sub === '补发投票面板' ? resendVotePanels
+                        : sub === '结算' ? settleRound
+                            : publishPending;
             const res = await runner(interaction.client, round);
             return interaction.editReply(res.ok ? `✅ 场次 #${id}：${res.message}` : `⚠️ 场次 #${id}：${res.message}`);
         }
