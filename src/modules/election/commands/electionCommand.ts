@@ -2,7 +2,7 @@
 //
 // 募选模块的管理斜杠命令 /募选管理。
 // 子命令：配置 / 导入候选池 / 查看候选池 / 发起 / 取消 / 查看报名 / 列表 /
-//         打回 / 恢复 / 开启公示 / 开启投票 / 补发投票面板 / 顺延投票截止 / 结算 / 公示。
+//         打回 / 恢复 / 开启公示 / 开启投票 / 补发投票面板 / 顺延投票截止 / 结算 / 公示 / 裁定平票。
 
 import {
     SlashCommandBuilder,
@@ -17,7 +17,7 @@ import { canManageElection, isElectionTestMode } from '../services/electionPermi
 import { buildConfigHub } from '../components/electionConfig';
 import { buildEntryMessage } from '../components/electionRound';
 import {
-    openPublicity, openVoting, resendVotePanels, settleRound, publishPending,
+    openPublicity, openVoting, resendVotePanels, settleRound, publishPending, resolveTie,
     disqualifyCandidate, restoreCandidate,
 } from '../services/electionRunner';
 import {
@@ -112,7 +112,12 @@ const data = new SlashCommandBuilder()
     .addSubcommand(sub =>
         sub.setName('公示')
             .setDescription('（手动）公示一个待确认的结算结果')
-            .addIntegerOption(o => o.setName('场次id').setDescription('募选编号').setRequired(true)));
+            .addIntegerOption(o => o.setName('场次id').setDescription('募选编号').setRequired(true)))
+    .addSubcommand(sub =>
+        sub.setName('裁定平票')
+            .setDescription('（平票时）从平票名单里人工指定当选者，指定后自动公示')
+            .addIntegerOption(o => o.setName('场次id').setDescription('募选编号').setRequired(true))
+            .addStringOption(o => o.setName('当选名单').setDescription('要当选的候选人：@ 他们或填用户ID，多人用空格分隔').setRequired(true)));
 
 const command: Command = {
     data,
@@ -397,6 +402,26 @@ const command: Command = {
                 ? await disqualifyCandidate(interaction.client, round, target.id, interaction.user.id, interaction.options.getString('理由'))
                 : await restoreCandidate(interaction.client, round, target.id);
             return interaction.editReply(res.ok ? `✅ ${target.toString()}：${res.message}` : `⚠️ ${res.message}`);
+        }
+
+        // ---- 裁定平票（规则分不出胜负时的人工决定） ----
+        if (sub === '裁定平票') {
+            const id = interaction.options.getInteger('场次id', true);
+            const round = getRound(id);
+            if (!round || round.guildId !== guildId) {
+                return interaction.reply({ content: `❌ 未找到募选 #${id}。`, flags: MessageFlags.Ephemeral });
+            }
+            // 从 @提及 或裸 ID 里抓用户 id，允许空格/逗号/顿号随便分隔
+            const ids = [...new Set(interaction.options.getString('当选名单', true).match(/\d{15,25}/g) ?? [])];
+            if (!ids.length) {
+                return interaction.reply({
+                    content: '❌ 没解析出候选人。请 @ 他们，或直接填用户 ID（多人用空格分隔）。',
+                    flags: MessageFlags.Ephemeral,
+                });
+            }
+            await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+            const res = await resolveTie(interaction.client, round, ids);
+            return interaction.editReply(res.ok ? `✅ 场次 #${id}：${res.message}` : `⚠️ 场次 #${id}：${res.message}`);
         }
 
         // ---- 顺延投票截止（面板发晚了/投票被耽误时补时间） ----

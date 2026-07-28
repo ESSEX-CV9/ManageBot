@@ -41,7 +41,7 @@ import {
     type RoundStatus,
     type Nomination,
 } from './electionDatabase';
-import { computeResults, type CandidateResult } from './electionTally';
+import { computeResults, tieInfo, type CandidateResult } from './electionTally';
 import { buildVotePanel } from '../components/electionVote';
 import { buildEntryMessage } from '../components/electionRound';
 import { canManageElection } from './electionPermission';
@@ -448,10 +448,19 @@ export async function settleRound(client: Client, round: ElectionRound): Promise
     const winners = results.filter(r => r.elected).map(r => r.userId);
     setRoundWinners(fresh.id, winners);
 
-    if (fresh.requireConfirm) {
+    // 出现完全平票时，无论是否开了二次确认都必须转人工——规则已经分不出谁该当选。
+    const { tied, seats } = tieInfo(fresh.vacancyCount, results);
+    if (fresh.requireConfirm || tied.length) {
         updateRound(fresh.id, { status: 'pending_confirm' });
         await postConfirmPrompt(client, fresh, results);
-        return { ok: true, message: '已生成结果，等待管理员确认后公示。' };
+        return {
+            ok: true,
+            message: !tied.length
+                ? '已生成结果，等待管理员确认后公示。'
+                : noVotesAtAll(results)
+                    ? `本场无人投票，${tied.length} 名候选人无法排名，已转人工裁定（/募选管理 裁定平票，或直接作废）。`
+                    : `出现平票：${tied.length} 人得分完全相同、争夺剩余 ${seats} 个名额，已转人工裁定（/募选管理 裁定平票）。`,
+        };
     }
 
     await publishResults(client, fresh, results);
@@ -477,10 +486,60 @@ export async function publishPending(client: Client, round: ElectionRound): Prom
     if (fresh.status !== 'pending_confirm') return { ok: false, message: `当前状态为「${fresh.status}」，无待确认结果。` };
 
     const results = computeRoundResults(fresh);
+    // 平票没裁定就公示，等于让名单顺序决定谁当选——拦住。
+    const { tied, seats } = tieInfo(fresh.vacancyCount, results);
+    if (tied.length) {
+        return {
+            ok: false,
+            message: `本场存在平票（${tied.length} 人争 ${seats} 个名额），请先用 \`/募选管理 裁定平票\` 指定当选者（裁定后会自动公示）。`,
+        };
+    }
     await publishResults(client, fresh, results);
     updateRound(fresh.id, { status: 'closed' });
     await disableVotePanels(client, fresh);
     return { ok: true, message: '已公示。' };
+}
+
+/**
+ * 人工裁定平票：从平票名单里指定当选者，然后直接定稿公示。
+ * 只能选平票组里的人，且不能超过剩余名额；少选则名额空缺（也是一种合法裁定）。
+ */
+export async function resolveTie(client: Client, round: ElectionRound, picks: string[]): Promise<RunResult> {
+    const fresh = getRound(round.id);
+    if (!fresh) return { ok: false, message: '募选不存在。' };
+    if (fresh.status !== 'pending_confirm') return { ok: false, message: `当前状态为「${fresh.status}」，没有待裁定的结果。` };
+
+    const results = computeRoundResults(fresh);
+    const { tied, seats } = tieInfo(fresh.vacancyCount, results);
+    if (!tied.length) return { ok: false, message: '本场没有平票需要裁定，直接用 `/募选管理 公示` 即可。' };
+
+    const tiedIds = new Set(tied.map(r => r.userId));
+    const chosen = [...new Set(picks)];
+    const outsiders = chosen.filter(id => !tiedIds.has(id));
+    if (outsiders.length) {
+        return {
+            ok: false,
+            message: `${outsiders.map(id => `<@${id}>`).join('、')} 不在平票名单里，无法指定。`
+                + `本场平票的是：${tied.map(r => `<@${r.userId}>`).join('、')}。`,
+        };
+    }
+    if (chosen.length > seats) return { ok: false, message: `只剩 ${seats} 个名额，最多指定 ${seats} 人。` };
+
+    // 按裁定定稿：平票组里被点名的当选，其余落选，平票标记清除
+    const picked = new Set(chosen);
+    for (const r of results) {
+        if (!r.tied) continue;
+        r.elected = picked.has(r.userId);
+        r.tied = false;
+    }
+    const winners = results.filter(r => r.elected).map(r => r.userId);
+    setRoundWinners(fresh.id, winners);
+    await publishResults(client, fresh, results);
+    updateRound(fresh.id, { status: 'closed' });
+    await disableVotePanels(client, fresh);
+
+    const vacant = seats - chosen.length;
+    return { ok: true, message: `已按裁定公示（当选 ${winners.length} 人${vacant > 0 ? `，${vacant} 个名额空缺` : ''}）。` };
 }
 
 /** 作废一个待确认的场次（不公示）。 */
@@ -495,6 +554,9 @@ export async function rejectPending(client: Client, round: ElectionRound): Promi
     return { ok: true, message: '已作废，未公示。' };
 }
 
+/** 全场一票没有：此时「大家都平票」的说法容易误解，单独换个说法。 */
+const noVotesAtAll = (results: CandidateResult[]) => results.every(r => r.publicVotes === 0 && r.adminVotes === 0);
+
 function shareText(round: ElectionRound, r: CandidateResult): string {
     const parts: string[] = [];
     if (round.enablePublic) parts.push(`民 ${(r.publicShare * 100).toFixed(1)}%`);
@@ -504,20 +566,33 @@ function shareText(round: ElectionRound, r: CandidateResult): string {
 
 function buildResultEmbed(round: ElectionRound, results: CandidateResult[], names: Map<string, string>, pending = false): EmbedBuilder {
     const winners = results.filter(r => r.elected);
+    const { tied, seats } = tieInfo(round.vacancyCount, results);
     const rank = results.map(r =>
-        `${r.elected ? '🏆' : '▫️'} #${r.rank} ${nameTag(names, r.userId)} — 综合 **${(r.finalScore * 100).toFixed(1)}%** ${shareText(round, r)}`,
+        `${r.tied ? '🤝' : r.elected ? '🏆' : '▫️'} #${r.rank} ${nameTag(names, r.userId)} — 综合 **${(r.finalScore * 100).toFixed(1)}%** ${shareText(round, r)}`,
     );
     const weights: string[] = [];
     if (round.enablePublic) weights.push(`大众×${round.weightPublic}`);
     if (round.enableAdmin) weights.push(`管理×${round.weightAdmin}`);
 
+    // 平票：得分与 tie-break 项都相同，规则分不出胜负，明说需要人工裁定
+    const tieLines = tied.length
+        ? [
+            '',
+            noVotesAtAll(results)
+                ? `🤝 **本场无人投票**：所有候选人得票均为 0，排不出名次，需管理员人工决定或作废本场。`
+                : `🤝 **平票待裁定**：${tied.map(r => nameTag(names, r.userId)).join('、')} 得分完全相同，`
+                    + `争夺剩余 **${seats}** 个名额，需管理员人工决定，暂未计入当选。`,
+        ]
+        : [];
+
     return new EmbedBuilder()
         .setTitle(`${pending ? '🕵️ 待确认' : '📢'} 募选结果：${round.title}`)
-        .setColor(pending ? 0xfaa61a : 0xeb459e)
+        .setColor(tied.length ? 0xed4245 : pending ? 0xfaa61a : 0xeb459e)
         .setDescription(
             [
                 `**空位数**：${round.vacancyCount}｜**加权**：${weights.join(' + ') || '—'}`,
                 `**当选**：${winners.map(w => nameTag(names, w.userId)).join('、') || '（无）'}`,
+                ...tieLines,
                 '',
                 '**完整排名：**',
                 ...rank,
@@ -640,9 +715,16 @@ async function postConfirmPrompt(client: Client, round: ElectionRound, results: 
     const guild = await fetchGuild(client, round.guildId);
     const names = guild ? await resolveNames(guild, results.map(r => r.userId)) : new Map<string, string>();
     const embed = buildResultEmbed(round, results, names, true);
-    embed.setDescription(`${embed.data.description ?? ''}\n\n_请管理员确认是否公示。_`);
-    const row = new ActionRowBuilder<ButtonBuilder>().addComponents(
+    // 有平票时不给「确认公示」按钮：必须先用命令点名裁定，否则公示出去等于随机决定
+    const { tied } = tieInfo(round.vacancyCount, results);
+    embed.setDescription(`${embed.data.description ?? ''}\n\n_${tied.length
+        ? `本场平票，请用 \`/募选管理 裁定平票 场次id:${round.id} 当选名单:@候选人\` 指定当选者（裁定后自动公示）；也可直接作废。`
+        : '请管理员确认是否公示。'}_`);
+    const buttons = tied.length ? [] : [
         new ButtonBuilder().setCustomId(`${CONFIRM_BTN}${round.id}`).setLabel('✅ 确认公示').setStyle(ButtonStyle.Success),
+    ];
+    const row = new ActionRowBuilder<ButtonBuilder>().addComponents(
+        ...buttons,
         new ButtonBuilder().setCustomId(`${REJECT_BTN}${round.id}`).setLabel('❌ 作废').setStyle(ButtonStyle.Danger),
     );
     const settings = getSettings(round.guildId);
