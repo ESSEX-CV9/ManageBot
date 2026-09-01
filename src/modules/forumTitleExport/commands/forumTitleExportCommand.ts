@@ -9,6 +9,7 @@
 // /论坛标题 移除 论坛id:xxx
 // /论坛标题 列表
 // /论坛标题 导出
+// /论坛标题 导出标签
 
 import {
   AttachmentBuilder,
@@ -48,6 +49,20 @@ interface ExportRow {
   locked: boolean;
   appliedTags: string;
   appliedTagIds: string;
+}
+
+interface TagExportRow {
+  guildName: string;
+  guildId: string;
+  forumName: string;
+  forumId: string;
+  tagCount: number;
+  tagOrder: number | '';
+  tagName: string;
+  tagId: string;
+  moderated: string;
+  emoji: string;
+  emojiId: string;
 }
 
 const CONFIG_DIR = path.join(process.cwd(), 'data');
@@ -141,6 +156,39 @@ function threadToRow(forum: ForumChannel, thread: ThreadChannel): ExportRow {
   };
 }
 
+function forumToTagRows(forum: ForumChannel): TagExportRow[] {
+  const base = {
+    guildName: forum.guild.name,
+    guildId: forum.guild.id,
+    forumName: forum.name,
+    forumId: forum.id,
+    tagCount: forum.availableTags.length,
+  };
+
+  // 即使论坛没有配置 Tag，也保留一行，确保导出的论坛列表是完整的。
+  if (forum.availableTags.length === 0) {
+    return [{
+      ...base,
+      tagOrder: '',
+      tagName: '',
+      tagId: '',
+      moderated: '',
+      emoji: '',
+      emojiId: '',
+    }];
+  }
+
+  return forum.availableTags.map((tag, index) => ({
+    ...base,
+    tagOrder: index + 1,
+    tagName: tag.name,
+    tagId: tag.id,
+    moderated: tag.moderated ? '是' : '否',
+    emoji: tag.emoji?.name ?? '',
+    emojiId: tag.emoji?.id ?? '',
+  }));
+}
+
 async function fetchAllForumThreads(forum: ForumChannel): Promise<ThreadChannel[]> {
   const threads = new Map<string, ThreadChannel>();
 
@@ -228,6 +276,48 @@ async function buildWorkbook(rows: ExportRow[]): Promise<Buffer> {
   return Buffer.from(buffer);
 }
 
+async function buildTagWorkbook(rows: TagExportRow[]): Promise<Buffer> {
+  const workbook = new ExcelJS.Workbook();
+  workbook.creator = 'ManageBot';
+  workbook.created = new Date();
+
+  const sheet = workbook.addWorksheet('论坛标签', {
+    views: [{ state: 'frozen', ySplit: 1 }],
+  });
+
+  sheet.columns = [
+    { header: '服务器', key: 'guildName', width: 24 },
+    { header: '服务器ID', key: 'guildId', width: 22 },
+    { header: '论坛', key: 'forumName', width: 24 },
+    { header: '论坛ID', key: 'forumId', width: 22 },
+    { header: '论坛Tag总数', key: 'tagCount', width: 14 },
+    { header: 'Tag顺序', key: 'tagOrder', width: 12 },
+    { header: 'Tag名称', key: 'tagName', width: 30 },
+    { header: 'Tag ID', key: 'tagId', width: 22 },
+    { header: '仅管理员可管理', key: 'moderated', width: 18 },
+    { header: 'Emoji', key: 'emoji', width: 16 },
+    { header: 'Emoji ID', key: 'emojiId', width: 22 },
+  ];
+
+  for (const row of rows) sheet.addRow(row);
+
+  const header = sheet.getRow(1);
+  header.font = { bold: true };
+  header.alignment = { vertical: 'middle' };
+
+  sheet.autoFilter = {
+    from: { row: 1, column: 1 },
+    to: { row: Math.max(1, sheet.rowCount), column: sheet.columnCount },
+  };
+
+  for (const key of ['forumName', 'tagName', 'emoji']) {
+    sheet.getColumn(key).alignment = { vertical: 'top', wrapText: true };
+  }
+
+  const buffer = await workbook.xlsx.writeBuffer();
+  return Buffer.from(buffer);
+}
+
 const data = new SlashCommandBuilder()
   .setName('论坛标题')
   .setDescription('（管理员）管理论坛标题导出列表并导出 Excel')
@@ -269,6 +359,11 @@ const data = new SlashCommandBuilder()
     subcommand
       .setName('导出')
       .setDescription('导出所有已登记论坛的帖子标题为 Excel'),
+  )
+  .addSubcommand(subcommand =>
+    subcommand
+      .setName('导出标签')
+      .setDescription('导出所有已登记论坛的 Tag 列表为 Excel'),
   );
 
 const command: Command = {
@@ -486,6 +581,80 @@ const command: Command = {
 
       return interaction.editReply({
         content: `✅ 导出完成，共 **${rows.length}** 个帖子，成功读取 **${successForums}/${forumIds.length}** 个论坛。${errorSummary}`,
+        files: [attachment],
+      });
+    }
+
+    if (subcommand === '导出标签') {
+      const config = await loadConfig();
+      const forumIds = config.forumIds;
+
+      if (forumIds.length === 0) {
+        return interaction.reply({
+          content: '❌ 当前没有登记论坛。请先使用 `/论坛标题 添加`。',
+          flags: MessageFlags.Ephemeral,
+        });
+      }
+
+      await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+
+      const rows: TagExportRow[] = [];
+      const errors: string[] = [];
+      let successForums = 0;
+      let tagCount = 0;
+
+      for (const forumId of forumIds) {
+        try {
+          const channel = await interaction.client.channels.fetch(forumId);
+
+          if (!channel) {
+            errors.push(`${forumId}: 频道不存在或 Bot 无权访问`);
+            continue;
+          }
+
+          if (channel.type !== ChannelType.GuildForum) {
+            errors.push(`${forumId}: 不是 Forum Channel`);
+            continue;
+          }
+
+          const forum = channel as ForumChannel;
+          rows.push(...forumToTagRows(forum));
+          tagCount += forum.availableTags.length;
+          successForums += 1;
+
+          console.log(`[ForumTitleExport] 读取论坛 Tag ${forum.guild.name}/${forum.name}: ${forum.availableTags.length} 个`);
+        } catch (error) {
+          console.error(`[ForumTitleExport] 读取论坛 ${forumId} 的 Tag 失败:`, error);
+          errors.push(`${forumId}: 读取 Tag 失败（详见 Bot 控制台）`);
+        }
+      }
+
+      if (rows.length === 0) {
+        const detail = errors.length > 0 ? `\n\n${errors.map(x => `• ${x}`).join('\n')}` : '';
+        return interaction.editReply(`❌ 没有读取到任何论坛。${detail}`);
+      }
+
+      rows.sort((a, b) => {
+        const guild = a.guildName.localeCompare(b.guildName, 'zh-CN');
+        if (guild !== 0) return guild;
+
+        const forum = a.forumName.localeCompare(b.forumName, 'zh-CN');
+        if (forum !== 0) return forum;
+
+        return Number(a.tagOrder || 0) - Number(b.tagOrder || 0);
+      });
+
+      const workbook = await buildTagWorkbook(rows);
+      const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
+      const filename = `forum-tags-${timestamp}.xlsx`;
+      const attachment = new AttachmentBuilder(workbook, { name: filename });
+
+      const errorSummary = errors.length > 0
+        ? `\n\n⚠️ 有 ${errors.length} 个论坛未成功导出：\n${errors.map(x => `• ${x}`).join('\n')}`
+        : '';
+
+      return interaction.editReply({
+        content: `✅ Tag 导出完成，共 **${tagCount}** 个 Tag，成功读取 **${successForums}/${forumIds.length}** 个论坛。${errorSummary}`,
         files: [attachment],
       });
     }
