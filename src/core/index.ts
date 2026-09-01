@@ -24,15 +24,18 @@ import pingCommand from '../shared/commands/ping';
 import setCheckChannelCommand from '../shared/commands/setCheckChannel';
 // import debugPermissionsCommand from '../shared/commands/debugPermissions'; // 需要调试权限时取消注释
 
-// ① 模版模块 —— 复制这一块来接入你自己的模块
+// 1. 模版模块 —— 复制这一块来接入你自己的模块
 import templateCommand from '../modules/template/commands/templateCommand';
 import { startTemplateSystem } from '../modules/template';
 
-// ① 募选模块
+// 2. 募选模块
 import electionCommand from '../modules/election/commands/electionCommand';
 import electionTestCommand from '../modules/election/commands/electionTestCommand';
 import { startElectionSystem } from '../modules/election';
 import { isElectionTestMode } from '../modules/election/services/electionPermission';
+
+// 3. 论坛帖子标题统计模块
+import forumTitleExportCommand from '../modules/forumTitleExport/commands/forumTitleExportCommand';
 
 // --- 进程级兜底日志（避免“无响应但控制台无日志”难以排查） ---
 const FATAL_EXIT_ON_EXCEPTION = String(process.env.FATAL_EXIT_ON_EXCEPTION || '').toLowerCase() === 'true';
@@ -103,11 +106,15 @@ client.commands.set(pingCommand.data.name, pingCommand);
 client.commands.set(setCheckChannelCommand.data.name, setCheckChannelCommand);
 // client.commands.set(debugPermissionsCommand.data.name, debugPermissionsCommand); // 需要调试权限时取消注释
 
-// ② 模版模块命令注册
+// 1. 模版模块命令注册
 client.commands.set(templateCommand.data.name, templateCommand);
 
-// ② 募选模块命令注册
+// 2. 募选模块命令注册
 client.commands.set(electionCommand.data.name, electionCommand);
+
+// 3. 论坛帖子标题统计模块命令注册
+client.commands.set(forumTitleExportCommand.data.name, forumTitleExportCommand);
+
 // 测试命令仅在测试模式下注册（生产环境不会出现 /募选测试）
 if (isElectionTestMode()) {
     client.commands.set(electionTestCommand.data.name, electionTestCommand);
