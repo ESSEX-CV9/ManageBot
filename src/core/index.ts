@@ -1,4 +1,4 @@
-// src/core/index.ts
+﻿// src/core/index.ts
 //
 // 机器人主入口。职责：
 //   1. 创建 Discord 客户端 + 诊断日志
@@ -77,8 +77,6 @@ client.on('error', (err) => console.error('❌ [Discord] client error:', err));
 client.on('warn', (info) => console.warn('⚠️ [Discord] client warn:', info));
 client.on('shardError', (err, shardId) => console.error(`❌ [Discord] shardError shard=${shardId}:`, err));
 client.on('shardDisconnect', (event, shardId) => console.warn(`⚠️ [Discord] shardDisconnect shard=${shardId} code=${event?.code} reason=${event?.reason}`));
-client.on('shardReconnecting', (shardId) => console.warn(`⚠️ [Discord] shardReconnecting shard=${shardId}`));
-client.on('shardResume', (shardId, replayedEvents) => console.log(`✅ [Discord] shardResume shard=${shardId} replayed=${replayedEvents}`));
 
 try {
     client.rest.on('rateLimited', (info) => {
