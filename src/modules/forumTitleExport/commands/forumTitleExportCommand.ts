@@ -5,6 +5,7 @@
 //
 // 命令：
 // /论坛标题 添加 论坛:#xxx
+// /论坛标题 添加 论坛id:123456789012345678
 // /论坛标题 移除 论坛id:xxx
 // /论坛标题 列表
 // /论坛标题 导出
@@ -14,6 +15,7 @@ import {
   ChannelType,
   MessageFlags,
   SlashCommandBuilder,
+  type ChatInputCommandInteraction,
   type ForumChannel,
   type GuildMember,
   type ThreadChannel,
@@ -53,6 +55,42 @@ const CONFIG_PATH = path.join(CONFIG_DIR, 'forum-title-export.json');
 
 function uniqueIds(ids: string[]): string[] {
   return [...new Set(ids.map(id => id.trim()).filter(Boolean))];
+}
+
+function normalizeForumId(value: string): string {
+  const trimmed = value.trim();
+  const mention = trimmed.match(/^<#(\d+)>$/);
+  return mention?.[1] ?? trimmed;
+}
+
+async function hasAdminPermission(interaction: ChatInputCommandInteraction): Promise<boolean> {
+  if (!interaction.guildId) return false;
+
+  // 正常情况下优先使用 interaction 中已经解析好的 GuildMember。
+  if (interaction.guild && interaction.member) {
+    const cachedMember = interaction.member as GuildMember;
+    if (checkAdminPermission(cachedMember)) return true;
+  }
+
+  // 某些服务器未命中 discord.js guild cache 时 interaction.guild 会是 null，
+  // 但 guildId 仍然存在。主动 fetch，避免把正常的服务器指令误判成私聊。
+  try {
+    const guild = interaction.guild ?? await interaction.client.guilds.fetch(interaction.guildId);
+    const member = await guild.members.fetch(interaction.user.id);
+    return checkAdminPermission(member);
+  } catch (error) {
+    console.warn(`[ForumTitleExport] 无法读取服务器 ${interaction.guildId} 的成员权限:`, error);
+    return false;
+  }
+}
+
+async function fetchForumById(
+  interaction: ChatInputCommandInteraction,
+  forumId: string,
+): Promise<ForumChannel | null> {
+  const channel = await interaction.client.channels.fetch(forumId);
+  if (!channel || channel.type !== ChannelType.GuildForum) return null;
+  return channel as ForumChannel;
 }
 
 async function loadConfig(): Promise<ExportConfig> {
@@ -196,13 +234,19 @@ const data = new SlashCommandBuilder()
   .addSubcommand(subcommand =>
     subcommand
       .setName('添加')
-      .setDescription('把当前服务器的一个论坛加入导出列表')
+      .setDescription('通过频道选择器或论坛 ID 加入导出列表')
       .addChannelOption(option =>
         option
           .setName('论坛')
-          .setDescription('要加入的 Forum Channel')
+          .setDescription('从当前服务器选择一个 Forum Channel')
           .addChannelTypes(ChannelType.GuildForum)
-          .setRequired(true),
+          .setRequired(false),
+      )
+      .addStringOption(option =>
+        option
+          .setName('论坛id')
+          .setDescription('直接输入 Forum Channel ID，可添加 Bot 所在其他服务器的论坛')
+          .setRequired(false),
       ),
   )
   .addSubcommand(subcommand =>
@@ -231,14 +275,14 @@ const command: Command = {
   data,
 
   async execute(interaction) {
-    if (!interaction.guild) {
+    if (!interaction.guildId) {
       return interaction.reply({
         content: '❌ 此命令只能在服务器中使用。',
         flags: MessageFlags.Ephemeral,
       });
     }
 
-    if (!checkAdminPermission(interaction.member as GuildMember | null)) {
+    if (!await hasAdminPermission(interaction)) {
       return interaction.reply({
         content: getPermissionDeniedMessage(),
         flags: MessageFlags.Ephemeral,
@@ -248,28 +292,69 @@ const command: Command = {
     const subcommand = interaction.options.getSubcommand();
 
     if (subcommand === '添加') {
-      const channel = interaction.options.getChannel('论坛', true);
+      const selectedChannel = interaction.options.getChannel('论坛', false);
+      const rawForumId = interaction.options.getString('论坛id', false);
 
-      if (channel.type !== ChannelType.GuildForum) {
+      if (!selectedChannel && !rawForumId) {
         return interaction.reply({
-          content: '❌ 请选择 Forum Channel。',
+          content: '❌ 请选择一个论坛，或填写论坛 ID。',
           flags: MessageFlags.Ephemeral,
         });
+      }
+
+      if (selectedChannel && rawForumId) {
+        return interaction.reply({
+          content: '❌ “论坛”和“论坛id”二选一即可，不要同时填写。',
+          flags: MessageFlags.Ephemeral,
+        });
+      }
+
+      let forum: ForumChannel | null = null;
+
+      if (selectedChannel) {
+        if (selectedChannel.type !== ChannelType.GuildForum) {
+          return interaction.reply({
+            content: '❌ 请选择 Forum Channel。',
+            flags: MessageFlags.Ephemeral,
+          });
+        }
+        forum = selectedChannel as ForumChannel;
+      } else {
+        const forumId = normalizeForumId(rawForumId!);
+        if (!/^\d+$/.test(forumId)) {
+          return interaction.reply({
+            content: '❌ 论坛 ID 格式不正确。请填写纯数字频道 ID（也支持 `<#频道ID>`）。',
+            flags: MessageFlags.Ephemeral,
+          });
+        }
+
+        try {
+          forum = await fetchForumById(interaction, forumId);
+        } catch (error) {
+          console.error(`[ForumTitleExport] 读取论坛 ${forumId} 失败:`, error);
+        }
+
+        if (!forum) {
+          return interaction.reply({
+            content: `❌ 无法读取论坛 \`${forumId}\`。请确认它是 Forum Channel，并且 Bot 已加入对应服务器且拥有查看该频道的权限。`,
+            flags: MessageFlags.Ephemeral,
+          });
+        }
       }
 
       const config = await loadConfig();
-      if (config.forumIds.includes(channel.id)) {
+      if (config.forumIds.includes(forum.id)) {
         return interaction.reply({
-          content: `ℹ️ <#${channel.id}> 已经在导出列表中。`,
+          content: `ℹ️ **${forum.guild.name} / ${forum.name}**（\`${forum.id}\`）已经在导出列表中。`,
           flags: MessageFlags.Ephemeral,
         });
       }
 
-      config.forumIds.push(channel.id);
+      config.forumIds.push(forum.id);
       await saveConfig(config);
 
       return interaction.reply({
-        content: `✅ 已加入论坛 <#${channel.id}>（\`${channel.id}\`）。当前共 **${config.forumIds.length}** 个论坛。`,
+        content: `✅ 已加入论坛 **${forum.guild.name} / ${forum.name}**（\`${forum.id}\`）。当前共 **${config.forumIds.length}** 个论坛。`,
         flags: MessageFlags.Ephemeral,
       });
     }
@@ -299,7 +384,7 @@ const command: Command = {
 
       if (config.forumIds.length === 0) {
         return interaction.reply({
-          content: '当前还没有登记任何论坛。使用 `/论坛标题 添加` 添加。',
+          content: '当前还没有登记任何论坛。使用 `/论坛标题 添加`，可选择论坛或直接输入论坛 ID。',
           flags: MessageFlags.Ephemeral,
         });
       }
