@@ -10,10 +10,20 @@
 //      而成人向内容极易被 provider 的内容审核拦截。只在「把握低」时才二次调用带正文。
 //   3. 遇到内容审核类错误 → 自动降级为不带正文重试 → 仍失败则转人工，流程绝不卡死。
 //
-// 同时支持两种 OpenAI 兼容协议（Chat Completions / Responses），内部统一成 judge() 一个接口。
+// 怎么调接口（两种协议、三种姿势、降级重试）全在 llmClient.ts，这里只管问什么。
 
 import crypto from 'crypto';
+
+import {
+    callCascade, callOnce, knownMode, readLlmConfig, toFailure,
+    type CallMode, type CallSpec, type LlmConfig, type LlmFailure,
+} from './llmClient';
 import type { GroupId, GuardConfig } from './types';
+
+export {
+    MODE_LABEL, describeLlmConfig, readLlmConfig,
+    type CallMode, type LlmConfig, type LlmProtocol, type ToolMode,
+} from './llmClient';
 
 /**
  * 判定结果缓存。由调用方注入——机器人注入 SQLite 实现，
@@ -25,53 +35,6 @@ export interface JudgementCache {
     set(key: string, value: Judgement): void;
 }
 
-export type LlmProtocol = 'chat' | 'responses';
-
-/**
- * 怎么让模型交出结构化结果。
- *   forced —— 带 tools 且 tool_choice 强制指定函数。最可靠，但**思考模式的模型往往不支持**
- *             （典型报错：Thinking mode does not support this tool_choice）
- *   auto   —— 带 tools，但让模型自己决定调不调
- *   json   —— 完全不用 tools，要求模型直接输出 JSON，程序自己从回复里抠出来
- * 'cascade' 表示按 forced → auto → json 依次降级，成功哪个就记住哪个。
- */
-export type CallMode = 'forced' | 'auto' | 'json';
-export type ToolMode = CallMode | 'cascade';
-
-export interface LlmConfig {
-    baseUrl: string;
-    apiKey: string;
-    model: string;
-    protocol: LlmProtocol;
-    timeoutMs: number;
-    /** 默认 cascade：自动降级，不用管模型支不支持 tool_choice */
-    toolMode?: ToolMode;
-}
-
-export function readLlmConfig(): LlmConfig | null {
-    const baseUrl = (process.env.TITLEGUARD_LLM_BASE_URL || '').trim().replace(/\/+$/, '');
-    const apiKey = (process.env.TITLEGUARD_LLM_API_KEY || '').trim();
-    const model = (process.env.TITLEGUARD_LLM_MODEL || '').trim();
-    if (!baseUrl || !apiKey || !model) return null;
-
-    const protocolRaw = (process.env.TITLEGUARD_LLM_PROTOCOL || 'chat').trim().toLowerCase();
-    const protocol: LlmProtocol = protocolRaw === 'responses' ? 'responses' : 'chat';
-
-    const timeout = Number(process.env.TITLEGUARD_LLM_TIMEOUT_MS);
-    const rawMode = (process.env.TITLEGUARD_LLM_TOOL_MODE || 'cascade').trim().toLowerCase();
-    const toolMode: ToolMode =
-        rawMode === 'forced' || rawMode === 'auto' || rawMode === 'json' ? rawMode : 'cascade';
-
-    return {
-        baseUrl,
-        apiKey,
-        model,
-        protocol,
-        timeoutMs: Number.isFinite(timeout) && timeout > 0 ? timeout : 20000,
-        toolMode,
-    };
-}
-
 // ---------- 输入输出 ----------
 
 export interface JudgeHit {
@@ -80,10 +43,6 @@ export interface JudgeHit {
     where: 'marker' | 'body';
 }
 
-/**
- * 社区既定的分类规则。必须喂给模型——否则它遇到「TAG 同时挂了 NTR 和纯爱」
- * 只会说「无法唯一确定应保留哪一组，故转人工」，而程序这边其实有确定答案（按优先级取）。
- */
 /**
  * 喂给模型的社区规则。三个维度都得给全，少一个模型就会自己脑补。
  * 尤其是「TAG 互斥」和「关键字互斥」是两套独立配置——
@@ -136,13 +95,7 @@ export interface Judgement {
     reason: string;
 }
 
-export type JudgeFailure =
-    | 'disabled'         // 没配 LLM 或被关掉
-    | 'moderation'       // 被内容审核拦了
-    | 'network'          // 网络/超时/5xx
-    | 'parse'            // 模型没调工具或参数解析失败
-    | 'tool_unsupported' // 模型不支持这种工具调用方式（思考模式常见）
-    | 'unknown';
+export type JudgeFailure = LlmFailure;
 
 export type JudgeOutcome =
     | { ok: true; judgement: Judgement; cached: boolean; usedBody: boolean; mode: CallMode }
@@ -254,7 +207,7 @@ TAG 和标题关键字是**两套独立的东西**。同一对分类在这两个
 拿不准「是不是分类标记」才填 low。错误的 high 会导致作者的标题被误改。`;
 
 /** 把互斥集合和优先级渲染成模型能直接照着办的说明 */
-function renderRules(rules: JudgeRules): string[] {
+export function renderRules(rules: JudgeRules): string[] {
     const lines: string[] = ['本社区既定的分类规则（以此为准，不要凭常识推断）：'];
 
     const withPriority = (groups: GroupId[]) => [...groups]
@@ -317,62 +270,6 @@ function buildUserPrompt(input: JudgeInput): string {
     return lines.join('\n');
 }
 
-// ---------- 协议适配 ----------
-
-interface RawCall {
-    argumentsJson: string;
-}
-
-function isModerationError(status: number, body: string): boolean {
-    if (status === 451) return true;
-    return /content[_\s-]?filter|content[_\s-]?policy|moderation|safety|risk[_\s-]?control|敏感|违规内容|内容审核/i
-        .test(body);
-}
-
-/**
- * 模型不支持这种工具调用方式。
- * 典型：思考/推理模式的模型拒绝强制 tool_choice——
- *   `Thinking mode does not support this tool_choice`
- * 碰到这类报错要降级换个姿势，而不是当成网络错误直接放弃。
- */
-function isToolChoiceError(body: string): boolean {
-    return /tool_choice|tool[_\s-]?call|function[_\s-]?call(ing)?|thinking mode|reasoning mode|不支持.*工具/i
-        .test(body);
-}
-
-/**
- * 从模型的自由文本里抠出 JSON 对象。
- * 思考模式的回复常见形态：前面一堆推理过程，中间夹 ```json 代码块，或者直接跟一个裸对象。
- * 用括号配对而不是正则，避免被 JSON 字符串里的花括号骗到。
- */
-function extractJson(text: string): string | null {
-    const fenced = text.match(/```(?:json)?\s*([\s\S]*?)```/i);
-    const candidates = [fenced ? fenced[1] : null, text].filter(Boolean) as string[];
-
-    for (const source of candidates) {
-        const start = source.indexOf('{');
-        if (start < 0) continue;
-
-        let depth = 0;
-        let inString = false;
-        let escaped = false;
-
-        for (let i = start; i < source.length; i++) {
-            const ch = source[i];
-            if (escaped) { escaped = false; continue; }
-            if (ch === '\\') { escaped = true; continue; }
-            if (ch === '"') { inString = !inString; continue; }
-            if (inString) continue;
-            if (ch === '{') depth++;
-            else if (ch === '}') {
-                depth--;
-                if (depth === 0) return source.slice(start, i + 1);
-            }
-        }
-    }
-    return null;
-}
-
 /** json 模式下追加的输出格式说明——没有 tool schema 兜着，只能在提示里写清楚 */
 const JSON_INSTRUCTION = `
 
@@ -386,142 +283,15 @@ const JSON_INSTRUCTION = `
   "reason": "一句话理由"
 }`;
 
-async function postJson(
-    config: LlmConfig, path: string, payload: unknown,
-): Promise<{ status: number; text: string }> {
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), config.timeoutMs);
-    try {
-        const res = await fetch(`${config.baseUrl}${path}`, {
-            method: 'POST',
-            headers: {
-                'content-type': 'application/json',
-                authorization: `Bearer ${config.apiKey}`,
-            },
-            body: JSON.stringify(payload),
-            signal: controller.signal,
-        });
-        return { status: res.status, text: await res.text() };
-    } finally {
-        clearTimeout(timer);
-    }
-}
-
-const TOOL_DEF = {
-    type: 'function',
-    function: { name: TOOL_NAME, description: '提交分类标记判断结果', parameters: TOOL_PARAMETERS },
-};
-
-function classifyHttpError(status: number, text: string): LlmError {
-    if (isModerationError(status, text)) {
-        return new LlmError('moderation', `HTTP ${status}: ${text.slice(0, 300)}`);
-    }
-    // 4xx 且提到 tool_choice / thinking mode → 是调用姿势不对，换个姿势还有救
-    if (status >= 400 && status < 500 && isToolChoiceError(text)) {
-        return new LlmError('tool_unsupported', `HTTP ${status}: ${text.slice(0, 300)}`);
-    }
-    return new LlmError('network', `HTTP ${status}: ${text.slice(0, 300)}`);
-}
-
-/** Chat Completions */
-async function callChat(config: LlmConfig, input: JudgeInput, mode: CallMode): Promise<RawCall> {
-    const userContent = buildUserPrompt(input) + (mode === 'json' ? JSON_INSTRUCTION : '');
-
-    const payload: Record<string, unknown> = {
-        model: config.model,
-        temperature: 0,
-        messages: [
-            { role: 'system', content: SYSTEM_PROMPT },
-            { role: 'user', content: userContent },
-        ],
+function specFor(input: JudgeInput): CallSpec {
+    return {
+        toolName: TOOL_NAME,
+        toolDescription: '提交分类标记判断结果',
+        parameters: TOOL_PARAMETERS as unknown as Record<string, unknown>,
+        systemPrompt: SYSTEM_PROMPT,
+        userPrompt: buildUserPrompt(input),
+        jsonInstruction: JSON_INSTRUCTION,
     };
-
-    if (mode === 'forced') {
-        payload.tools = [TOOL_DEF];
-        payload.tool_choice = { type: 'function', function: { name: TOOL_NAME } };
-    } else if (mode === 'auto') {
-        payload.tools = [TOOL_DEF];
-        payload.tool_choice = 'auto';
-    }
-
-    const { status, text } = await postJson(config, '/chat/completions', payload);
-    if (status < 200 || status >= 300) throw classifyHttpError(status, text);
-
-    const data = JSON.parse(text) as {
-        choices?: {
-            message?: {
-                content?: string | null;
-                tool_calls?: { function?: { arguments?: string } }[];
-            };
-        }[];
-    };
-    const message = data.choices?.[0]?.message;
-
-    const args = message?.tool_calls?.[0]?.function?.arguments;
-    if (args) return { argumentsJson: args };
-
-    // 没调工具（json 模式本来就不带 tools，auto 模式也可能不调）→ 从正文里抠 JSON
-    const extracted = extractJson(message?.content ?? '');
-    if (extracted) return { argumentsJson: extracted };
-
-    throw new LlmError('parse',
-        mode === 'json' ? '回复里找不到 JSON 对象' : '模型未调用工具，回复里也没有 JSON');
-}
-
-/** Responses API：tools 扁平 + tool_choice.name，结果在 output[] 里找 function_call */
-async function callResponses(config: LlmConfig, input: JudgeInput, mode: CallMode): Promise<RawCall> {
-    const userContent = buildUserPrompt(input) + (mode === 'json' ? JSON_INSTRUCTION : '');
-
-    const payload: Record<string, unknown> = {
-        model: config.model,
-        temperature: 0,
-        instructions: SYSTEM_PROMPT,
-        input: [{ role: 'user', content: userContent }],
-    };
-
-    if (mode !== 'json') {
-        payload.tools = [{
-            type: 'function',
-            name: TOOL_NAME,
-            description: '提交分类标记判断结果',
-            parameters: TOOL_PARAMETERS,
-        }];
-        payload.tool_choice = mode === 'forced' ? { type: 'function', name: TOOL_NAME } : 'auto';
-    }
-
-    const { status, text } = await postJson(config, '/responses', payload);
-    if (status < 200 || status >= 300) throw classifyHttpError(status, text);
-
-    const data = JSON.parse(text) as {
-        output?: {
-            type?: string; name?: string; arguments?: string;
-            content?: { type?: string; text?: string }[];
-        }[];
-        output_text?: string;
-    };
-
-    const call = data.output?.find(o => o.type === 'function_call' && o.name === TOOL_NAME)
-        ?? data.output?.find(o => o.type === 'function_call');
-    if (call?.arguments) return { argumentsJson: call.arguments };
-
-    // 没调工具 → 把所有文本片段拼起来抠 JSON
-    const textOut = data.output_text
-        ?? (data.output ?? [])
-            .flatMap(o => o.content ?? [])
-            .map(c => c.text ?? '')
-            .join('\n');
-    const extracted = extractJson(textOut);
-    if (extracted) return { argumentsJson: extracted };
-
-    throw new LlmError('parse',
-        mode === 'json' ? '回复里找不到 JSON 对象' : '模型未调用工具，回复里也没有 JSON');
-}
-
-class LlmError extends Error {
-    constructor(public kind: JudgeFailure, message: string) {
-        super(message);
-        this.name = 'LlmError';
-    }
 }
 
 // ---------- 解析与校验 ----------
@@ -531,7 +301,7 @@ function parseJudgement(argumentsJson: string): Judgement {
     try {
         raw = JSON.parse(argumentsJson) as Record<string, unknown>;
     } catch {
-        throw new LlmError('parse', `工具参数不是合法 JSON：${argumentsJson.slice(0, 200)}`);
+        throw new Error(`工具参数不是合法 JSON：${argumentsJson.slice(0, 200)}`);
     }
 
     const confidenceRaw = String(raw.confidence ?? '').toLowerCase();
@@ -554,28 +324,6 @@ function parseJudgement(argumentsJson: string): Judgement {
 }
 
 // ---------- 对外接口 ----------
-
-/**
- * 记住每个「接口 + 模型」实际能用哪种调用姿势，避免每次都从 forced 撞一遍。
- * 只存在内存里，重启后重新试探。
- */
-const workingMode = new Map<string, CallMode>();
-
-function modeKey(config: LlmConfig): string {
-    return `${config.baseUrl}::${config.model}::${config.protocol}`;
-}
-
-function rememberMode(config: LlmConfig, mode: CallMode): void {
-    workingMode.set(modeKey(config), mode);
-}
-
-/** 降级顺序：上次成功的那个排最前，其余按可靠性排 */
-function orderedModes(config: LlmConfig): CallMode[] {
-    const all: CallMode[] = ['forced', 'auto', 'json'];
-    const known = workingMode.get(modeKey(config));
-    if (!known) return all;
-    return [known, ...all.filter(m => m !== known)];
-}
 
 function cacheKey(config: LlmConfig, input: JudgeInput): string {
     const payload = JSON.stringify({
@@ -629,95 +377,32 @@ export async function judge(
     if (cached) {
         return {
             ok: true, judgement: cached, cached: true, usedBody: false,
-            mode: workingMode.get(modeKey(config)) ?? 'forced',
+            mode: knownMode(config) ?? 'forced',
         };
     }
-
-    const call = config.protocol === 'responses' ? callResponses : callChat;
-
-    /**
-     * 用指定姿势调一次。
-     * retryOnParse 只在**最后一种**姿势上打开：中间的姿势解析失败了直接降级就好，
-     * 原地重试一次纯属多花一次调用。
-     */
-    const attempt = async (
-        payload: JudgeInput, mode: CallMode, retryOnParse: boolean,
-    ): Promise<Judgement> => {
-        try {
-            return parseJudgement((await call(config, payload, mode)).argumentsJson);
-        } catch (err) {
-            if (retryOnParse && err instanceof LlmError && err.kind === 'parse') {
-                return parseJudgement((await call(config, payload, mode)).argumentsJson);
-            }
-            throw err;
-        }
-    };
-
-    /**
-     * 按 forced → auto → json 依次降级。
-     * 思考模式的模型会拒绝强制 tool_choice（Thinking mode does not support this tool_choice），
-     * 碰到这类报错就换下一种姿势，而不是直接判失败。
-     * 成功哪个就记住哪个，下次直接从它开始，不用每次都撞一遍墙。
-     */
-    const cascade = async (payload: JudgeInput): Promise<{ judgement: Judgement; mode: CallMode }> => {
-        const configured = config.toolMode ?? 'cascade';
-        const modes: CallMode[] = configured === 'cascade'
-            ? orderedModes(config)
-            : [configured];
-
-        const tried: CallMode[] = [];
-        let lastError: LlmError | Error | null = null;
-
-        for (let i = 0; i < modes.length; i++) {
-            const mode = modes[i];
-            const isLast = i === modes.length - 1;
-            tried.push(mode);
-            try {
-                const judgement = await attempt(payload, mode, isLast);
-                rememberMode(config, mode);
-                return { judgement, mode };
-            } catch (err) {
-                lastError = err instanceof Error ? err : new Error(String(err));
-                const kind = err instanceof LlmError ? err.kind : 'unknown';
-                // 只有「姿势不对」和「解析不出来」才值得换姿势重试；
-                // 网络不通、被内容审核拦下，换几次都一样。
-                if (kind !== 'tool_unsupported' && kind !== 'parse') throw err;
-                console.warn(`[TitleGuard] LLM ${mode} 模式不可用（${kind}），降级重试：`
-                    + `${lastError.message.slice(0, 160)}`);
-            }
-        }
-
-        const err = lastError ?? new LlmError('unknown', '所有调用方式都失败了');
-        throw Object.assign(err, { triedModes: tried });
-    };
 
     let judgement: Judgement;
     let usedMode: CallMode;
     try {
-        const r = await cascade(input);
-        judgement = r.judgement;
+        const r = await callCascade(config, specFor(input), parseJudgement);
+        judgement = r.value;
         usedMode = r.mode;
     } catch (err) {
-        const kind = err instanceof LlmError ? err.kind : 'unknown';
-        return {
-            ok: false,
-            kind,
-            error: err instanceof Error ? err.message : String(err),
-            triedModes: (err as { triedModes?: CallMode[] }).triedModes,
-        };
+        return { ok: false, ...toFailure(err) };
     }
 
     // 把握低且允许带正文时，补一次带正文的判定
     let usedBody = false;
     if (judgement.confidence === 'low' && options.bodyExcerpt) {
         try {
-            const better = await attempt({ ...input, bodyExcerpt: options.bodyExcerpt }, usedMode, true);
-            judgement = better;
+            judgement = await callOnce(
+                config, specFor({ ...input, bodyExcerpt: options.bodyExcerpt }),
+                usedMode, parseJudgement, true,
+            );
             usedBody = true;
         } catch (err) {
             // 被内容审核拦了就保留不带正文的结果，绝不让流程卡死
-            const kind = err instanceof LlmError ? err.kind : 'unknown';
-            console.warn(`[TitleGuard] 带正文重判失败（${kind}），沿用不带正文的结果：`,
+            console.warn('[TitleGuard] 带正文重判失败，沿用不带正文的结果：',
                 err instanceof Error ? err.message : err);
         }
     }
@@ -725,19 +410,3 @@ export async function judge(
     options.cache?.set(key, judgement);
     return { ok: true, judgement, cached: false, usedBody, mode: usedMode };
 }
-
-/** 供配置面板显示：LLM 是否已配好 */
-export function describeLlmConfig(): string {
-    const config = readLlmConfig();
-    if (!config) return '未配置（缺 TITLEGUARD_LLM_BASE_URL / API_KEY / MODEL）';
-    const known = workingMode.get(modeKey(config));
-    return `${config.model} @ ${config.baseUrl}`
-        + `（${config.protocol === 'chat' ? 'Chat Completions' : 'Responses API'}`
-        + `${known ? ` · ${MODE_LABEL[known]}` : ''}）`;
-}
-
-export const MODE_LABEL: Record<CallMode, string> = {
-    forced: '强制 tool call',
-    auto: '模型自行决定是否调用工具',
-    json: 'JSON 输出',
-};

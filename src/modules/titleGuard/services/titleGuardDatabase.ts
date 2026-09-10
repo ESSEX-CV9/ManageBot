@@ -49,6 +49,19 @@ db.exec(`
         updated_at              INTEGER NOT NULL
     );
 
+    -- 身份组能力：谁能干什么。
+    -- 社区管理组不是一个身份组，而是一堆（风纪委员、执行管理……），
+    -- 各自负责的事情不一样，所以权限按「能力」发，不按「是不是管理员」发。
+    -- 某项能力一个身份组都没配 = 回退到 permissionManager 的管理员判定（即保持原状）。
+    CREATE TABLE IF NOT EXISTS tt_role_caps (
+        guild_id   TEXT NOT NULL,
+        role_id    TEXT NOT NULL,
+        capability TEXT NOT NULL,
+        granted_by TEXT,
+        granted_at INTEGER NOT NULL,
+        PRIMARY KEY (guild_id, role_id, capability)
+    );
+
     -- 论坛级配置
     CREATE TABLE IF NOT EXISTS tt_forums (
         guild_id          TEXT NOT NULL,
@@ -270,7 +283,66 @@ migrateExclusiveDimension();
 migrateTagBanToCross();
 
 ensureColumn('tt_settings', 'multi_route_group', "TEXT NOT NULL DEFAULT ''");
+
+// 申诉复核（两级：先 AI 一次，再人工）
+ensureColumn('tt_cases', 'appeal_text', 'TEXT');
+ensureColumn('tt_cases', 'appeal_by', 'TEXT');
+ensureColumn('tt_cases', 'appeal_at', 'INTEGER');
+// AI 复核每案只有一次，用掉就置 1
+ensureColumn('tt_cases', 'ai_review_used', 'INTEGER NOT NULL DEFAULT 0');
+ensureColumn('tt_cases', 'ai_review_upheld', 'INTEGER');
+ensureColumn('tt_cases', 'llm_review_reason', 'TEXT');
+// 申诉时暂停倒计时，存下当时还剩多久；AI 维持原判后按这个恢复，
+// 免得点一下按钮就白赚一整个宽限期
+ensureColumn('tt_cases', 'paused_remaining_ms', 'INTEGER');
 ensureColumn('tt_groups', 'priority', 'INTEGER NOT NULL DEFAULT 0');
+
+// ============================================================
+// 身份组能力
+// ============================================================
+
+const listCapsStmt = db.prepare(
+    'SELECT role_id, capability FROM tt_role_caps WHERE guild_id = ? ORDER BY capability, role_id');
+const listCapRolesStmt = db.prepare(
+    'SELECT role_id FROM tt_role_caps WHERE guild_id = ? AND capability = ?');
+const grantCapStmt = db.prepare(`
+    INSERT INTO tt_role_caps (guild_id, role_id, capability, granted_by, granted_at)
+    VALUES (?, ?, ?, ?, ?)
+    ON CONFLICT(guild_id, role_id, capability) DO NOTHING
+`);
+const revokeCapStmt = db.prepare(
+    'DELETE FROM tt_role_caps WHERE guild_id = ? AND role_id = ? AND capability = ?');
+const revokeAllCapsStmt = db.prepare('DELETE FROM tt_role_caps WHERE guild_id = ? AND role_id = ?');
+
+export interface RoleCapability {
+    roleId: string;
+    capability: string;
+}
+
+export function listRoleCapabilities(guildId: string): RoleCapability[] {
+    const rows = listCapsStmt.all(guildId) as { role_id: string; capability: string }[];
+    return rows.map(r => ({ roleId: r.role_id, capability: r.capability }));
+}
+
+/** 拥有某项能力的身份组。空数组 = 没配，调用方据此回退到管理员判定 */
+export function listRolesWithCapability(guildId: string, capability: string): string[] {
+    const rows = listCapRolesStmt.all(guildId, capability) as { role_id: string }[];
+    return rows.map(r => r.role_id);
+}
+
+export function grantCapability(
+    guildId: string, roleId: string, capability: string, byUserId: string,
+): boolean {
+    return grantCapStmt.run(guildId, roleId, capability, byUserId, Date.now()).changes > 0;
+}
+
+export function revokeCapability(guildId: string, roleId: string, capability: string): boolean {
+    return revokeCapStmt.run(guildId, roleId, capability).changes > 0;
+}
+
+export function revokeAllCapabilities(guildId: string, roleId: string): number {
+    return revokeAllCapsStmt.run(guildId, roleId).changes;
+}
 
 // ============================================================
 // 服务器配置
@@ -832,6 +904,17 @@ export interface GuardCase {
     isOldPost: boolean;
     wasArchived: boolean;
     llmReason: string | null;
+    /** 作者提交的申诉理由（已过安检才会落这儿） */
+    appealText: string | null;
+    appealBy: string | null;
+    appealAt: number | null;
+    /** AI 复核用掉了没有。每案只有一次 */
+    aiReviewUsed: boolean;
+    /** AI 复核的结论：true 维持原判，false 申诉成立，null 还没复核过 */
+    aiReviewUpheld: boolean | null;
+    llmReviewReason: string | null;
+    /** 倒计时暂停时还剩多久。恢复时按它算，不重新给一整个宽限期 */
+    pausedRemainingMs: number | null;
     createdAt: number;
     updatedAt: number;
     closedAt: number | null;
@@ -854,6 +937,13 @@ interface CaseRow {
     is_old_post: number;
     was_archived: number;
     llm_reason: string | null;
+    appeal_text: string | null;
+    appeal_by: string | null;
+    appeal_at: number | null;
+    ai_review_used: number;
+    ai_review_upheld: number | null;
+    llm_review_reason: string | null;
+    paused_remaining_ms: number | null;
     created_at: number;
     updated_at: number;
     closed_at: number | null;
@@ -877,6 +967,13 @@ function toCase(row: CaseRow): GuardCase {
         isOldPost: Boolean(row.is_old_post),
         wasArchived: Boolean(row.was_archived),
         llmReason: row.llm_reason,
+        appealText: row.appeal_text,
+        appealBy: row.appeal_by,
+        appealAt: row.appeal_at,
+        aiReviewUsed: Boolean(row.ai_review_used),
+        aiReviewUpheld: row.ai_review_upheld === null ? null : Boolean(row.ai_review_upheld),
+        llmReviewReason: row.llm_review_reason,
+        pausedRemainingMs: row.paused_remaining_ms,
         createdAt: row.created_at,
         updatedAt: row.updated_at,
         closedAt: row.closed_at,
@@ -981,6 +1078,13 @@ const updateCaseStmt = db.prepare(`
         notice_message_id = @notice_message_id,
         deadline = @deadline,
         llm_reason = @llm_reason,
+        appeal_text = @appeal_text,
+        appeal_by = @appeal_by,
+        appeal_at = @appeal_at,
+        ai_review_used = @ai_review_used,
+        ai_review_upheld = @ai_review_upheld,
+        llm_review_reason = @llm_review_reason,
+        paused_remaining_ms = @paused_remaining_ms,
         updated_at = @updated_at,
         closed_at = @closed_at
     WHERE id = @id
@@ -999,6 +1103,13 @@ export function updateCase(id: number, patch: Partial<Omit<GuardCase, 'id'>>): G
         notice_message_id: merged.noticeMessageId,
         deadline: merged.deadline,
         llm_reason: merged.llmReason,
+        appeal_text: merged.appealText,
+        appeal_by: merged.appealBy,
+        appeal_at: merged.appealAt,
+        ai_review_used: merged.aiReviewUsed ? 1 : 0,
+        ai_review_upheld: merged.aiReviewUpheld === null ? null : (merged.aiReviewUpheld ? 1 : 0),
+        llm_review_reason: merged.llmReviewReason,
+        paused_remaining_ms: merged.pausedRemainingMs,
         updated_at: Date.now(),
         closed_at: merged.closedAt,
     });

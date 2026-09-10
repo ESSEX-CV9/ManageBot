@@ -10,12 +10,29 @@ import { Events, type Client, type ThreadChannel } from 'discord.js';
 import { startTitleGuardScheduler } from './services/titleGuardScheduler';
 import { titleGuardThreadCreate, titleGuardThreadUpdate } from './events/threadEvents';
 
+import type { ModalSubmitInteraction } from 'discord.js';
+
+import { MODAL_APPEAL, handleAppealModal } from './components/noticePanel';
+import { handleTitleGuardModal as handleAuthorFixModal } from './components/authorFixPanel';
+
 export { handleTitleGuardButton } from './components/noticePanel';
 export {
     handleTitleGuardSelect,
-    handleTitleGuardModal,
     handleAuthorFixButton,
 } from './components/authorFixPanel';
+
+/**
+ * 模块里的模态框统一从这儿分流。
+ * 核心只按 tt_ 前缀分发到模块，模块内部再按具体 customId 认领——
+ * 免得每加一个弹窗就得改一次核心。
+ */
+export async function handleTitleGuardModal(interaction: ModalSubmitInteraction): Promise<void> {
+    if (interaction.customId.startsWith(MODAL_APPEAL)) {
+        await handleAppealModal(interaction);
+        return;
+    }
+    await handleAuthorFixModal(interaction);
+}
 
 /**
  * 启动标题规范系统（在 clientReady 后由核心调用）。

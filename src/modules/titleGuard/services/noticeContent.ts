@@ -58,6 +58,31 @@ export interface NoticeInput {
      * （否则只能拿到引擎内部的小写形式，作者看着莫名其妙）。
      */
     normalized?: NormalizedTitle;
+    /**
+     * AI 的说法，会用小字挂在通知最下面。
+     * 分两条：建案时的定性理由，和作者申诉后的复核结论。
+     */
+    llmReason?: string | null;
+    review?: {
+        /** true = 维持原判，false = 申诉成立 */
+        upheld: boolean;
+        reason: string;
+    } | null;
+    /** 申诉已升到人工，等管理组处理 */
+    awaitingHuman?: boolean;
+}
+
+/** AI 理由的显示上限。再长就淹没正文了，完整内容管理组能在案件详情里看 */
+const REASON_LIMIT = 300;
+
+/**
+ * Discord 的小字语法。整段每一行都要带前缀，否则换行后就变回正常字号了。
+ * 顺手把可能的 @ 提及打断——这些文字里混着模型复述的作者原话。
+ */
+function subtext(text: string): string {
+    const safe = text.replace(/@(everyone|here)/g, '@\u200b$1').replace(/<@[!&]?(\d+)>/g, '@$1');
+    const clipped = safe.length > REASON_LIMIT ? safe.slice(0, REASON_LIMIT) + '…' : safe;
+    return clipped.split(/\r?\n/).map(line => '-# ' + line).join('\n');
 }
 
 /** 顿号连接的「A」「B」「C」 */
@@ -230,19 +255,56 @@ export function buildNoticeContent(input: NoticeInput): NoticeContent {
     }
     fields.push({ name: '四、规范依据', value: basisLines.join('\n') });
 
+    // AI 说过的话挂在最下面，小字，不抢正文
+    const notes: string[] = [];
+    if (input.llmReason) notes.push(subtext('🤖 AI 判定：' + input.llmReason));
+    if (input.review) {
+        notes.push(subtext(
+            (input.review.upheld ? '🤖 AI 复核：维持原判。' : '🤖 AI 复核：申诉成立。')
+            + input.review.reason,
+        ));
+    }
+
+    const description = '本帖分类信息不符合社区规范，请按下列说明处理。'
+        + (input.isOldPost ? '\n本帖为旧帖，已相应延长处理期限。' : '')
+        + (notes.length > 0 ? '\n\n' + notes.join('\n') : '');
+
     return {
         mention: input.authorId ? `<@${input.authorId}>` : null,
         title: '帖子分类规范 · 整改通知',
-        description: '本帖分类信息不符合社区规范，请按下列说明处理。'
-            + (input.isOldPost ? '\n本帖为旧帖，已相应延长处理期限。' : ''),
+        description,
         fields,
-        footer: '如对判定有异议，请点击下方按钮提请管理组复核，倒计时将即时暂停。',
-        buttons: [
-            { label: '我要修改', style: 'primary', who: '帖主 / 管理组' },
-            { label: '申请复核', style: 'secondary', who: '帖主 / 管理组' },
-            { label: '人工覆盖', style: 'danger', who: '仅管理组' },
-        ],
+        footer: input.awaitingHuman
+            ? '本帖已提请人工复核，倒计时保持暂停，请等待管理组处理。'
+            : input.review
+                ? '如仍有异议，可点击下方按钮提请人工复核。'
+                : '如对判定有异议，请点击下方按钮提请复核，倒计时将即时暂停。',
+        buttons: buildButtonList(input),
     };
+}
+
+/**
+ * 通知上应该有哪几个按钮。
+ * 复核那颗会随案件状态变：AI 复核用掉之前是「申请复核」，用掉之后是「申请人工复核」，
+ * 已经升到人工了就不再显示——重复点没有意义。
+ */
+function buildButtonList(input: NoticeInput): NoticeButton[] {
+    const buttons: NoticeButton[] = [
+        { label: '我要修改', style: 'primary', who: '帖主 / 管理组' },
+    ];
+
+    if (input.awaitingHuman) {
+        buttons.push({ label: '驳回申诉', style: 'secondary', who: '有「复核」权限的身份组' });
+    } else {
+        buttons.push({
+            label: input.review ? '申请人工复核' : '申请复核',
+            style: 'secondary',
+            who: '帖主 / 管理组',
+        });
+    }
+
+    buttons.push({ label: '人工覆盖', style: 'danger', who: '有「覆盖」权限的身份组' });
+    return buttons;
 }
 
 /** 整改完成后在帖子里回的那条 */

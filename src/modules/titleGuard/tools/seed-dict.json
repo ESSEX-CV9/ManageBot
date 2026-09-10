@@ -18,7 +18,13 @@
       "dimension": "word",
       "groups": [
         "纯爱",
-        "NTR",
+        "NTR"
+      ]
+    },
+    {
+      "dimension": "word",
+      "groups": [
+        "纯爱",
         "NTL"
       ]
     }
@@ -235,7 +241,6 @@
     "ntrs杯",
     "纯爱oc杯",
     "牛头人战士杯",
-    "绿帽癖",
     "纯爱企划"
   ],
   "_白名单来源": "从真实标题数据里提炼：征文活动名（X杯）、人设词。否定式（无X/非X）不进白名单——照样污染搜索。",
@@ -269,24 +274,9 @@
       "wordGroup": "纯爱"
     },
     {
-      "tagGroup": "NTR",
-      "wordGroup": "NTL"
-    },
-    {
-      "tagGroup": "NTR",
-      "wordGroup": "逆NTR"
-    },
-    {
       "tagGroup": "NTL",
       "wordGroup": "纯爱"
-    },
-    {
-      "tagGroup": "NTL",
-      "wordGroup": "NTR"
-    },
-    {
-      "tagGroup": "NTL",
-      "wordGroup": "逆NTR"
     }
-  ]
+  ],
+  "segmenterWords": []
 }
