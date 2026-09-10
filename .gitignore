@@ -9,3 +9,5 @@ temp/
 .claude/
 
 docs/
+# 调试台保存词表前自动留的上一版
+src/modules/titleGuard/tools/seed-dict.json.bak

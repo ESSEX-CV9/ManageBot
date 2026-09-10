@@ -1,0 +1,1330 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>标题规范 · 调试台</title>
+<style>
+  :root{
+    --bg:#0f1115; --panel:#171a21; --panel2:#1e222b; --line:#2b303c;
+    --fg:#e6e9ef; --dim:#98a1b3; --faint:#6b7385;
+    --accent:#5b8cff; --ok:#3fb950; --warn:#e3b341; --bad:#f85149; --llm:#a371f7;
+    --prefix:#2d5f8b; --suffix:#7a5230; --middle:#5a4b7c; --body:#2a2f3a;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--fg);
+    font:14px/1.6 "Segoe UI","Microsoft YaHei",system-ui,sans-serif}
+  a{color:var(--accent)}
+  code,.mono{font-family:"Cascadia Mono",Consolas,monospace}
+
+  header{padding:14px 20px;border-bottom:1px solid var(--line);
+    display:flex;align-items:center;gap:16px;flex-wrap:wrap;background:var(--panel)}
+  header h1{margin:0;font-size:16px;font-weight:600}
+  header .sub{color:var(--faint);font-size:12px}
+
+  nav{display:flex;gap:4px;margin-left:auto}
+  nav button{background:transparent;border:1px solid transparent;color:var(--dim);
+    padding:6px 14px;border-radius:6px;cursor:pointer;font-size:13px}
+  nav button:hover{color:var(--fg);background:var(--panel2)}
+  nav button.on{background:var(--accent);border-color:var(--accent);color:#fff}
+
+  main{padding:20px;max-width:1400px;margin:0 auto}
+  .tab{display:none}
+  .tab.on{display:block}
+
+  .card{background:var(--panel);border:1px solid var(--line);border-radius:8px;
+    padding:16px;margin-bottom:16px}
+  .card h2{margin:0 0 12px;font-size:14px;font-weight:600;color:var(--dim);
+    text-transform:none;letter-spacing:.02em}
+  .card h2 .hint{font-weight:400;color:var(--faint);font-size:12px;margin-left:8px}
+
+  textarea,input[type=text],select{width:100%;background:var(--panel2);color:var(--fg);
+    border:1px solid var(--line);border-radius:6px;padding:8px 10px;font-size:14px;
+    font-family:inherit}
+  textarea{resize:vertical;min-height:64px}
+  input:focus,textarea:focus,select:focus{outline:none;border-color:var(--accent)}
+  label{display:block;color:var(--dim);font-size:12px;margin:0 0 5px}
+
+  button.go{background:var(--accent);border:none;color:#fff;padding:8px 20px;
+    border-radius:6px;cursor:pointer;font-size:14px}
+  button.go:hover{filter:brightness(1.1)}
+  button.ghost{background:var(--panel2);border:1px solid var(--line);color:var(--fg);
+    padding:6px 14px;border-radius:6px;cursor:pointer;font-size:13px}
+  button.ghost:hover{border-color:var(--accent)}
+  button.mini{background:transparent;border:1px solid var(--line);color:var(--dim);
+    padding:2px 8px;border-radius:4px;cursor:pointer;font-size:12px}
+  button.mini:hover{color:var(--bad);border-color:var(--bad)}
+
+  .row{display:flex;gap:12px;flex-wrap:wrap;align-items:flex-end}
+  .row>*{flex:1;min-width:0}
+  .row .narrow{flex:0 0 220px}
+  .row .auto{flex:0 0 auto}
+
+  table{width:100%;border-collapse:collapse;font-size:13px}
+  th{text-align:left;color:var(--faint);font-weight:500;padding:6px 10px;
+    border-bottom:1px solid var(--line);white-space:nowrap;font-size:12px}
+  td{padding:6px 10px;border-bottom:1px solid #21252e;vertical-align:top}
+  tbody tr:hover{background:#1b1f27}
+
+  .tag{display:inline-block;padding:1px 7px;border-radius:4px;font-size:12px;
+    background:var(--panel2);border:1px solid var(--line);margin:1px 2px 1px 0}
+  .tag.g{border-color:#2d5a3d;color:#7ee787}
+  .tag.r{border-color:#5a2d2d;color:#ff9492}
+  .tag.y{border-color:#5a4d2d;color:#e3b341}
+  .tag.p{border-color:#4a3a6a;color:#c9a3ff}
+  .tag.dim{color:var(--faint)}
+
+  .pill{display:inline-block;padding:2px 10px;border-radius:12px;font-size:12px;font-weight:500}
+  .pill.ok{background:#16281c;color:#7ee787}
+  .pill.auto{background:#152238;color:#79b8ff}
+  .pill.llm{background:#241a38;color:#c9a3ff}
+  .pill.man{background:#3a1d1d;color:#ff9492}
+
+  /* 切分可视化 */
+  .strip{display:flex;flex-wrap:wrap;gap:3px;margin:10px 0 4px}
+  .seg{border-radius:5px;padding:6px 10px;border:1px solid transparent;position:relative}
+  .seg .lbl{display:block;font-size:10px;opacity:.75;margin-bottom:2px;letter-spacing:.05em}
+  .seg .txt{font-family:"Cascadia Mono",Consolas,monospace;font-size:13px;word-break:break-all}
+  .seg.prefix{background:var(--prefix);border-color:#3f7cb4}
+  .seg.suffix{background:var(--suffix);border-color:#a06d3f}
+  .seg.middle{background:var(--middle);border-color:#7a68a5}
+  .seg.body{background:var(--body);border-color:#3a4150}
+  .seg.bad{border-style:dashed;border-color:var(--bad)}
+  .seg.soft{border-style:dashed;opacity:.9}
+  .hl{background:rgba(248,81,73,.35);border-radius:3px;padding:0 2px;
+    box-shadow:inset 0 -2px 0 var(--bad)}
+  .hl.wl{background:rgba(63,185,80,.25);box-shadow:inset 0 -2px 0 var(--ok)}
+  .hl.neu{background:rgba(227,179,65,.25);box-shadow:inset 0 -2px 0 var(--warn)}
+
+  .legend{display:flex;gap:14px;flex-wrap:wrap;font-size:12px;color:var(--faint);margin-top:6px}
+  .legend i{display:inline-block;width:11px;height:11px;border-radius:3px;
+    vertical-align:-1px;margin-right:4px}
+
+  .empty{color:var(--faint);font-size:13px;padding:10px 0}
+  .err{color:var(--bad);font-size:13px}
+  .note{color:var(--faint);font-size:12px;margin-top:6px;line-height:1.7}
+
+  .stats{display:flex;gap:10px;flex-wrap:wrap}
+  .stat{background:var(--panel2);border:1px solid var(--line);border-radius:6px;
+    padding:10px 16px;min-width:110px}
+  .stat b{display:block;font-size:22px;font-weight:600;line-height:1.2}
+  .stat span{color:var(--faint);font-size:12px}
+
+  .scroll{max-height:520px;overflow:auto}
+  .drop{border:2px dashed var(--line);border-radius:8px;padding:28px;text-align:center;
+    color:var(--dim);cursor:pointer;transition:.15s}
+  .drop:hover,.drop.over{border-color:var(--accent);color:var(--fg);background:#141821}
+
+  .kv{display:grid;grid-template-columns:auto 1fr;gap:4px 14px;font-size:13px}
+  .kv dt{color:var(--faint)}
+  .kv dd{margin:0}
+
+  .diff-old{color:#ff9492;text-decoration:line-through;opacity:.75}
+  .diff-new{color:#7ee787}
+  /* 仿 Discord 的通知预览 */
+  .dc{background:#313338;border-radius:8px;padding:14px 16px;max-width:620px}
+  .dc .who{color:#f2f3f5;font-weight:600;font-size:14px;margin-bottom:6px}
+  .dc .who .bot{background:#5865f2;color:#fff;font-size:10px;padding:1px 5px;
+    border-radius:3px;margin-left:6px;vertical-align:1px;font-weight:500}
+  .dc .mention{background:rgba(88,101,242,.3);color:#c9cdfb;border-radius:3px;padding:0 2px}
+  .dc .embed{border-left:4px solid #f0a30a;background:#2b2d31;border-radius:4px;
+    padding:12px 16px;margin-top:4px}
+  .dc .et{color:#f2f3f5;font-weight:600;font-size:15px;margin-bottom:8px}
+  .dc .ed{color:#dbdee1;font-size:14px;white-space:pre-wrap;line-height:1.5}
+  .dc .ef{margin-top:12px}
+  .dc .efn{color:#f2f3f5;font-weight:600;font-size:13px;margin-bottom:2px}
+  .dc .efv{color:#dbdee1;font-size:13px;white-space:pre-wrap;line-height:1.55}
+  .dc .efv code{background:#1e1f22;border-radius:3px;padding:1px 4px;font-size:12px}
+  .dc .foot{color:#949ba4;font-size:11px;margin-top:12px;padding-top:8px}
+  .dc .btns{display:flex;gap:8px;margin-top:10px;flex-wrap:wrap}
+  .dc .btn{border-radius:3px;padding:7px 14px;font-size:13px;font-weight:500;color:#fff}
+  .dc .btn.primary{background:#5865f2}
+  .dc .btn.secondary{background:#4e5058}
+  .dc .btn.danger{background:#da373c}
+  .dc .btn small{display:block;font-size:10px;opacity:.7;font-weight:400}
+  .dc .done{background:#2b2d31;border-radius:4px;padding:10px 14px;margin-top:10px;
+    color:#dbdee1;font-size:13px;white-space:pre-wrap;border-left:4px solid #3fb950}
+
+  .issue{padding:7px 12px;border-radius:5px;margin-bottom:6px;font-size:13px;line-height:1.6}
+  .issue.error{background:#2b1a1a;border-left:3px solid var(--bad);color:#ffb3b0}
+  .issue.warn{background:#2b2618;border-left:3px solid var(--warn);color:#e8d08a}
+
+  .verdict{background:var(--panel2);border:1px solid var(--line);border-left:4px solid var(--llm);
+    border-radius:6px;padding:12px 16px;margin-bottom:12px}
+  .verdict h3{margin:0 0 8px;font-size:13px;color:var(--llm);font-weight:600}
+  .arrow{color:var(--faint);margin:0 8px}
+
+  .clickable{cursor:pointer}
+  .clickable:hover td{background:#212734}
+</style>
+</head>
+<body>
+
+<header>
+  <h1>标题规范 · 调试台</h1>
+  <span class="sub" id="dictInfo">词表加载中…</span>
+  <nav>
+    <button data-tab="single" class="on">单条测试</button>
+    <button data-tab="batch">批量分析</button>
+    <button data-tab="llm">LLM 判定</button>
+    <button data-tab="dict">词表设置</button>
+  </nav>
+</header>
+
+<main>
+
+<!-- ============ 单条测试 ============ -->
+<section class="tab on" id="tab-single">
+  <div class="card">
+    <h2>输入<span class="hint">一行一条，可以贴多条</span></h2>
+    <div class="row">
+      <div>
+        <label>帖子标题</label>
+        <textarea id="titleInput" placeholder="【NTL NTR】某某的故事&#10;纯爱牛头人日记&#10;《真正的橘子味世界不允许百合破坏的存在！》"></textarea>
+      </div>
+      <div class="narrow">
+        <label>帖子挂的 TAG（逗号分隔）</label>
+        <input type="text" id="tagsInput" placeholder="NTR, 多路线">
+        <div class="note">TAG 会影响判定：它决定保留哪个分类。</div>
+      </div>
+    </div>
+    <div style="margin-top:12px;display:flex;gap:8px;align-items:center">
+      <button class="go" id="runSingle">分析</button>
+      <button class="ghost" id="fillSamples">填入示例</button>
+      <span class="note" id="singleStatus"></span>
+    </div>
+  </div>
+  <div id="singleOut"></div>
+</section>
+
+<!-- ============ 批量分析 ============ -->
+<section class="tab" id="tab-batch">
+  <div class="card">
+    <h2>导入标题表<span class="hint">/论坛标题 导出 的 xlsx 格式</span></h2>
+    <div class="drop" id="drop">
+      把 xlsx 拖进来，或点击选择文件
+      <input type="file" id="file" accept=".xlsx" hidden>
+    </div>
+    <div class="row" style="margin-top:12px">
+      <div>
+        <label>或者直接用服务器上的文件（相对项目根目录）</label>
+        <input type="text" id="pathInput" value="docs/forum-titles-2026-09-01T23-00-27-645Z.xlsx">
+      </div>
+      <div class="auto"><button class="ghost" id="loadPath">加载</button></div>
+    </div>
+    <div class="note" id="batchStatus"></div>
+  </div>
+
+  <div id="batchOut"></div>
+</section>
+
+<!-- ============ LLM 判定 ============ -->
+<section class="tab" id="tab-llm">
+  <div class="card">
+    <h2>接口配置<span class="hint">只存在内存里，关掉服务就没了，不会写进任何文件</span></h2>
+    <div class="row">
+      <div class="narrow">
+        <label>服务商预设</label>
+        <select id="llmPreset"></select>
+      </div>
+      <div>
+        <label>接口地址（base_url）</label>
+        <input type="text" id="llmBase" placeholder="https://api.deepseek.com/v1">
+      </div>
+      <div class="narrow">
+        <label>协议</label>
+        <select id="llmProto">
+          <option value="chat">Chat Completions</option>
+          <option value="responses">Responses API</option>
+        </select>
+      </div>
+    </div>
+    <div class="row" style="margin-top:12px">
+      <div>
+        <label>API Key</label>
+        <input type="text" id="llmKey" placeholder="sk-…">
+      </div>
+      <div class="narrow">
+        <label>模型名</label>
+        <input type="text" id="llmModel" placeholder="deepseek-chat">
+      </div>
+      <div class="narrow">
+        <label>超时（毫秒）</label>
+        <input type="text" id="llmTimeout" value="30000">
+      </div>
+      <div class="narrow">
+        <label>调用方式</label>
+        <select id="llmToolMode">
+          <option value="cascade">自动降级（推荐）</option>
+          <option value="forced">强制 tool call</option>
+          <option value="auto">模型自行决定</option>
+          <option value="json">JSON 输出</option>
+        </select>
+      </div>
+    </div>
+    <div style="margin-top:12px;display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+      <button class="go" id="llmSave">保存配置</button>
+      <button class="ghost" id="llmTest">连通性自检</button>
+      <button class="ghost" id="llmClear">清除配置</button>
+      <span class="note" id="llmStatus"></span>
+    </div>
+    <div class="note">
+      走 OpenAI 兼容协议。判定结果里的「建议新标题」一律会被程序校验
+      「只能是原标题删字」，模型编不出新东西来。<br><br>
+      <b>调用方式</b>：默认「自动降级」，按 <code>强制 tool call → 模型自行决定 → JSON 输出</code>
+      依次尝试，哪个通用哪个，并记住结果。<br>
+      <b>思考/推理模式的模型</b>（如 DeepSeek R1、各家的 thinking 版本）通常不接受强制 tool_choice，
+      会报 <code>Thinking mode does not support this tool_choice</code>，自动降级就是为了兜住这种情况。
+    </div>
+  </div>
+
+  <div id="llmTestOut"></div>
+
+  <div class="card">
+    <h2>怎么测<span class="hint">配好之后</span></h2>
+    <div class="note" style="font-size:13px;line-height:1.9">
+      1. 点「连通性自检」，用一条标准样例真调一次，看接口通不通、判得对不对。<br>
+      2. 去<b>单条测试</b>或<b>批量分析</b>，凡是判成「需LLM定性」的，
+         下面都会出现一个「发起真实 LLM 判定」按钮。<br>
+      3. 点了之后会真调接口，然后**按判定结果重算方案和通知**，
+         你能直接看到判定前后处置的变化。
+    </div>
+  </div>
+</section>
+
+<!-- ============ 词表设置 ============ -->
+<section class="tab" id="tab-dict">
+  <div id="issuesBox"></div>
+  <div class="card">
+    <h2>TAG 互斥<span class="hint">同一组里的 TAG，一个帖子只能挂一个</span></h2>
+    <div id="tagSetsBox"></div>
+    <button class="ghost" id="addTagSet" style="margin-top:10px">+ 新增 TAG 互斥集合</button>
+  </div>
+
+  <div class="card">
+    <h2>关键字互斥<span class="hint">同一组里的分类，一条标题里只能出现一个</span></h2>
+    <div id="wordSetsBox"></div>
+    <button class="ghost" id="addWordSet" style="margin-top:10px">+ 新增关键字互斥集合</button>
+    <div class="note">TAG 和标题关键字是两套独立的东西，互不互斥分开配。
+      同一对分类可以 TAG 互斥而关键字不互斥，反之亦然。</div>
+  </div>
+
+  <div class="card">
+    <h2>分类优先级<span class="hint">数值大的优先保留。三种互斥撞上时都按它裁决</span></h2>
+    <div id="prioBox"></div>
+    <div class="note">数值大的留下。TAG 互斥留 TAG、关键字互斥留词、交叉互斥则是输的那边被摘掉，
+      三种情况用的都是这一份优先级。</div>
+  </div>
+
+  <div class="card">
+    <h2>交叉互斥<span class="hint">挂了某个 TAG，标题里就不许出现某类关键字</span></h2>
+    <div id="crossBox"></div>
+    <button class="ghost" id="addCross" style="margin-top:10px">+ 新增交叉互斥</button>
+    <div class="note">有方向，要双向禁就写两条。撞上时按上面的优先级裁决：
+      优先级低的那一边被摘掉——在 TAG 侧就摘 TAG，在关键字侧就删标题里的词；
+      两边都没配优先级时摘 TAG。<br>
+      「挂百合 TAG 就不许标题里写百破」就是靠这条落地的，而百合和百破的**关键字**并不互斥。</div>
+  </div>
+
+  <div class="card">
+    <h2>分词词库<span class="hint">纠正中文分词器的切分</span></h2>
+    <div class="note" style="margin-bottom:10px">
+      标题正文里的命中必须落在词边界上才作数，所以分词器切错了判定就跟着错。<br>
+      <b>补词</b>＝它不认识这个词（不补的话「我说纯爱牛逼」会切成「纯爱/牛/逼」，「纯爱牛」就混过去了）；
+      <b>拆词</b>＝它粘得太狠（「戴绿帽」被当成一个词，「绿帽」就抠不出来）。<br>
+      标签区不过这道闸——那里是标签罗列不是句子。
+    </div>
+    <div id="segWordsBox"></div>
+    <button class="ghost" id="addSegWord" style="margin-top:10px">+ 新增</button>
+
+    <div style="margin-top:14px;border-top:1px solid var(--line);padding-top:12px">
+      <label>试切一段文字，看当前词库切成什么</label>
+      <div class="row">
+        <div><input type="text" id="cutInput" placeholder="粘一段标题进来，比如：我说纯爱牛逼"></div>
+        <div class="auto"><button class="ghost" id="cutGo">切一下</button></div>
+      </div>
+      <div id="cutOut" class="note" style="margin-top:8px"></div>
+    </div>
+  </div>
+
+  <div class="card">
+    <h2>TAG → 分类组<span class="hint">论坛的 TAG 名对应哪个分类</span></h2>
+    <div id="tagMapBox"></div>
+    <button class="ghost" id="addTagMap" style="margin-top:10px">+ 新增映射</button>
+  </div>
+
+  <div class="card">
+    <h2>词表<span class="hint">分类词 / 黑名单 / 白名单 / 中性标记</span></h2>
+    <div class="row" style="margin-bottom:10px">
+      <div class="narrow">
+        <input type="text" id="dictFilter" placeholder="筛选词 / 分类组…">
+      </div>
+      <div class="auto"><button class="ghost" id="addWord">+ 新增词条</button></div>
+    </div>
+    <div class="scroll"><table id="dictTable">
+      <thead><tr>
+        <th style="width:150px">词</th><th style="width:110px">类型</th>
+        <th style="width:110px">分类组</th><th style="width:110px">生效范围</th>
+        <th style="width:110px">替换为</th><th>备注</th><th style="width:44px"></th>
+      </tr></thead>
+      <tbody></tbody>
+    </table></div>
+    <div class="note">
+      <b>分类词</b>＝映射到某个分类，参与互斥判定。<br>
+      <b>黑名单</b>＝命中就算违规，会被替换成「替换为」里填的词（留空则直接删掉）。<br>
+      <b>白名单</b>＝明确「这不是分类标记」，用来吃掉误判。比如「拉拉队」会把里面的「拉拉」吃掉。<br>
+      <b>中性标记</b>＝像「多路线」，不参与任何互斥判定，也不能豁免冲突。
+    </div>
+  </div>
+
+  <div class="card" style="position:sticky;bottom:16px;z-index:5">
+    <div style="display:flex;gap:10px;align-items:center">
+      <button class="go" id="saveDict">保存并生效</button>
+      <button class="ghost" id="exportDict">导出整份词表</button>
+      <button class="ghost" id="importDict">导入词表文件</button>
+      <input type="file" id="importFile" accept=".json,application/json" hidden>
+      <button class="ghost" id="reloadDict">放弃改动，重新读取</button>
+      <span class="note" id="dictStatus"></span>
+    </div>
+  </div>
+</section>
+
+</main>
+
+<script>
+const $ = s => document.querySelector(s);
+const $$ = s => [...document.querySelectorAll(s)];
+const esc = s => String(s ?? '').replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+
+// ---------- Tab ----------
+$$('nav button').forEach(b => b.onclick = () => {
+  $$('nav button').forEach(x => x.classList.toggle('on', x === b));
+  $$('.tab').forEach(t => t.classList.toggle('on', t.id === 'tab-' + b.dataset.tab));
+});
+
+async function api(path, opts) {
+  const res = await fetch(path, opts);
+  const data = await res.json().catch(() => ({ ok:false, error:'返回的不是 JSON' }));
+  if (!res.ok && data.error) throw new Error(data.error);
+  return data;
+}
+
+const PILL = { '合规':'ok', '可自动整改':'auto', '需LLM定性':'llm', '转人工':'man' };
+const RULE_DESC = {
+  T1:'标题含黑名单词', T2:'标题关键字互斥', T3:'标题正文关键字互斥',
+  T4:'TAG 与关键字交叉互斥', G1:'TAG 之间互斥',
+};
+const KIND_CLS = { '分类词':'', '黑名单':'r', '白名单':'g', '中性标记':'y' };
+
+// ============================================================
+// 单条测试
+// ============================================================
+
+function renderSegments(r) {
+  // 把每段渲染成一个色块，命中的词在段内高亮
+  const blocks = r.segments.map(seg => {
+    const hits = r.candidates.filter(c => c.chosen && c.segmentIndex === seg.index);
+    let txt = esc(seg.sourceText);
+    // 按命中的原文片段做高亮（从长到短替换，避免互相破坏）
+    [...hits].sort((a,b) => b.sourceText.length - a.sourceText.length).forEach(h => {
+      if (!h.sourceText) return;
+      const cls = h.kind === '白名单' ? 'wl' : h.kind === '中性标记' ? 'neu' : '';
+      const needle = esc(h.sourceText);
+      if (txt.includes('<span') && txt.includes(needle) === false) return;
+      txt = txt.replace(needle, `<span class="hl ${cls}">${needle}</span>`);
+    });
+    const bad = seg.kind === 'marker' && !seg.wellFormed ? ' bad' : '';
+    // 没有括号兜底、纯靠斜杠罗列推出来的标签区，冲突要先过 LLM 才敢改
+    const soft = seg.kind === 'marker' && seg.confident === false && !bad ? ' soft' : '';
+    const brk = seg.bracket ? ` ${seg.bracket}` : (seg.kind === 'marker' ? ' 分隔符划出来的' : '');
+    const flag = bad ? ' · 括号没闭合，不确信' : (soft ? ' · 靠排版推断，不确信' : '');
+    return `<div class="seg ${seg.position}${bad}${soft}">
+      <span class="lbl">${esc(seg.positionLabel)}${esc(brk)}${flag}</span>
+      <span class="txt">${txt || '&nbsp;'}</span>
+    </div>`;
+  }).join('');
+
+  return `<div class="strip">${blocks || '<span class="empty">空标题</span>'}</div>
+    <div class="legend">
+      <span><i style="background:var(--prefix)"></i>前缀标记</span>
+      <span><i style="background:var(--middle)"></i>中部标记</span>
+      <span><i style="background:var(--suffix)"></i>后缀标记</span>
+      <span><i style="background:var(--body)"></i>主体（自然语言）</span>
+      <span><i style="background:rgba(248,81,73,.5)"></i>命中分类词</span>
+      <span><i style="background:rgba(63,185,80,.4)"></i>命中白名单</span>
+      <span><i style="background:rgba(227,179,65,.4)"></i>中性标记</span>
+      <span><i style="border:1px dashed #8b949e;background:none"></i>虚线框 = 不确信是标签区，冲突交 LLM 定性</span>
+    </div>`;
+}
+
+function renderTokens(r) {
+  const markers = r.segments.filter(s => s.kind === 'marker' && s.tokens.length);
+  if (!markers.length) return '';
+  return `<div class="card"><h2>标记段切出来的 token<span class="hint">删词时删的是整个 token，不是单个关键词</span></h2>
+    ${markers.map(s => `<div style="margin-bottom:8px">
+      <span class="tag dim">${esc(s.positionLabel)}</span>
+      ${s.tokens.map(t => `<span class="tag ${t.matched ? 'r' : ''}">${esc(t.text)}</span>`).join('')}
+    </div>`).join('')}
+    <div class="note">标红的 token 里含有被识别出来的分类词。</div></div>`;
+}
+
+function renderCandidates(r) {
+  if (!r.candidates.length) {
+    return `<div class="card"><h2>关键词识别</h2><div class="empty">这条标题一个词典词都没命中。</div></div>`;
+  }
+  const rows = r.candidates.map(c => `<tr>
+    <td class="mono">${esc(c.sourceText || c.word)}</td>
+    <td><span class="tag ${KIND_CLS[c.kind] ?? ''}">${esc(c.kind)}</span></td>
+    <td>${c.group ? esc(c.group) : '<span class="tag dim">—</span>'}</td>
+    <td>${esc(c.positionLabel)}</td>
+    <td>${c.chosen
+      ? '<span class="tag g">采纳</span>'
+      : `<span class="tag dim">落选</span>${c.supersededBy ? ` <span class="note">被「${esc(c.supersededBy)}」盖住</span>` : ''}`}</td>
+  </tr>`).join('');
+  return `<div class="card"><h2>关键词识别<span class="hint">落选的是被更长的词吃掉了——最大覆盖优先</span></h2>
+    <table><thead><tr><th>命中文字</th><th>词典类型</th><th>分类组</th><th>位置</th><th>是否采纳</th></tr></thead>
+    <tbody>${rows}</tbody></table></div>`;
+}
+
+function renderViolations(r) {
+  if (!r.violations.length) {
+    return `<div class="card"><h2>判定结果</h2>
+      <span class="pill ok">合规</span>
+      <div class="note">没有发现任何违规。</div></div>`;
+  }
+  const rows = r.violations.map(v => `<tr>
+    <td><b>${esc(v.rule)}</b><div class="note">${esc(RULE_DESC[v.rule] ?? '')}</div></td>
+    <td>${esc(v.message)}</td>
+    <td>${v.words.map(w => `<span class="tag r">${esc(w)}</span>`).join('') || '—'}
+        ${v.tagNames.map(t => `<span class="tag y">TAG:${esc(t)}</span>`).join('')}</td>
+    <td>${v.needsLlm
+      ? '<span class="tag p">需 LLM 定性</span>'
+      : '<span class="tag g">规则可直接判</span>'}</td>
+  </tr>`).join('');
+  return `<div class="card"><h2>判定结果</h2>
+    <span class="pill ${PILL[r.disposition]}">${esc(r.disposition)}</span>
+    <table style="margin-top:12px"><thead><tr>
+      <th style="width:130px">规则</th><th>说明</th><th style="width:220px">涉及</th><th style="width:130px">能否直接判</th>
+    </tr></thead><tbody>${rows}</tbody></table></div>`;
+}
+
+function renderPlan(r) {
+  if (!r.plan) return '';
+  const p = r.plan;
+  return `<div class="card"><h2>整改方案</h2><dl class="kv">
+    <dt>标题</dt><dd>${p.changed
+      ? `<div class="mono diff-old">${esc(r.title)}</div><div class="mono diff-new">${esc(p.newTitle)}</div>`
+      : '<span class="tag dim">不改</span>'}</dd>
+    <dt>摘除 TAG</dt><dd>${p.removeTags.map(t => `<span class="tag r">${esc(t)}</span>`).join('') || '<span class="tag dim">无</span>'}</dd>
+    <dt>补上 TAG</dt><dd>${p.addTags.map(t => `<span class="tag g">${esc(t)}</span>`).join('') || '<span class="tag dim">无</span>'}</dd>
+    <dt>保留分类</dt><dd>${p.keepGroup ? `<b>${esc(p.keepGroup)}</b> <span class="note">（${esc(p.keepSource)}）</span>` : '<span class="tag dim">未能确定</span>'}</dd>
+    <dt>能否自动改</dt><dd>${p.autoFixable
+      ? '<span class="tag g">可以</span>'
+      : `<span class="tag r">不行</span> <span class="note">${esc(p.blockedReason ?? '')}</span>`}</dd>
+    <dt>动作</dt><dd>${p.notes.map(n => `<div class="note">· ${esc(n)}</div>`).join('') || '—'}</dd>
+  </dl></div>`;
+}
+
+function renderNotice(r) {
+  if (!r.notice) return '';
+  const n = r.notice;
+  // Discord 的 <t:...> 时间戳在网页里显示不出来，替换成人能读的
+  const fmt = v => esc(v)
+    .replace(/&lt;t:(\d+):f&gt;/g, (_, t) => new Date(+t * 1000).toLocaleString('zh-CN'))
+    .replace(/&lt;t:(\d+):R&gt;/g, () => '24 小时后')
+    .replace(/`([^`]+)`/g, '<code>$1</code>')
+    .replace(/\*\*([^*]+)\*\*/g, '<b>$1</b>');
+
+  return `<div class="card"><h2>发给作者的通知<span class="hint">和 Discord 上一字不差，只是时间戳换成了可读格式</span></h2>
+    <div class="dc">
+      <div class="who">规范助手<span class="bot">BOT</span></div>
+      ${n.mention ? `<div style="margin-bottom:6px"><span class="mention">@帖子作者</span></div>` : ''}
+      <div class="embed">
+        <div class="et">${esc(n.title)}</div>
+        <div class="ed">${fmt(n.description)}</div>
+        ${n.fields.map(f => `<div class="ef">
+          <div class="efn">${esc(f.name)}</div>
+          <div class="efv">${fmt(f.value)}</div>
+        </div>`).join('')}
+        <div class="foot">${esc(n.footer)}</div>
+      </div>
+      <div class="btns">${n.buttons.map(b => `<div class="btn ${b.style}">
+        ${esc(b.label)}<small>${esc(b.who)}</small></div>`).join('')}</div>
+    </div>
+    ${r.doneMessage ? `<div style="margin-top:14px">
+      <div class="note" style="margin-bottom:6px">到期作者仍未处理时，机器人整改完会再回一条：</div>
+      <div class="dc" style="padding:0;background:transparent">
+        <div class="done">${fmt(r.doneMessage)}</div>
+      </div></div>` : ''}
+  </div>`;
+}
+
+/** 需 LLM 定性的，给个按钮真调一次 */
+function renderLlmAction(r, key) {
+  if (r.disposition !== '需LLM定性') return '';
+  return `<div class="card" style="border-color:var(--llm)">
+    <h2>这条需要语义判定<span class="hint">规则只能看出有冲突，判不了这些词是不是在做分类标记</span></h2>
+    <div class="note" style="margin-bottom:10px">
+      在拿到判定结果之前，机器人<b>不会给作者发通知</b>——方案还没定，
+      发出去只会是一条「我也不知道怎么办」的骚扰。
+    </div>
+    <button class="go" data-llm="${esc(key)}">发起真实 LLM 判定</button>
+    <span class="note" id="llmMsg-${esc(key)}"></span>
+    <div id="llmRes-${esc(key)}"></div>
+  </div>`;
+}
+
+function renderOne(r, meta, key) {
+  return `<div class="card" style="border-color:var(--accent)">
+      <h2>标题 ${meta ? `<span class="hint">${esc(meta)}</span>` : ''}</h2>
+      <div class="mono" style="font-size:15px;margin-bottom:4px">${esc(r.title)}</div>
+      <div>${r.tags.length
+        ? r.tags.map(t => `<span class="tag ${t.group ? '' : 'dim'}">${esc(t.name)}${t.group ? ' → ' + esc(t.group) : ' （未映射）'}</span>`).join('')
+        : '<span class="tag dim">没有 TAG</span>'}</div>
+      ${r.normalizedText !== r.title ? `<div class="note">归一化后：<code>${esc(r.normalizedText)}</code></div>` : ''}
+    </div>
+    <div class="card"><h2>切分<span class="hint">引擎把标题拆成了这几段</span></h2>${renderSegments(r)}</div>
+    ${renderTokens(r)}
+    ${renderCandidates(r)}
+    ${renderViolations(r)}
+    ${key ? renderLlmAction(r, key) : ''}
+    ${renderPlan(r)}
+    ${renderNotice(r)}`;
+}
+
+async function runSingle() {
+  const raw = $('#titleInput').value.split('\n').map(s => s.trim()).filter(Boolean);
+  if (!raw.length) { $('#singleStatus').textContent = '先输入标题'; return; }
+  const tags = $('#tagsInput').value.split(/[,，]/).map(s => s.trim()).filter(Boolean);
+  currentTags = tags;
+  $('#singleStatus').textContent = '分析中…';
+  try {
+    const { results } = await api('/api/analyze', {
+      method:'POST', headers:{'content-type':'application/json'},
+      body: JSON.stringify({ titles: raw, tags }),
+    });
+    singleResults = results;
+    $('#singleOut').innerHTML = results
+      .map((r, i) => renderOne(r, null, 's' + i))
+      .join('<div style="height:24px"></div>');
+    bindLlmButtons(i => ({ title: singleResults[+i.slice(1)].title, tags: currentTags }));
+    $('#singleStatus').textContent = `共 ${results.length} 条`;
+  } catch (e) {
+    $('#singleStatus').innerHTML = `<span class="err">${esc(e.message)}</span>`;
+  }
+}
+$('#runSingle').onclick = runSingle;
+$('#titleInput').addEventListener('keydown', e => {
+  if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) runSingle();
+});
+$('#fillSamples').onclick = () => {
+  $('#titleInput').value = [
+    '【NTL NTR】某某的故事',
+    '纯爱牛头人日记',
+    '《真正的橘子味世界不允许百合破坏的存在！》',
+    '【乱伦/姐弟/NTL/可纯爱/隐奸】性压抑了怎么办',
+    '[牛头人杯/ntr/ntl]韩警官同人',
+    '【纯爱/无NTR】温柔的日常',
+  ].join('\n');
+  $('#tagsInput').value = 'NTR';
+};
+
+// ============================================================
+// 批量分析
+// ============================================================
+
+let batchItems = [];
+let singleResults = [];
+let currentTags = [];
+
+/** 给所有「发起真实 LLM 判定」按钮绑事件。resolve(key) 返回请求体 */
+function bindLlmButtons(resolve) {
+  $$('[data-llm]').forEach(btn => btn.onclick = async () => {
+    const key = btn.dataset.llm;
+    const msg = $('#llmMsg-' + key);
+    const out = $('#llmRes-' + key);
+    btn.disabled = true;
+    msg.textContent = '正在调用接口…';
+    try {
+      const r = await api('/api/llm-judge', {
+        method:'POST', headers:{'content-type':'application/json'},
+        body: JSON.stringify(resolve(key)),
+      });
+      if (!r.ok) {
+        const tried = r.triedModes?.length ? `（试过：${r.triedModes.join(' → ')}）` : '';
+        throw new Error(`[${r.kind ?? '失败'}] ${r.error}${tried}`);
+      }
+      msg.innerHTML = `<span style="color:var(--ok)">判定完成，耗时 ${r.elapsedMs} ms`
+        + `${r.modeLabel ? `，方式：${esc(r.modeLabel)}` : ''}</span>`;
+      out.innerHTML = renderJudgement(r);
+    } catch (e) {
+      msg.innerHTML = `<span class="err">${esc(e.message)}</span>`;
+    } finally {
+      btn.disabled = false;
+    }
+  });
+}
+
+function renderJudgement(r) {
+  const j = r.judgement;
+  const conf = { high:'高', medium:'中', low:'低' }[j.confidence] ?? j.confidence;
+  const after = r.after;
+  return `<div style="margin-top:14px">
+    <div class="verdict">
+      <h3>语义判定结果</h3>
+      <dl class="kv">
+        <dt>是否分类标记</dt><dd>${j.isClassification
+          ? '<span class="tag r">是——这些词在给作品做分类</span>'
+          : '<span class="tag g">否——只是自然语言的一部分</span>'}</dd>
+        <dt>把握程度</dt><dd>${conf}${j.confidence === 'low' ? ' <span class="note">（低把握不会被自动执行）</span>' : ''}</dd>
+        <dt>建议保留</dt><dd>${j.suggestedKeep ? esc(j.suggestedKeep) : '<span class="tag dim">未给出</span>'}</dd>
+        <dt>建议标题</dt><dd class="mono">${j.suggestedTitle ? esc(j.suggestedTitle) : '<span class="tag dim">不改</span>'}</dd>
+        <dt>理由</dt><dd>${esc(j.reason)}</dd>
+        <dt>调用方式</dt><dd>${esc(r.modeLabel ?? '—')}</dd>
+        <dt>首楼摘录</dt><dd>${r.usedBody ? '把握低，带正文重判过一次' : '未使用'}</dd>
+      </dl>
+    </div>
+    <div class="card" style="margin:0">
+      <h2>判定后的最终结论</h2>
+      <div style="margin-bottom:10px">
+        <span class="pill llm">${esc(r.before.disposition)}</span>
+        <span class="arrow">→</span>
+        <span class="pill ${PILL[after.disposition]}">${esc(after.disposition)}</span>
+      </div>
+      ${renderPlan(after)}
+      ${renderNotice(after)}
+    </div>
+  </div>`;
+}
+
+$('#drop').onclick = () => $('#file').click();
+$('#drop').ondragover = e => { e.preventDefault(); $('#drop').classList.add('over'); };
+$('#drop').ondragleave = () => $('#drop').classList.remove('over');
+$('#drop').ondrop = e => {
+  e.preventDefault(); $('#drop').classList.remove('over');
+  if (e.dataTransfer.files[0]) upload(e.dataTransfer.files[0]);
+};
+$('#file').onchange = e => { if (e.target.files[0]) upload(e.target.files[0]); };
+
+async function upload(file) {
+  $('#batchStatus').textContent = `正在读取 ${file.name}…`;
+  try {
+    const buf = await file.arrayBuffer();
+    const r = await api('/api/upload', {
+      method:'POST',
+      headers:{ 'content-type':'application/octet-stream', 'x-filename': encodeURIComponent(file.name) },
+      body: buf,
+    });
+    $('#batchStatus').textContent = `已读入 ${r.count} 条，开始跑判定…`;
+    await runBatch();
+  } catch (e) {
+    $('#batchStatus').innerHTML = `<span class="err">${esc(e.message)}</span>`;
+  }
+}
+
+$('#loadPath').onclick = async () => {
+  $('#batchStatus').textContent = '加载中…';
+  try {
+    const r = await api('/api/load-path', {
+      method:'POST', headers:{'content-type':'application/json'},
+      body: JSON.stringify({ file: $('#pathInput').value.trim() }),
+    });
+    $('#batchStatus').textContent = `已读入 ${r.count} 条，开始跑判定…`;
+    await runBatch();
+  } catch (e) {
+    $('#batchStatus').innerHTML = `<span class="err">${esc(e.message)}</span>`;
+  }
+};
+
+async function runBatch() {
+  const r = await api('/api/batch', { method:'POST' });
+  batchItems = r.items;
+  $('#batchStatus').textContent = `${r.sourceName} — 判定完成，耗时 ${r.elapsedMs} ms`;
+
+  const s = r.stats;
+  const pct = n => ((n / s.总数) * 100).toFixed(2) + '%';
+  const stats = `<div class="card"><h2>总览</h2><div class="stats">
+      <div class="stat"><b>${s.总数}</b><span>帖子总数</span></div>
+      <div class="stat"><b style="color:var(--ok)">${s.合规 ?? 0}</b><span>合规</span></div>
+      <div class="stat"><b style="color:var(--accent)">${s.可自动整改 ?? 0}</b><span>可自动整改</span></div>
+      <div class="stat"><b style="color:var(--llm)">${s.需LLM定性 ?? 0}</b><span>需 LLM 定性</span></div>
+      <div class="stat"><b style="color:var(--bad)">${s.转人工 ?? 0}</b><span>转人工</span></div>
+      <div class="stat"><b>${pct(s.总数 - (s.合规 ?? 0))}</b><span>违规率</span></div>
+    </div></div>`;
+
+  const ruleRows = ['T1','T2','G1','G2','T3','T4']
+    .map(k => `<tr><td><b>${k}</b></td><td>${esc(RULE_DESC[k])}</td>
+      <td style="text-align:right">${r.ruleStats[k] ?? 0}</td>
+      <td>${['T3','T4'].includes(k) ? '<span class="tag p">需 LLM</span>' : ''}</td></tr>`).join('');
+
+  const wordRows = r.wordStats.map(([w, n]) =>
+    `<tr><td class="mono">${esc(w)}</td><td style="text-align:right">${n}</td></tr>`).join('');
+
+  const forumRows = r.forumStats.filter(f => f[2] >= 20).map(([name, hit, total]) =>
+    `<tr><td>${esc(name)}</td><td style="text-align:right">${hit} / ${total}</td>
+     <td style="text-align:right">${(hit/total*100).toFixed(1)}%</td></tr>`).join('');
+
+  const side = `<div class="row" style="align-items:stretch">
+    <div class="card" style="flex:1"><h2>各条规则命中</h2>
+      <table><tbody>${ruleRows}</tbody></table></div>
+    <div class="card" style="flex:1"><h2>关键词命中次数</h2>
+      <div class="scroll" style="max-height:260px"><table><tbody>${wordRows}</tbody></table></div></div>
+    <div class="card" style="flex:1"><h2>各论坛违规率</h2>
+      <div class="scroll" style="max-height:260px"><table><tbody>${forumRows}</tbody></table></div></div>
+  </div>`;
+
+  const filter = `<div class="card"><h2>检出明细<span class="hint">点任意一行看完整判定过程</span></h2>
+    <div class="row" style="margin-bottom:10px">
+      <div class="narrow"><input type="text" id="bFilter" placeholder="搜标题 / 关键词…"></div>
+      <div class="narrow"><select id="bDisp">
+        <option value="">全部处置</option>
+        <option>可自动整改</option><option>需LLM定性</option><option>转人工</option>
+      </select></div>
+      <div class="narrow"><select id="bRule">
+        <option value="">全部规则</option>
+        ${['T1','T2','T3','T4','G1','G2'].map(k => `<option>${k}</option>`).join('')}
+      </select></div>
+      <div class="auto"><span class="note" id="bCount"></span></div>
+    </div>
+    <div class="scroll"><table id="bTable"><thead><tr>
+      <th style="width:110px">处置</th><th>标题</th><th style="width:150px">TAG</th>
+      <th style="width:120px">命中词</th><th style="width:90px">规则</th><th>建议改成</th>
+    </tr></thead><tbody></tbody></table></div>
+  </div><div id="rowDetail"></div>`;
+
+  $('#batchOut').innerHTML = stats + side + filter;
+  $('#bFilter').oninput = $('#bDisp').onchange = $('#bRule').onchange = renderBatchTable;
+  renderBatchTable();
+}
+
+function renderBatchTable() {
+  const q = $('#bFilter').value.trim().toLowerCase();
+  const disp = $('#bDisp').value;
+  const rule = $('#bRule').value;
+
+  const list = batchItems.filter(it =>
+    (!disp || it.disposition === disp) &&
+    (!rule || it.rules.includes(rule)) &&
+    (!q || it.title.toLowerCase().includes(q) || it.words.some(w => w.includes(q)))
+  );
+
+  $('#bCount').textContent = `${list.length} / ${batchItems.length} 条`;
+  $('#bTable').querySelector('tbody').innerHTML = list.slice(0, 400).map(it => `
+    <tr class="clickable" data-index="${it.index}">
+      <td><span class="pill ${PILL[it.disposition]}">${esc(it.disposition)}</span></td>
+      <td class="mono">${esc(it.title)}</td>
+      <td>${esc(it.tags) || '—'}</td>
+      <td>${it.words.map(w => `<span class="tag r">${esc(w)}</span>`).join('')}</td>
+      <td>${it.rules.map(r => `<span class="tag">${esc(r)}</span>`).join('')}</td>
+      <td class="mono">${it.newTitle ? esc(it.newTitle) : `<span class="note">${esc(it.blockedReason || '—')}</span>`}</td>
+    </tr>`).join('')
+    + (list.length > 400 ? `<tr><td colspan="6" class="note">只显示前 400 条，用上面的筛选缩小范围。</td></tr>` : '');
+
+  $$('#bTable tbody tr[data-index]').forEach(tr => tr.onclick = () => showRow(tr.dataset.index));
+}
+
+async function showRow(index) {
+  const r = await api('/api/row?index=' + index);
+  $('#rowDetail').innerHTML = `<div style="height:8px"></div>` +
+    renderOne(r.result, `${r.meta.guild} / ${r.meta.forum}`, 'b' + index);
+  bindLlmButtons(key => ({ index: +key.slice(1) }));
+  $('#rowDetail').scrollIntoView({ behavior:'smooth', block:'start' });
+}
+
+// ============================================================
+// 词表设置
+// ============================================================
+
+let seed = null;
+
+async function loadDict() {
+  const r = await api('/api/dict');
+  seed = r.seed;
+  $('#dictInfo').textContent =
+    `词表：分类词 ${r.stats.分类词} · 黑名单 ${r.stats.黑名单} · 白名单 ${r.stats.白名单} · 中性 ${r.stats.中性标记}`;
+  renderIssues(r.issues);
+  renderDictTab();
+}
+
+function renderIssues(issues) {
+  if (!issues || issues.length === 0) {
+    $('#issuesBox').innerHTML = `<div class="card" style="border-color:#2d5a3d">
+      <h2>词表体检</h2>
+      <div style="color:#7ee787;font-size:13px">✓ 没发现配置问题</div></div>`;
+    // 顶部也给个标记，别让人非要点进这个页签才知道
+    const bad = 0;
+    $$('nav button').forEach(b => { if (b.dataset.tab === 'dict') b.textContent = '词表设置'; });
+    return;
+  }
+  const errors = issues.filter(i => i.level === 'error');
+  $('#issuesBox').innerHTML = `<div class="card" style="border-color:${errors.length ? 'var(--bad)' : 'var(--warn)'}">
+    <h2>词表体检<span class="hint">${errors.length} 个错误 · ${issues.length - errors.length} 个提醒</span></h2>
+    ${issues.map(i => `<div class="issue ${i.level}">
+      ${i.level === 'error' ? '✕' : '!'} ${esc(i.message)}</div>`).join('')}
+    <div class="note">「错误」是配了但不生效或互相打架的；「提醒」是能跑但可能不是你想要的。</div>
+  </div>`;
+  $$('nav button').forEach(b => {
+    if (b.dataset.tab === 'dict') b.textContent = `词表设置 ${errors.length ? '✕' : '!'}`;
+  });
+}
+
+/** 单独渲染一块，出错只影响这一块，不会把整页打断 */
+function safely(what, fn) {
+  try { fn(); } catch (e) {
+    console.error('[词表] 渲染「' + what + '」出错：', e);
+    const box = $('#dictStatus');
+    if (box) box.innerHTML = '<span class="err">' + esc(what + ' 渲染出错：' + e.message)
+      + '（其余部分正常，改动未受影响）</span>';
+  }
+}
+
+/**
+ * 渲染一块面板。出错只毁这一块，不会把后面的面板连同词条表格一起打断。
+ *
+ * 这道闸是有来历的：某次一个面板抛了异常，renderDictTab 半路中止，
+ * 词条表格根本没渲染出来，接着一点「保存」，commitWords 从空表格里
+ * 收出一个空词典，把整个词表覆盖没了。
+ */
+function safely(what, fn) {
+  try {
+    fn();
+  } catch (e) {
+    console.error('[词表] 渲染「' + what + '」出错：', e);
+    const box = $('#dictStatus');
+    if (box) {
+      box.innerHTML = '<span class="err">' + esc(what + ' 这一块渲染出错：' + e.message)
+        + '。其余部分正常，词条未受影响。</span>';
+    }
+  }
+}
+
+function renderDictTab() {
+  // seed.exclusiveSets 是一个扁平数组，每项自带 dimension，
+  // 界面上按维度分开渲染，但 data-set 存的是它在原数组里的真实下标。
+  safely('TAG 互斥', () => renderSets('tag', '#tagSetsBox'));
+  safely('关键字互斥', () => renderSets('word', '#wordSetsBox'));
+  safely('分类优先级', renderPrio);
+  safely('交叉互斥', renderCross);
+  safely('分词词库', renderSegWords);
+  safely('TAG 映射', renderTagMap);
+  safely('词条', renderWords);
+}
+
+function renderCross() {
+  $('#crossBox').innerHTML = (seed.crossExclusions ?? []).map((c, i) => `
+    <div class="row" style="margin-bottom:8px">
+      <div class="narrow"><label>挂了这个分类的 TAG</label>
+        <input type="text" data-cross="${i}" data-f="tagGroup" value="${esc(c.tagGroup ?? '')}"></div>
+      <div class="narrow"><label>标题里就不许出现</label>
+        <input type="text" data-cross="${i}" data-f="wordGroup" value="${esc(c.wordGroup ?? '')}"></div>
+      <div><label>备注</label>
+        <input type="text" data-cross="${i}" data-f="note" value="${esc(c.note ?? '')}"></div>
+      <div class="auto"><button class="mini" data-delcross="${i}">删除</button></div>
+    </div>`).join('') || '<div class="empty">还没有交叉互斥。</div>';
+
+  $$('[data-cross]').forEach(inp => inp.onchange = () => {
+    seed.crossExclusions[+inp.dataset.cross][inp.dataset.f] = inp.value.trim();
+  });
+  $$('[data-delcross]').forEach(b => b.onclick = () => {
+    seed.crossExclusions.splice(+b.dataset.delcross, 1); renderDictTab();
+  });
+}
+
+function renderSegWords() {
+  const list = seed.segmenterWords ?? [];
+  $('#segWordsBox').innerHTML = list.map((w, i) => `
+    <div class="row" style="margin-bottom:6px">
+      <div class="narrow"><input type="text" data-seg="${i}" data-f="word" value="${esc(w.word ?? '')}" placeholder="词"></div>
+      <div class="narrow"><select data-seg="${i}" data-f="action">
+        <option${w.action === '拆词' ? '' : ' selected'}>补词</option>
+        <option${w.action === '拆词' ? ' selected' : ''}>拆词</option>
+      </select></div>
+      <div><input type="text" data-seg="${i}" data-f="note" value="${esc(w.note ?? '')}" placeholder="备注"></div>
+      <div class="auto"><button class="mini" data-delseg="${i}">删除</button></div>
+    </div>`).join('') || '<div class="empty">还没配置。代码里不内置任何词。</div>';
+
+  $$('[data-seg]').forEach(inp => inp.onchange = () => {
+    seed.segmenterWords[+inp.dataset.seg][inp.dataset.f] = inp.value.trim();
+  });
+  $$('[data-delseg]').forEach(b => b.onclick = () => {
+    seed.segmenterWords.splice(+b.dataset.delseg, 1); renderDictTab();
+  });
+}
+
+function renderTagMap() {
+  const tm = Object.entries(seed.tagGroups ?? {});
+  $('#tagMapBox').innerHTML = tm.map(([name, group], i) => `
+    <div class="row" style="margin-bottom:6px">
+      <div class="narrow"><input type="text" data-tm="${i}" data-f="name" value="${esc(name)}" placeholder="TAG 名"></div>
+      <div class="narrow"><input type="text" data-tm="${i}" data-f="group" value="${esc(group)}" placeholder="分类组"></div>
+      <div class="auto"><button class="mini" data-deltm="${esc(name)}">删除</button></div>
+    </div>`).join('') || '<div class="empty">还没有映射。</div>';
+
+  $$('[data-tm]').forEach(inp => inp.onchange = () => {
+    const rebuilt = {};
+    $$('[data-tm][data-f=name]').forEach(n => {
+      const g = document.querySelector(`[data-tm="${n.dataset.tm}"][data-f=group]`);
+      if (n.value.trim()) rebuilt[n.value.trim()] = g.value.trim();
+    });
+    seed.tagGroups = rebuilt;
+  });
+  $$('[data-deltm]').forEach(b => b.onclick = () => {
+    delete seed.tagGroups[b.dataset.deltm]; renderDictTab();
+  });
+}
+
+function renderSets(dimension, boxSelector) {
+  const sets = seed.exclusiveSets ?? [];
+  const mine = sets.map((set, i) => ({ set, i })).filter(x => x.set.dimension === dimension);
+  const label = dimension === 'tag' ? 'TAG 互斥' : '关键字互斥';
+
+  $(boxSelector).innerHTML = mine.map(({ set, i }) => `
+    <div class="row" style="margin-bottom:8px">
+      <div><input type="text" data-set="${i}" value="${esc((set.groups ?? []).join(', '))}"
+        placeholder="用逗号分隔，如 纯爱, NTR, NTL"></div>
+      <div class="auto"><button class="mini" data-delset="${i}">删除</button></div>
+    </div>`).join('') || `<div class="empty">还没有${label}集合。</div>`;
+
+  $(boxSelector).querySelectorAll('[data-set]').forEach(inp => inp.onchange = () => {
+    seed.exclusiveSets[+inp.dataset.set].groups =
+      inp.value.split(/[,，]/).map(s => s.trim()).filter(Boolean);
+    renderPrio();
+  });
+  $(boxSelector).querySelectorAll('[data-delset]').forEach(b => b.onclick = () => {
+    seed.exclusiveSets.splice(+b.dataset.delset, 1); renderDictTab();
+  });
+}
+
+function renderPrio() {
+  // 三种规则里出现过的分类组都要能配优先级，交叉互斥里的也算
+  const groups = [...new Set([
+    ...(seed.exclusiveSets ?? []).flatMap(x => x.groups ?? []),
+    ...(seed.crossExclusions ?? []).flatMap(c => [c.tagGroup, c.wordGroup]),
+  ].filter(Boolean))];
+  seed.groupPriority = seed.groupPriority ?? {};
+  $('#prioBox').innerHTML = groups.length ? `<div class="row">${groups.map(g => `
+    <div class="narrow"><label>${esc(g)}</label>
+      <input type="text" data-prio="${esc(g)}" value="${seed.groupPriority[g] ?? 0}"></div>`).join('')}</div>`
+    : '<div class="empty">先配互斥关系，这里才会出现分类组。</div>';
+
+  $$('[data-prio]').forEach(inp => inp.onchange = () => {
+    seed.groupPriority[inp.dataset.prio] = Number(inp.value) || 0;
+  });
+}
+
+function allWords() {
+  // 白名单在 seed 里是单独的字符串数组，这里统一成一张表来编辑
+  return [
+    ...(seed.dict ?? []).map((d, i) => ({ ...d, _src:'dict', _i:i })),
+    ...(seed.whitelist ?? []).map((w, i) => ({
+      word:w, kind:'白名单', group:null, scope:'全标题', replaceTo:null, note:'', _src:'wl', _i:i,
+    })),
+  ];
+}
+
+function renderWords() {
+  const q = $('#dictFilter').value.trim().toLowerCase();
+  const list = allWords().filter(d =>
+    !q || d.word.toLowerCase().includes(q) || String(d.group ?? '').toLowerCase().includes(q));
+
+  const KINDS = ['分类词','黑名单','白名单','中性标记'];
+  const SCOPES = ['全标题','仅标记段','仅主体段'];
+
+  $('#dictTable').querySelector('tbody').innerHTML = list.map(d => `
+    <tr data-src="${d._src}" data-i="${d._i}">
+      <td><input type="text" data-f="word" value="${esc(d.word)}"></td>
+      <td><select data-f="kind">${KINDS.map(k =>
+        `<option${k === d.kind ? ' selected' : ''}>${k}</option>`).join('')}</select></td>
+      <td><input type="text" data-f="group" value="${esc(d.group ?? '')}" ${d.kind === '白名单' ? 'disabled' : ''}></td>
+      <td><select data-f="scope">${SCOPES.map(s =>
+        `<option${s === (d.scope ?? '全标题') ? ' selected' : ''}>${s}</option>`).join('')}</select></td>
+      <td><input type="text" data-f="replaceTo" value="${esc(d.replaceTo ?? '')}" ${d.kind === '黑名单' ? '' : 'disabled'}></td>
+      <td><input type="text" data-f="note" value="${esc(d.note ?? '')}"></td>
+      <td><button class="mini" data-del="1">×</button></td>
+    </tr>`).join('') || '<tr><td colspan="7" class="empty">没有匹配的词条。</td></tr>';
+
+  $$('#dictTable tbody tr[data-src]').forEach(tr => {
+    tr.querySelectorAll('input,select').forEach(el => el.onchange = () => commitWords());
+    tr.querySelector('[data-del]').onclick = () => { tr.remove(); commitWords(); renderWords(); };
+  });
+}
+
+/** 把表格里的内容写回 seed（白名单拆回单独的数组） */
+function commitWords() {
+  const dict = [], whitelist = [];
+  const rows = $$('#dictTable tbody tr[data-src]');
+
+  // 表格一行都没有、可是内存里明明有词 —— 说明表格压根没渲染出来
+  // （比如上面某个面板抛了异常，把 renderDictTab 打断了）。
+  // 这时候拿空列表覆盖，等于一键清空整个词典。宁可什么都不做。
+  if (rows.length === 0 && ((seed.dict ?? []).length + (seed.whitelist ?? []).length) > 0) {
+    console.warn('[词表] 词条表格是空的，跳过回收，避免清空词典');
+    return;
+  }
+
+  rows.forEach(tr => {
+    const get = f => tr.querySelector(`[data-f=${f}]`)?.value.trim() ?? '';
+    const word = get('word');
+    if (!word) return;
+    const kind = get('kind');
+    if (kind === '白名单') { whitelist.push(word); return; }
+    dict.push({
+      word, kind,
+      group: get('group') || null,
+      scope: get('scope') || '全标题',
+      replaceTo: kind === '黑名单' ? (get('replaceTo') || null) : null,
+      note: get('note') || undefined,
+    });
+  });
+  // 只有在没筛选时才整体替换，否则会把筛掉的词弄丢
+  if (!$('#dictFilter').value.trim()) { seed.dict = dict; seed.whitelist = whitelist; }
+  else {
+    // 有筛选：只更新可见的那些，其余保持原样
+    const visible = new Set([...dict.map(d => d.word), ...whitelist]);
+    seed.dict = [...seed.dict.filter(d => !visible.has(d.word) && !isVisible(d.word)), ...dict];
+    seed.whitelist = [...seed.whitelist.filter(w => !visible.has(w) && !isVisible(w)), ...whitelist];
+  }
+  $('#dictStatus').innerHTML = '<span style="color:var(--warn)">有未保存的改动</span>';
+}
+
+function isVisible(word) {
+  const q = $('#dictFilter').value.trim().toLowerCase();
+  return !q || word.toLowerCase().includes(q);
+}
+
+$('#dictFilter').oninput = renderWords;
+$('#addWord').onclick = () => {
+  seed.dict.unshift({ word:'', kind:'分类词', group:'', scope:'全标题', replaceTo:null, note:'' });
+  $('#dictFilter').value = ''; renderWords();
+};
+$('#addTagSet').onclick = () => {
+  (seed.exclusiveSets ??= []).push({ dimension:'tag', groups:[] }); renderDictTab();
+};
+$('#addWordSet').onclick = () => {
+  (seed.exclusiveSets ??= []).push({ dimension:'word', groups:[] }); renderDictTab();
+};
+$('#addCross').onclick = () => {
+  (seed.crossExclusions ??= []).push({ tagGroup:'', wordGroup:'', note:'' }); renderDictTab();
+};
+$('#addSegWord').onclick = () => {
+  (seed.segmenterWords ??= []).push({ word: '', action: '补词', note: '' }); renderDictTab();
+};
+
+$('#cutGo').onclick = async () => {
+  const text = $('#cutInput').value.trim();
+  if (!text) return;
+  try {
+    const r = await api('/api/cut', {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ text, segmenterWords: seed.segmenterWords ?? [] }),
+    });
+    $('#cutOut').innerHTML = r.available
+      ? '归一化后：<code>' + esc(r.normalized) + '</code><br>切成：'
+        + r.tokens.map(t => '<span class="tag">' + esc(t) + '</span>').join('')
+      : '<span class="err">分词器没加载起来。</span>';
+  } catch (e) {
+    $('#cutOut').innerHTML = '<span class="err">' + esc(e.message) + '</span>';
+  }
+};
+
+$('#addTagMap').onclick = () => { seed.tagGroups = { ...seed.tagGroups, '': '' }; renderDictTab(); };
+
+$('#saveDict').onclick = async () => {
+  commitWords();
+  $('#dictStatus').textContent = '保存中…';
+  try {
+    const r = await api('/api/dict', {
+      method:'POST', headers:{'content-type':'application/json'}, body: JSON.stringify(seed),
+    });
+    $('#dictStatus').innerHTML = `<span style="color:var(--ok)">已保存并生效，共 ${r.words} 条词</span>`;
+    await loadDict();
+    if ((r.issues ?? []).some(i => i.level === 'error')) {
+      $('#issuesBox').scrollIntoView({ behavior:'smooth', block:'start' });
+    }
+  } catch (e) {
+    $('#dictStatus').innerHTML = `<span class="err">${esc(e.message)}</span>`;
+  }
+};
+/**
+ * 导出的是**当前编辑中**的这一份，包含还没保存的改动。
+ * 想拿磁盘上生效的那一份，先点「重新读取」再导出。
+ */
+$('#exportDict').onclick = () => {
+  commitWords();
+  const stamp = new Date().toLocaleString('sv').replace(/[: ]/g, '-').slice(0, 16);
+  const payload = {
+    _导出于: new Date().toLocaleString('zh-CN'),
+    _说明: '标题规范词表。用调试台的「导入词表文件」原样载回来。',
+    ...seed,
+  };
+  const blob = new Blob([JSON.stringify(payload, null, 2)], { type: 'application/json' });
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = `标题规范词表-${stamp}.json`;
+  a.click();
+  setTimeout(() => URL.revokeObjectURL(a.href), 1000);
+
+  const n = (seed.dict ?? []).length + (seed.whitelist ?? []).length;
+  $('#dictStatus').innerHTML = `<span style="color:var(--ok)">已导出 ${n} 条词及全部互斥配置</span>`;
+};
+
+$('#importDict').onclick = () => $('#importFile').click();
+
+/**
+ * 导入只载入编辑器，**不落盘**。
+ * 你可以先看体检结果、翻一遍词条，确认没问题再点「保存并生效」。
+ */
+$('#importFile').onchange = async ev => {
+  const file = ev.target.files?.[0];
+  if (!file) return;
+  ev.target.value = ''; // 允许连续导入同一个文件
+
+  try {
+    const incoming = JSON.parse(await file.text());
+    if (typeof incoming !== 'object' || incoming === null) throw new Error('不是一个 JSON 对象');
+    if (!Array.isArray(incoming.dict)) throw new Error('缺少 dict 数组，这不像一份词表');
+
+    const before = (seed.dict ?? []).length + (seed.whitelist ?? []).length;
+    const after = incoming.dict.length + (incoming.whitelist ?? []).length;
+
+    if (before > 0 && !confirm(
+      `要用文件里的 ${after} 条词，替换当前编辑中的 ${before} 条吗？\n`
+      + '（只载入编辑器，你确认后再点「保存并生效」才会写入）',
+    )) return;
+
+    // 去掉导出时加的说明字段，别让它们混进配置
+    delete incoming._导出于;
+
+    seed = incoming;
+    seed.dict ??= [];
+    seed.whitelist ??= [];
+    seed.exclusiveSets ??= [];
+    seed.crossExclusions ??= [];
+    seed.segmenterWords ??= [];
+    seed.tagGroups ??= {};
+    seed.groupPriority ??= {};
+
+    renderDictTab();
+
+    // 导入的配置先体检一遍，问题当场看得见
+    try {
+      const r = await api('/api/dict/check', {
+        method: 'POST', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify(seed),
+      });
+      renderIssues(r.issues ?? []);
+    } catch { /* 体检失败不影响导入本身 */ }
+
+    $('#dictStatus').innerHTML = `<span style="color:var(--warn)">`
+      + `已载入 ${after} 条词，还没保存。核对无误后点「保存并生效」。</span>`;
+  } catch (e) {
+    $('#dictStatus').innerHTML = `<span class="err">导入失败：${esc(e.message)}</span>`;
+  }
+};
+
+$('#reloadDict').onclick = async () => {
+  await loadDict();
+  $('#dictStatus').textContent = '已重新读取';
+};
+
+// ============================================================
+// ==== LLM 页签
+// ============================================================
+
+let llmPresets = [];
+
+async function loadLlm() {
+  const r = await api('/api/llm');
+  llmPresets = r.presets;
+  $('#llmPreset').innerHTML = llmPresets
+    .map((p, i) => `<option value="${i}">${esc(p.name)}</option>`).join('');
+
+  if (r.current) {
+    $('#llmBase').value = r.current.baseUrl;
+    $('#llmModel').value = r.current.model;
+    $('#llmProto').value = r.current.protocol;
+    $('#llmToolMode').value = r.current.toolMode || 'cascade';
+    $('#llmTimeout').value = r.current.timeoutMs;
+    $('#llmKey').value = '';
+    $('#llmKey').placeholder = '已保存：' + r.current.apiKeyMasked + '（留空则不改）';
+    $('#llmStatus').innerHTML = '<span style="color:var(--ok)">已配置</span>';
+  } else {
+    $('#llmStatus').textContent = '尚未配置';
+  }
+}
+
+$('#llmPreset').onchange = () => {
+  const p = llmPresets[+$('#llmPreset').value];
+  if (!p) return;
+  if (p.baseUrl) $('#llmBase').value = p.baseUrl;
+  if (p.model) $('#llmModel').value = p.model;
+  $('#llmProto').value = p.protocol;
+};
+
+$('#llmSave').onclick = async () => {
+  $('#llmStatus').textContent = '保存中…';
+  try {
+    const r = await api('/api/llm', {
+      method:'POST', headers:{'content-type':'application/json'},
+      body: JSON.stringify({
+        baseUrl: $('#llmBase').value.trim(),
+        apiKey: $('#llmKey').value.trim(),
+        model: $('#llmModel').value.trim(),
+        protocol: $('#llmProto').value,
+        toolMode: $('#llmToolMode').value,
+        timeoutMs: +$('#llmTimeout').value || 30000,
+      }),
+    });
+    if (!r.ok) throw new Error(r.error);
+    $('#llmStatus').innerHTML = `<span style="color:var(--ok)">已保存（${esc(r.apiKeyMasked)}）</span>`;
+    await loadLlm();
+  } catch (e) {
+    $('#llmStatus').innerHTML = `<span class="err">${esc(e.message)}</span>`;
+  }
+};
+
+$('#llmClear').onclick = async () => {
+  await api('/api/llm', { method:'DELETE' });
+  $('#llmKey').value = ''; $('#llmKey').placeholder = 'sk-…';
+  $('#llmStatus').textContent = '已清除';
+  $('#llmTestOut').innerHTML = '';
+};
+
+$('#llmTest').onclick = async () => {
+  $('#llmStatus').textContent = '正在自检…';
+  $('#llmTestOut').innerHTML = '';
+  try {
+    const r = await api('/api/llm-test', { method:'POST' });
+    if (!r.ok) {
+      const tried = r.triedModes?.length ? `（试过：${r.triedModes.join(' → ')}）` : '';
+      throw new Error(`[${r.kind ?? '失败'}] ${r.error}${tried}`);
+    }
+    const j = r.judgement;
+    const right = j.isClassification === false;
+    $('#llmStatus').innerHTML =
+      `<span style="color:var(--ok)">接口正常，耗时 ${r.elapsedMs} ms，实际用的是「${esc(r.modeLabel)}」</span>`;
+    $('#llmTestOut').innerHTML = `<div class="card">
+      <h2>自检结果</h2>
+      <div class="note" style="margin-bottom:10px">
+        样例标题：<code>《真正的橘子味世界不允许百合破坏的存在！》</code>（挂「百合」TAG）<br>
+        ${esc(r.expected)}
+      </div>
+      <div class="verdict">
+        <h3>${right ? '✅ 判对了' : '⚠️ 判得不对，可能要调 prompt 或换模型'}</h3>
+        <dl class="kv">
+          <dt>是否分类标记</dt><dd>${j.isClassification ? '是' : '否'}</dd>
+          <dt>把握程度</dt><dd>${esc(j.confidence)}</dd>
+          <dt>调用方式</dt><dd>${esc(r.modeLabel)}</dd>
+          <dt>理由</dt><dd>${esc(j.reason)}</dd>
+        </dl>
+      </div></div>`;
+  } catch (e) {
+    $('#llmStatus').innerHTML = `<span class="err">${esc(e.message)}</span>`;
+  }
+};
+
+loadDict();
+loadLlm();
+</script>
+</body>
+</html>

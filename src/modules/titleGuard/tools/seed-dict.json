@@ -1,0 +1,292 @@
+{
+  "_说明": [
+    "离线分析用的词典种子。线上词典由 /标题规范 词典 维护，这份只喂给 tools/analyzeTitles.ts。",
+    "取自《Tag按独立标题数数量级分组》里【独立标题数 >= 10】的 23 个词，低于 10 的按约定不管。",
+    "scope 全标题 = 标记段和正文都算；仅标记段 = 只认方括号里的。",
+    "白名单目前是空的——跑一遍分析、看误判样本之后往里加。"
+  ],
+  "exclusiveSets": [
+    {
+      "dimension": "tag",
+      "groups": [
+        "纯爱",
+        "NTR",
+        "NTL"
+      ]
+    },
+    {
+      "dimension": "word",
+      "groups": [
+        "纯爱",
+        "NTR",
+        "NTL"
+      ]
+    }
+  ],
+  "tagGroups": {
+    "纯爱": "纯爱",
+    "NTR": "NTR",
+    "NTL": "NTL",
+    "百合": "百合",
+    "GL": "百合",
+    "多路线": "多路线"
+  },
+  "dict": [
+    {
+      "word": "纯爱",
+      "kind": "分类词",
+      "group": "纯爱",
+      "scope": "全标题",
+      "replaceTo": null,
+      "note": "独立标题 2686，标记段占比 89%"
+    },
+    {
+      "word": "纯爱向",
+      "kind": "分类词",
+      "group": "纯爱",
+      "scope": "全标题",
+      "replaceTo": null,
+      "note": "独立标题 11"
+    },
+    {
+      "word": "1v1",
+      "kind": "分类词",
+      "group": "纯爱",
+      "scope": "全标题",
+      "replaceTo": null,
+      "note": "独立标题 24"
+    },
+    {
+      "word": "双洁",
+      "kind": "分类词",
+      "group": "纯爱",
+      "scope": "全标题",
+      "replaceTo": null,
+      "note": "独立标题 13，标记段占比 92%"
+    },
+    {
+      "word": "NTR",
+      "kind": "分类词",
+      "group": "NTR",
+      "scope": "全标题",
+      "replaceTo": null,
+      "note": "独立标题 786，标记段占比 77%"
+    },
+    {
+      "word": "NTRS",
+      "kind": "分类词",
+      "group": "NTR",
+      "scope": "全标题",
+      "replaceTo": null,
+      "note": "独立标题 99"
+    },
+    {
+      "word": "牛头人",
+      "kind": "分类词",
+      "group": "NTR",
+      "scope": "全标题",
+      "replaceTo": null,
+      "note": "独立标题 57，标记段占比 74%"
+    },
+    {
+      "word": "绿帽",
+      "kind": "分类词",
+      "group": "NTR",
+      "scope": "全标题",
+      "replaceTo": null,
+      "note": "独立标题 99，但标记段只占 47% —— 高危"
+    },
+    {
+      "word": "出轨",
+      "kind": "分类词",
+      "group": "NTR",
+      "scope": "全标题",
+      "replaceTo": null,
+      "note": "独立标题 71，标记段只占 42% —— 高危"
+    },
+    {
+      "word": "寝取",
+      "kind": "分类词",
+      "group": "NTR",
+      "scope": "全标题",
+      "replaceTo": null,
+      "note": "独立标题 31，标记段只占 31% —— 高危"
+    },
+    {
+      "word": "苦主",
+      "kind": "分类词",
+      "group": "NTR",
+      "scope": "全标题",
+      "replaceTo": null,
+      "note": "独立标题 24，标记段只占 47% —— 高危"
+    },
+    {
+      "word": "NTL",
+      "kind": "分类词",
+      "group": "NTL",
+      "scope": "全标题",
+      "replaceTo": null,
+      "note": "独立标题 1079，标记段占比 86%"
+    },
+    {
+      "word": "黄毛",
+      "kind": "分类词",
+      "group": "NTL",
+      "scope": "全标题",
+      "replaceTo": null,
+      "note": "独立标题 57，标记段只占 30% —— 高危"
+    },
+    {
+      "word": "逆NTR",
+      "kind": "分类词",
+      "group": "逆NTR",
+      "scope": "全标题",
+      "replaceTo": null,
+      "note": "独立标题 45。独立一组，绝不能算成 NTR"
+    },
+    {
+      "word": "百合",
+      "kind": "分类词",
+      "group": "百合",
+      "scope": "全标题",
+      "replaceTo": null,
+      "note": "独立标题 422，标记段占比 79%"
+    },
+    {
+      "word": "GL",
+      "kind": "分类词",
+      "group": "百合",
+      "scope": "全标题",
+      "replaceTo": null,
+      "note": "独立标题 125"
+    },
+    {
+      "word": "女同",
+      "kind": "分类词",
+      "group": "百合",
+      "scope": "全标题",
+      "replaceTo": null,
+      "note": "独立标题 65，标记段只占 32% —— 高危"
+    },
+    {
+      "word": "女女",
+      "kind": "分类词",
+      "group": "百合",
+      "scope": "全标题",
+      "replaceTo": null,
+      "note": "独立标题 14"
+    },
+    {
+      "word": "拉拉",
+      "kind": "分类词",
+      "group": "百合",
+      "scope": "全标题",
+      "replaceTo": null,
+      "note": "独立标题 12，标记段占比 0% —— 极高危"
+    },
+    {
+      "word": "les",
+      "kind": "分类词",
+      "group": "百合",
+      "scope": "全标题",
+      "replaceTo": null,
+      "note": "独立标题 10，标记段只占 10%，且是大量英文单词的子串 —— 极高危"
+    },
+    {
+      "word": "百破",
+      "kind": "分类词",
+      "group": "百破",
+      "scope": "全标题",
+      "replaceTo": null,
+      "note": "独立标题 86，标记段占比 92%"
+    },
+    {
+      "word": "百合破坏",
+      "kind": "分类词",
+      "group": "百破",
+      "scope": "全标题",
+      "replaceTo": null,
+      "note": "独立标题 37。字面含「百合」但不进黑名单——靠 TAG 禁令隔离"
+    },
+    {
+      "word": "纯爱牛",
+      "kind": "黑名单",
+      "group": "NTR",
+      "scope": "全标题",
+      "replaceTo": "NTR",
+      "note": "独立标题 21。有干净替代写法，必须换"
+    },
+    {
+      "word": "多路线",
+      "kind": "中性标记",
+      "group": null,
+      "scope": "全标题",
+      "replaceTo": null,
+      "note": "不属于任何互斥集合，也不能豁免冲突"
+    }
+  ],
+  "whitelist": [
+    "百合杯",
+    "百破杯",
+    "牛头人杯",
+    "纯爱杯",
+    "ntl杯",
+    "ntr杯",
+    "ntrs杯",
+    "纯爱oc杯",
+    "牛头人战士杯",
+    "绿帽癖",
+    "纯爱企划"
+  ],
+  "_白名单来源": "从真实标题数据里提炼：征文活动名（X杯）、人设词。否定式（无X/非X）不进白名单——照样污染搜索。",
+  "groupPriority": {
+    "NTR": 40,
+    "逆NTR": 30,
+    "NTL": 20,
+    "纯爱": 10
+  },
+  "multiRouteGroup": "多路线",
+  "crossExclusions": [
+    {
+      "tagGroup": "百合",
+      "wordGroup": "百破",
+      "note": "百合破坏可以在标题里用百合两个字，但不能挂百合 TAG"
+    },
+    {
+      "tagGroup": "纯爱",
+      "wordGroup": "NTR"
+    },
+    {
+      "tagGroup": "纯爱",
+      "wordGroup": "NTL"
+    },
+    {
+      "tagGroup": "纯爱",
+      "wordGroup": "逆NTR"
+    },
+    {
+      "tagGroup": "NTR",
+      "wordGroup": "纯爱"
+    },
+    {
+      "tagGroup": "NTR",
+      "wordGroup": "NTL"
+    },
+    {
+      "tagGroup": "NTR",
+      "wordGroup": "逆NTR"
+    },
+    {
+      "tagGroup": "NTL",
+      "wordGroup": "纯爱"
+    },
+    {
+      "tagGroup": "NTL",
+      "wordGroup": "NTR"
+    },
+    {
+      "tagGroup": "NTL",
+      "wordGroup": "逆NTR"
+    }
+  ]
+}

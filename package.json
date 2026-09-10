@@ -8,12 +8,15 @@
     "build": "tsc",
     "start": "node --max-old-space-size=1024 dist/core/index.js",
     "typecheck": "tsc --noEmit",
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "test": "echo \"Error: no test specified\" && exit 1",
+    "test:guard": "tsx --test src/modules/titleGuard/services/engine.test.ts src/modules/titleGuard/services/rewriter.test.ts",
+    "guard:ui": "tsx src/modules/titleGuard/tools/debugServer.ts"
   },
   "keywords": [],
   "author": "",
   "license": "ISC",
   "dependencies": {
+    "@node-rs/jieba": "^2.0.3",
     "better-sqlite3": "^11.10.0",
     "discord.js": "^14.19.3",
     "dotenv": "^16.5.0",

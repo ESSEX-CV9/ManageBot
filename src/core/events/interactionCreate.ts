@@ -14,6 +14,13 @@ import { MessageFlags, type Interaction, type ChatInputCommandInteraction } from
 import { handleTemplateButton, handleTemplateModalSubmit } from '../../modules/template';
 // 募选模块的交互 handler
 import { handleElectionButton, handleElectionSelect, handleElectionModal } from '../../modules/election';
+// 标题规范模块的交互 handler
+import {
+    handleTitleGuardButton,
+    handleTitleGuardSelect,
+    handleTitleGuardModal,
+    handleAuthorFixButton,
+} from '../../modules/titleGuard';
 
 const INTERACTION_DEBUG_LOG = String(process.env.INTERACTION_DEBUG_LOG || '').toLowerCase() === 'true';
 
@@ -85,6 +92,11 @@ export async function interactionCreateHandler(interaction: Interaction): Promis
                 await handleTemplateButton(interaction);
             } else if (interaction.customId.startsWith('elect_')) {
                 await handleElectionButton(interaction);
+            } else if (interaction.customId.startsWith('tt_')) {
+                // 作者自助面板里的按钮先接，剩下的交给通知面板
+                if (!(await handleAuthorFixButton(interaction))) {
+                    await handleTitleGuardButton(interaction);
+                }
             }
             // 新模块：在此追加 else if (customId.startsWith('yourprefix_')) { ... }
             return;
@@ -96,6 +108,8 @@ export async function interactionCreateHandler(interaction: Interaction): Promis
                 await handleTemplateModalSubmit(interaction);
             } else if (interaction.customId.startsWith('elect_')) {
                 await handleElectionModal(interaction);
+            } else if (interaction.customId.startsWith('tt_')) {
+                await handleTitleGuardModal(interaction);
             }
             // 新模块：在此追加分支
             return;
@@ -105,6 +119,8 @@ export async function interactionCreateHandler(interaction: Interaction): Promis
         if (interaction.isAnySelectMenu()) {
             if (interaction.customId.startsWith('elect_')) {
                 await handleElectionSelect(interaction);
+            } else if (interaction.customId.startsWith('tt_')) {
+                await handleTitleGuardSelect(interaction);
             }
             // 新模块：在此追加 if (customId.startsWith('yourprefix_')) { ... }
             return;

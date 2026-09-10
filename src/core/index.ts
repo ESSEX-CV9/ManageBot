@@ -37,6 +37,10 @@ import { isElectionTestMode } from '../modules/election/services/electionPermiss
 // 3. 论坛帖子标题统计模块
 import forumTitleExportCommand from '../modules/forumTitleExport/commands/forumTitleExportCommand';
 
+// 4. 标题与 TAG 规范模块
+import titleGuardCommand from '../modules/titleGuard/commands/titleGuardCommand';
+import { startTitleGuardSystem } from '../modules/titleGuard';
+
 // --- 进程级兜底日志（避免“无响应但控制台无日志”难以排查） ---
 const FATAL_EXIT_ON_EXCEPTION = String(process.env.FATAL_EXIT_ON_EXCEPTION || '').toLowerCase() === 'true';
 
@@ -113,6 +117,9 @@ client.commands.set(electionCommand.data.name, electionCommand);
 // 3. 论坛帖子标题统计模块命令注册
 client.commands.set(forumTitleExportCommand.data.name, forumTitleExportCommand);
 
+// 4. 标题与 TAG 规范模块命令注册
+client.commands.set(titleGuardCommand.data.name, titleGuardCommand);
+
 // 测试命令仅在测试模式下注册（生产环境不会出现 /募选测试）
 if (isElectionTestMode()) {
     client.commands.set(electionTestCommand.data.name, electionTestCommand);
@@ -139,6 +146,7 @@ client.once(Events.ClientReady, async (readyClient) => {
     // ③ 启动各模块的后台系统
     await startTemplateSystem(readyClient);
     await startElectionSystem(readyClient);
+    await startTitleGuardSystem(readyClient);
 
     console.log('\n🤖 机器人已完全启动，所有系统正常运行！');
 });
