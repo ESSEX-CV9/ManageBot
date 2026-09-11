@@ -23,6 +23,7 @@ import {
     ButtonStyle,
     ChannelSelectMenuBuilder,
     ChannelType,
+    type ForumChannel,
     EmbedBuilder,
     MessageFlags,
     ModalBuilder,
@@ -40,6 +41,7 @@ import {
 import { checkAdminPermission } from '../../../core/utils/permissionManager';
 import * as db from '../services/titleGuardDatabase';
 import { invalidateConfigCache } from '../services/enforcer';
+import { autoMapTags } from '../services/backfillQueue';
 import {
     CAPABILITIES,
     CAPABILITY_HINT,
@@ -63,6 +65,7 @@ const BTN_DICT = `${P}:dict`;
 const BTN_EDIT_GRACE = `${P}:grace`;
 const BTN_EDIT_QUEUE = `${P}:queue`;
 const BTN_EDIT_DICTSRC = `${P}:dictsrc`;
+const BTN_AUTOMAP = `${P}:automap`;
 const SEL_CAP = `${P}:cap`;         // 选哪一项能力
 const SEL_ROLES = `${P}:roles`;     // tt_cfg:roles:<capability>
 const SEL_FORUMS = `${P}:forumsel`;
@@ -246,6 +249,16 @@ function forumsView(guildId: string) {
     const forums = db.listForums(guildId);
     const enabled = forums.filter(f => f.enabled).map(f => f.forumId);
 
+    // 没对上分类组的 TAG 在判定里等于不存在，所以这个数得摆在明面上
+    let mappedTotal = 0;
+    let unmapped = 0;
+    for (const f of forums) {
+        for (const m of db.listTagMap(guildId, f.forumId)) {
+            if (m.group) mappedTotal++;
+            else unmapped++;
+        }
+    }
+
     const embed = new EmbedBuilder()
         .setTitle('📋 纳管的论坛')
         .setColor(0x5865f2)
@@ -254,11 +267,23 @@ function forumsView(guildId: string) {
                 ? enabled.map(id => `<#${id}>`).join('\n')
                 : '_还没纳管任何论坛。_',
         )
-        .addFields({
-            name: '怎么改',
-            value: '下面的菜单**勾着的就是最终名单**，取消勾选即为移出管理。\n'
-                + '移出不会删掉已有的案件记录，只是不再检查新帖。',
-        });
+        .addFields(
+            {
+                name: '怎么改',
+                value: '下面的菜单**勾着的就是最终名单**，取消勾选即为移出管理。\n'
+                    + '移出不会删掉已有的案件记录，只是不再检查新帖。',
+            },
+            {
+                name: 'TAG 映射',
+                value: unmapped > 0
+                    ? `这些论坛一共有 **${unmapped}** 个 TAG 还没对上分类组。\n`
+                        + '没对上的 TAG 在判定里等于不存在——挂了它也不算声明任何分类。\n'
+                        + '点下面的按钮让机器人按词表猜一遍。'
+                    : mappedTotal > 0
+                        ? `所有 TAG 都有归属了（共 ${mappedTotal} 个）。`
+                        : '还没生成过映射。点下面的按钮按词表猜一遍。',
+            },
+        );
 
     const select = new ChannelSelectMenuBuilder()
         .setCustomId(SEL_FORUMS)
@@ -273,6 +298,11 @@ function forumsView(guildId: string) {
         components: [
             new ActionRowBuilder<ChannelSelectMenuBuilder>().addComponents(select),
             new ActionRowBuilder<ButtonBuilder>().addComponents(
+                new ButtonBuilder().setCustomId(BTN_AUTOMAP)
+                    .setLabel('全部论坛生成 TAG 映射')
+                    .setStyle(unmapped > 0 ? ButtonStyle.Primary : ButtonStyle.Secondary)
+                    .setEmoji('🔖')
+                    .setDisabled(enabled.length === 0),
                 new ButtonBuilder().setCustomId(BTN_HOME).setLabel('返回').setStyle(ButtonStyle.Secondary).setEmoji('◀️'),
             ),
         ],
@@ -511,6 +541,38 @@ export async function handleConfigButton(interaction: ButtonInteraction): Promis
                     field('slowGap', '老帖：几分钟发一个', s.queueIntervalMinutes, '默认 5'),
                 ),
         );
+        return true;
+    }
+
+    if (interaction.customId === BTN_AUTOMAP) {
+        if (!hasCapability(memberOf(interaction), guildId, '词表')) {
+            await denied(interaction, '生成 TAG 映射需要「词表」权限。');
+            return true;
+        }
+        // 要挨个拉频道，可能超过三秒，先 defer 住
+        await interaction.deferUpdate();
+
+        let total = 0;
+        let guessed = 0;
+        const missing: string[] = [];
+        for (const f of db.listForums(guildId)) {
+            const ch = await interaction.client.channels.fetch(f.forumId).catch(() => null);
+            if (!ch || ch.type !== ChannelType.GuildForum) { missing.push(f.forumId); continue; }
+            const r = autoMapTags(interaction.guild!, ch as ForumChannel);
+            total += r.total;
+            guessed += r.guessed;
+        }
+        invalidateConfigCache();
+
+        await interaction.editReply(forumsView(guildId));
+        await interaction.followUp({
+            content: `✅ 跑完了：共 ${total} 个 TAG，这次新猜出 ${guessed} 个分类组。`
+                + '已人工配置过的不会被覆盖。'
+                + (missing.length > 0
+                    ? `\n⚠️ 有 ${missing.length} 个纳管的论坛读不到（频道删了或没权限）。`
+                    : ''),
+            flags: MessageFlags.Ephemeral,
+        });
         return true;
     }
 

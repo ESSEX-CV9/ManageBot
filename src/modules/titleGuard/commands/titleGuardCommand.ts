@@ -219,7 +219,9 @@ const data = new SlashCommandBuilder()
 
     .addSubcommandGroup(g => g.setName('tag映射').setDescription('论坛 TAG 对应哪个分类组')
         .addSubcommand(s => s.setName('自动生成').setDescription('用 TAG 名去词典里猜，不覆盖已人工配置的')
-            .addChannelOption(o => o.setName('论坛').setDescription('论坛频道').addChannelTypes(ChannelType.GuildForum).setRequired(true)))
+            .addChannelOption(o => o.setName('论坛')
+                .setDescription('留空 = 已纳管的全部论坛一起跑')
+                .addChannelTypes(ChannelType.GuildForum)))
         .addSubcommand(s => s.setName('查看').setDescription('查看某论坛的映射')
             .addChannelOption(o => o.setName('论坛').setDescription('论坛频道').addChannelTypes(ChannelType.GuildForum).setRequired(true)))
         .addSubcommand(s => s.setName('修改').setDescription('手工指定某个 TAG 的分类组')
@@ -1077,17 +1079,68 @@ async function handleSegmenter(interaction: ChatInputCommandInteraction, sub: st
 
 async function handleTagMap(interaction: ChatInputCommandInteraction, sub: string): Promise<void> {
     const guildId = interaction.guildId!;
-    const forum = interaction.options.getChannel('论坛', true) as ForumChannel;
 
+    // 自动生成允许不指定论坛 —— 那就把已纳管的全部跑一遍。
+    // 纳管了八个论坛还要敲八次，是上线时最烦的一步。
     if (sub === '自动生成') {
-        const result = autoMapTags(interaction.guild!, forum);
+        const picked = interaction.options.getChannel('论坛') as ForumChannel | null;
+        await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+
+        const targets: ForumChannel[] = [];
+        const missing: string[] = [];
+
+        if (picked) {
+            targets.push(picked);
+        } else {
+            for (const f of db.listForums(guildId)) {
+                const ch = await interaction.client.channels.fetch(f.forumId).catch(() => null);
+                if (ch && ch.type === ChannelType.GuildForum) targets.push(ch as ForumChannel);
+                else missing.push(f.forumId);
+            }
+        }
+
+        if (targets.length === 0) {
+            await interaction.editReply(picked
+                ? '❌ 读不到这个论坛。'
+                : '还没有纳管任何论坛。先用 `/标题规范 论坛 添加`。');
+            return;
+        }
+
+        const lines: string[] = [];
+        let total = 0;
+        let guessed = 0;
+        let mapped = 0;
+
+        for (const forum of targets) {
+            const r = autoMapTags(interaction.guild!, forum);
+            total += r.total;
+            guessed += r.guessed;
+            mapped += r.mapped;
+            const left = r.total - r.mapped;
+            lines.push(`• <#${forum.id}> ${r.total} 个 TAG，新猜出 ${r.guessed} 个`
+                + (left > 0 ? `，还有 **${left}** 个没对上` : '，全部有归属'));
+        }
         invalidateConfigCache();
-        await interaction.reply(ephemeral(
-            `✅ <#${forum.id}> 共 ${result.total} 个 TAG，按词典猜出 ${result.guessed} 个分类组。\n`
-            + '已人工配置过的映射不会被覆盖。',
-        ));
+
+        const left = total - mapped;
+        await interaction.editReply([
+            `✅ 跑完 ${targets.length} 个论坛，共 ${total} 个 TAG，新猜出 ${guessed} 个分类组。`,
+            ...lines,
+            '',
+            '已人工配置过的映射不会被覆盖。',
+            left > 0
+                ? `还有 **${left}** 个 TAG 没对上分类组 —— 多半是画风、平台这类非分类 TAG，`
+                    + '那就不用管；真是分类 TAG 的用 `/标题规范 tag映射 修改` 手工指一下。'
+                : '所有 TAG 都有归属了。',
+            ...(missing.length > 0
+                ? ['', `⚠️ 有 ${missing.length} 个纳管的论坛读不到（频道删了或没权限）：`
+                    + missing.map(id => `\`${id}\``).join('、')]
+                : []),
+        ].join('\n'));
         return;
     }
+
+    const forum = interaction.options.getChannel('论坛', true) as ForumChannel;
 
     if (sub === '修改') {
         const tagName = interaction.options.getString('tag名', true);

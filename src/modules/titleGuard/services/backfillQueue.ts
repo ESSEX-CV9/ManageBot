@@ -17,6 +17,7 @@ import {
 } from 'discord.js';
 
 import * as db from './titleGuardDatabase';
+import { normalize } from './normalizer';
 import {
     effectiveViolations,
     fetchThread,
@@ -274,32 +275,48 @@ export async function runBackfillTick(
 // TAG 映射自动生成
 // ============================================================
 
+export interface AutoMapResult {
+    total: number;
+    /** 这次新猜出来的 */
+    guessed: number;
+    /** 跑完之后一共有多少个 TAG 是有分类组的（含以前人工配的） */
+    mapped: number;
+}
+
 /**
  * 用论坛现有的 TAG 名去词典里找同名词，猜出它属于哪个分类组。
  * 只补名字和「还没配过」的归属，**不覆盖管理组已经人工修正过的映射**。
+ *
+ * 两个容易踩的点：
+ *   1. 词表可能是**借别的服的**，所以要走 dictSourceOf，不能直接用 guild.id，
+ *      否则借用方这边永远是一张空词表，什么都猜不出来。
+ *   2. TAG 名要走和词典同一套**归一化**再比。词典里存的是归一化形式，
+ *      而 TAG 名常有全角和装饰符——「ＮＴＲ」「纯★爱」只做 toLowerCase 是匹配不上的。
  */
-export function autoMapTags(guild: Guild, forum: ForumChannel): { total: number; guessed: number } {
-    const dict = db.listDict(guild.id);
+export function autoMapTags(guild: Guild, forum: ForumChannel): AutoMapResult {
+    const dict = db.listDict(db.dictSourceOf(guild.id));
     const byWord = new Map(dict.filter(d => d.enabled && d.group).map(d => [d.word, d.group!]));
 
     const existing = new Map(db.listTagMap(guild.id, forum.id).map(m => [m.tagId, m.group]));
 
     let guessed = 0;
+    let mapped = 0;
     for (const tag of forum.availableTags) {
-        const normalized = tag.name.trim().toLowerCase();
-        const guess = byWord.get(normalized) ?? null;
+        const already = existing.get(tag.id);
 
         // 已经有人工配置的就只更新名字
-        if (existing.get(tag.id)) {
+        if (already) {
             db.touchTagMapping(guild.id, forum.id, tag.id, tag.name, null);
+            mapped++;
             continue;
         }
 
+        const guess = byWord.get(normalize(tag.name).text.trim()) ?? null;
         db.setTagMapping(guild.id, forum.id, tag.id, tag.name, guess);
-        if (guess) guessed++;
+        if (guess) { guessed++; mapped++; }
     }
 
-    return { total: forum.availableTags.length, guessed };
+    return { total: forum.availableTags.length, guessed, mapped };
 }
 
 export { isForumThread };
