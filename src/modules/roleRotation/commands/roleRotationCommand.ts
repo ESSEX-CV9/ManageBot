@@ -69,20 +69,32 @@ const data = new SlashCommandBuilder()
         .addBooleanOption(option => option.setName('是否启用').setDescription('是否自动按月发起问询')))
     .addSubcommand(sub => sub
         .setName('添加频道')
-        .setDescription('添加通知频道或招募频道，可重复执行以配置多个')
+        .setDescription('添加通知频道、招募频道或子区，可重复执行以配置多个')
         .addRoleOption(option => option.setName('身份组').setDescription('被管理的身份组').setRequired(true))
         .addStringOption(option => option.setName('类型').setDescription('频道用途').setRequired(true)
             .addChoices({ name: '通知频道', value: 'notification' }, { name: '招募频道', value: 'recruitment' }))
         .addChannelOption(option => option.setName('频道').setDescription('要添加的频道').setRequired(true)
-            .addChannelTypes(ChannelType.GuildText, ChannelType.GuildAnnouncement)))
+            .addChannelTypes(
+                ChannelType.GuildText,
+                ChannelType.GuildAnnouncement,
+                ChannelType.PublicThread,
+                ChannelType.PrivateThread,
+                ChannelType.AnnouncementThread,
+            )))
     .addSubcommand(sub => sub
         .setName('移除频道')
-        .setDescription('从配置中移除通知频道或招募频道')
+        .setDescription('从配置中移除通知频道、招募频道或子区')
         .addRoleOption(option => option.setName('身份组').setDescription('被管理的身份组').setRequired(true))
         .addStringOption(option => option.setName('类型').setDescription('频道用途').setRequired(true)
             .addChoices({ name: '通知频道', value: 'notification' }, { name: '招募频道', value: 'recruitment' }))
         .addChannelOption(option => option.setName('频道').setDescription('要移除的频道').setRequired(true)
-            .addChannelTypes(ChannelType.GuildText, ChannelType.GuildAnnouncement)))
+            .addChannelTypes(
+                ChannelType.GuildText,
+                ChannelType.GuildAnnouncement,
+                ChannelType.PublicThread,
+                ChannelType.PrivateThread,
+                ChannelType.AnnouncementThread,
+            )))
     .addSubcommand(sub => sub
         .setName('添加冲突')
         .setDescription('添加申请时互斥的身份组')

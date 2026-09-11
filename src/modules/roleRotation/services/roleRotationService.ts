@@ -65,6 +65,32 @@ export function syncRoleMembers(config: RoleRotationConfig, role: Role): void {
     syncMembers(config.id, role.members.map(member => ({ userId: member.id, isBot: member.user.bot })));
 }
 
+/**
+ * 读取可发送消息的文字频道或子区。已归档子区会先尝试重新开启；否则每月任务到点时
+ * 很可能因为 Discord 自动归档而无法发出消息。
+ */
+async function fetchOutputChannel(
+    client: Client,
+    channelId: string,
+    guildId: string,
+): Promise<{ channel: GuildTextBasedChannel } | { error: string }> {
+    const fetched = await client.channels.fetch(channelId).catch(() => null);
+    if (!fetched || !('guildId' in fetched) || fetched.guildId !== guildId || !fetched.isTextBased()) {
+        return { error: `<#${channelId}> 不存在、不可访问或不是文字频道/子区` };
+    }
+    if (fetched.isThread() && fetched.archived) {
+        try {
+            await fetched.setArchived(false, '分管身份组轮替消息需要发送或更新');
+        } catch (error) {
+            return {
+                error: `<#${channelId}> 已归档且无法重新开启：${error instanceof Error ? error.message : String(error)}`,
+            };
+        }
+    }
+    if (!fetched.isSendable()) return { error: `<#${channelId}> 当前不可发送消息` };
+    return { channel: fetched as GuildTextBasedChannel };
+}
+
 async function fetchGuildAndRole(
     client: Client,
     config: RoleRotationConfig,
@@ -95,11 +121,12 @@ async function sendInquiryMessages(
     const errors: string[] = [];
     for (const channelId of config.notificationChannelIds) {
         if (existingChannels.has(channelId)) continue;
-        const channel = await client.channels.fetch(channelId).catch(() => null);
-        if (!channel?.isSendable() || !('guildId' in channel) || channel.guildId !== config.guildId) {
-            errors.push(`<#${channelId}> 不可发送`);
+        const output = await fetchOutputChannel(client, channelId, config.guildId);
+        if ('error' in output) {
+            errors.push(output.error);
             continue;
         }
+        const channel = output.channel;
         const me = channel.guild.members.me;
         if (
             !role.mentionable
@@ -129,9 +156,9 @@ async function editInquiryMessages(
     const participants = listParticipants(round.id).length;
     for (const item of listMessages(round.id, 'inquiry')) {
         try {
-            const channel = await client.channels.fetch(item.channelId);
-            if (!channel?.isTextBased()) continue;
-            const message = await (channel as GuildTextBasedChannel).messages.fetch(item.messageId);
+            const output = await fetchOutputChannel(client, item.channelId, config.guildId);
+            if ('error' in output) throw new Error(output.error);
+            const message = await output.channel.messages.fetch(item.messageId);
             await message.edit(buildInquiryMessage(config, round, participants, result));
         } catch (error) {
             console.warn(`[RoleRotation] 无法更新问询消息 ${item.channelId}/${item.messageId}:`, error);
@@ -148,9 +175,9 @@ async function refreshRecruitmentMessages(
 ): Promise<void> {
     for (const item of listMessages(round.id, 'recruitment')) {
         try {
-            const channel = await client.channels.fetch(item.channelId);
-            if (!channel?.isTextBased()) continue;
-            const message = await (channel as GuildTextBasedChannel).messages.fetch(item.messageId);
+            const output = await fetchOutputChannel(client, item.channelId, config.guildId);
+            if ('error' in output) throw new Error(output.error);
+            const message = await output.channel.messages.fetch(item.messageId);
             await message.edit(buildRecruitmentMessage(config, round, currentMembers, closedReason));
         } catch (error) {
             console.warn(`[RoleRotation] 无法更新招募消息 ${item.channelId}/${item.messageId}:`, error);
@@ -383,17 +410,18 @@ async function ensureRecruitmentMessagesInternal(
     const failures: string[] = [];
     for (const channelId of config.recruitmentChannelIds) {
         if (existingChannels.has(channelId)) continue;
-        const channel = await client.channels.fetch(channelId).catch(() => null);
-        if (!channel?.isSendable() || !('guildId' in channel) || channel.guildId !== config.guildId) {
-            failures.push(channelId);
+        const output = await fetchOutputChannel(client, channelId, config.guildId);
+        if ('error' in output) {
+            failures.push(output.error);
             continue;
         }
+        const channel = output.channel;
         try {
             const message = await channel.send(buildRecruitmentMessage(config, round, currentMembers));
             saveMessage({ roundId: round.id, phase: 'recruitment', channelId, messageId: message.id });
             sent++;
-        } catch {
-            failures.push(channelId);
+        } catch (error) {
+            failures.push(`<#${channelId}>：${error instanceof Error ? error.message : String(error)}`);
         }
     }
     await refreshRecruitmentMessages(client, config, round, currentMembers);
