@@ -323,22 +323,28 @@ export async function scanForums(
 // ============================================================
 
 /**
- * 从指定队列取一个帖子处理。
+ * 处理一个队列项的结果。
  *
- * 返回**这次有没有真的处理掉一个**。调用方靠它决定要不要记一次配额——
- * 队列空跑也算数的话，歇 30 分钟的闸会被一堆空转悄悄耗光，
- * 等真有帖子进来时配额已经没了。
+ *   done    真发了一条通知 —— 占一次配额
+ *   skipped 这一项没事（帖子没了、复查已合规、已有未结案件）—— 已经出队，但不占配额
+ *   empty   队列空了 —— 该收工了
+ *
+ * 三者必须分开。以前只返回 boolean，调用方把「跳过」也当成「队列空了」整批中止，
+ * 于是一批里只要头一个是跳过的，这一分钟就白过了，看起来像卡死。
  */
+export type TickResult = 'done' | 'skipped' | 'empty';
+
+/** 从指定队列取一个帖子处理 */
 export async function runBackfillTick(
     client: Client, guildId: string, lane: db.QueueLane = 'slow',
-): Promise<boolean> {
-    const item = db.nextBackfillItem(lane);
-    if (!item || item.guildId !== guildId) return false;
+): Promise<TickResult> {
+    const item = db.nextBackfillItem(guildId, lane);
+    if (!item) return 'empty';
 
     const thread = await fetchThread(client, item.threadId);
     if (!thread) {
         db.finishBackfillItem(item.guildId, item.threadId, 'skipped', '帖子已不存在');
-        return false;
+        return 'skipped';
     }
 
     try {
@@ -347,7 +353,7 @@ export async function runBackfillTick(
         const inspection = await inspectThread(thread);
         if (inspection.skipped) {
             db.finishBackfillItem(item.guildId, item.threadId, 'skipped', inspection.skipped);
-            return false;
+            return 'skipped';
         }
 
         const violations = effectiveViolations(inspection);
@@ -355,25 +361,25 @@ export async function runBackfillTick(
             db.finishBackfillItem(item.guildId, item.threadId, 'skipped', '复查已合规');
             // 复查发现没事了，记进「已核查」，省得下次全量又把它捞出来
             db.markClean(item.guildId, item.forumId, [item.threadId]);
-            return false;
+            return 'skipped';
         }
 
         const { openCaseFor } = await import('./enforcer');
         const guardCase = openCaseFor(inspection);
         if (!guardCase) {
             db.finishBackfillItem(item.guildId, item.threadId, 'skipped', '已有未结案件');
-            return false;
+            return 'skipped';
         }
 
         db.finishBackfillItem(item.guildId, item.threadId, 'done');
         console.log(`[TitleGuard] ${lane === 'fast' ? '活跃帖' : '老帖'}入案 #${guardCase.id}：${thread.name}`);
-        // 真发了一条通知才算用掉一次配额
-        return true;
+        // 真建了案才算用掉一次配额
+        return 'done';
     } catch (err) {
         const message = err instanceof Error ? err.message : String(err);
         db.finishBackfillItem(item.guildId, item.threadId, 'failed', message);
         console.error(`[TitleGuard] 队列整改失败 ${item.threadId}：`, err);
-        return false;
+        return 'skipped';
     }
 }
 

@@ -1496,8 +1496,24 @@ async function handleQueue(interaction: ChatInputCommandInteraction, sub: string
         ? `${min} 分钟`
         : min < 60 * 48 ? `${(min / 60).toFixed(1)} 小时` : `${(min / 60 / 24).toFixed(1)} 天`;
 
+    // 队列不动的时候，绝大多数原因是这两个开关，而不是队列本身有问题。
+    // 不在这儿说清楚，看的人只会看到「待处理 28」一直不变，完全无从下手
+    const blockers: string[] = [];
+    if (!settings.enabled) {
+        blockers.push('🚨 **总开关是关的** —— 调度器根本不会碰队列。'
+            + '开：`/标题规范 配置 启用:true`');
+    }
+    if (settings.queuePaused) {
+        blockers.push('⏸️ **队列被暂停了**。继续：`/标题规范 队列 继续`');
+    }
+    if (blockers.length === 0 && fast + slow > 0) {
+        blockers.push('▶️ 正在跑。调度器每分钟醒一次，'
+            + '快队列会在一次唤醒里连着发完这一批，慢队列按间隔一个一个来。');
+    }
+
     await interaction.reply(ephemeral([
-        `**整改队列**　${settings.queuePaused ? '⏸️ 已暂停' : '▶️ 运行中'}`,
+        `**整改队列**`,
+        ...blockers,
         '',
         `🏃 **快队列**（活跃帖 + 近期归档）　待处理 **${fast}**`,
         `　　${settings.fastBatchSize} 条一批，每批歇 ${settings.fastBatchPauseMinutes} 分钟`
@@ -1507,6 +1523,12 @@ async function handleQueue(interaction: ChatInputCommandInteraction, sub: string
         `　　${settings.queueIntervalMinutes} 分钟一个　→ 约 ${dur(slowMin)}`,
         '',
         `累计：已完成 ${stats.done ?? 0}　跳过 ${stats.skipped ?? 0}　失败 ${stats.failed ?? 0}`,
+        ...(stats.skipped
+            ? ['_跳过 = 帖子没了 / 复查发现已经合规 / 已有未结案件。这些不占限速配额。_']
+            : []),
+        ...(stats.failed
+            ? [`_失败 ${stats.failed} 个，去看机器人日志里的「队列整改失败」。_`]
+            : []),
         '',
         '_两条队列并行跑，所以实际跑完的时间取慢的那条。_',
         '_限速是故意的：发通知一定会顶帖，一口气发几百条会把论坛首页整个刷掉。_',

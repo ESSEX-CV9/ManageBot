@@ -1417,8 +1417,13 @@ const enqueueStmt = db.prepare(`
         lane = excluded.lane
     WHERE tt_queue.state = 'pending'
 `);
+// guild_id 必须进 WHERE。少了它就是「全局取最老的一条，不是这个服的就放弃」——
+// 两个服的时候，其中一个会被另一个的排队项永久挡住，而且那些项连状态都不会变，
+// 表现是「待处理数字一直不动」，非常难查
 const nextQueueStmt = db.prepare(`
-    SELECT * FROM tt_queue WHERE state = 'pending' AND lane = ? ORDER BY enqueued_at LIMIT 1
+    SELECT * FROM tt_queue
+    WHERE guild_id = ? AND state = 'pending' AND lane = ?
+    ORDER BY enqueued_at LIMIT 1
 `);
 const pendingCountStmt = db.prepare(`
     SELECT COUNT(*) AS c FROM tt_queue WHERE guild_id = ? AND state = 'pending' AND lane = ?
@@ -1438,8 +1443,8 @@ export function enqueueBackfill(
     enqueueStmt.run(guildId, forumId, threadId, lane, Date.now());
 }
 
-export function nextBackfillItem(lane: QueueLane): QueueItem | null {
-    const row = nextQueueStmt.get(lane) as {
+export function nextBackfillItem(guildId: string, lane: QueueLane): QueueItem | null {
+    const row = nextQueueStmt.get(guildId, lane) as {
         guild_id: string; forum_id: string; thread_id: string; lane: string;
         state: string; attempts: number; last_error: string | null;
     } | undefined;

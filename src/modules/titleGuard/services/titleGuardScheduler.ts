@@ -230,6 +230,15 @@ const fastBatchCount = new Map<string, number>();
 const fastBatchStart = new Map<string, number>();
 
 /**
+ * 一个 tick 里最多花在快队列上的时间。
+ *
+ * 一批 50 个，要是恰好全都需要模型定性，每个几十秒，这一批能跑掉半小时以上，
+ * 而 tick 是串行的（有 ticking 锁）——那段时间里发通知、到期复查全部停摆。
+ * 所以给它一个预算，用超了就把剩下的留到下一个 tick，批次计数原样带过去。
+ */
+const FAST_LANE_BUDGET_MS = 45_000;
+
+/**
  * 快队列：一批 N 个，发满就歇 M 分钟。
  *
  * 计数按「批」重置而不是按滑动窗口，是因为管理组要能预期：
@@ -252,12 +261,23 @@ async function processFastLane(client: Client, guildId: string, now: number): Pr
     }
     if (count === 0) fastBatchStart.set(guildId, now);
 
-    // 一个 tick（1 分钟）里把这批剩下的额度用掉，别一分钟才发一个
-    const remaining = size - count;
-    for (let i = 0; i < remaining; i++) {
-        const handled = await runBackfillTick(client, guildId, 'fast');
-        if (!handled) return; // 队列空了，这批不算数，下次有货再从头计
-        fastBatchCount.set(guildId, (fastBatchCount.get(guildId) ?? 0) + 1);
+    // 一个 tick 里尽量把这批的额度用掉，别一分钟才发一个
+    const deadline = Date.now() + FAST_LANE_BUDGET_MS;
+    for (let i = count; i < size; i++) {
+        const r = await runBackfillTick(client, guildId, 'fast');
+
+        // 队列空了才收工。**「跳过」不能当成空**——
+        // 跳过的项已经出队了，接着取下一个就是；
+        // 把它当成空会让「一批里头一个是跳过的」变成这一分钟什么都没干
+        if (r === 'empty') return;
+
+        // 只有真发出去的才占配额。跳过的不占，否则一批 50 个可能全被
+        // 「复查已合规」这类占掉，真该发的一个都没轮上
+        if (r === 'done') {
+            fastBatchCount.set(guildId, (fastBatchCount.get(guildId) ?? 0) + 1);
+        }
+
+        if (Date.now() > deadline) return; // 预算用完，剩下的下个 tick 接着来
     }
 }
 
@@ -267,9 +287,15 @@ async function processSlowLane(client: Client, guildId: string, now: number): Pr
     const intervalMs = Math.max(1, settings.queueIntervalMinutes) * 60_000;
     if (now - (lastBackfill.get(guildId) ?? 0) < intervalMs) return;
 
-    const handled = await runBackfillTick(client, guildId, 'slow');
-    // 队列空的时候不要刷新计时器，否则真有货进来时还得再等一轮
-    if (handled) lastBackfill.set(guildId, now);
+    // 跳过的不算数：那没发通知，也就没顶帖，不该占掉这一轮的间隔。
+    // 连着遇到跳过就继续往下取，但别在一个 tick 里耗太久
+    const deadline = Date.now() + FAST_LANE_BUDGET_MS;
+    for (;;) {
+        const r = await runBackfillTick(client, guildId, 'slow');
+        if (r === 'empty') return;        // 队列空，也不刷新计时器
+        if (r === 'done') { lastBackfill.set(guildId, now); return; }
+        if (Date.now() > deadline) return; // 一直在跳过，下个 tick 接着清
+    }
 }
 
 async function processBackfill(client: Client): Promise<void> {
