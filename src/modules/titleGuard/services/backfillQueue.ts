@@ -43,6 +43,12 @@ const MAX_ARCHIVE_PAGES = 1000;
 
 export interface CollectResult {
     threads: ThreadChannel[];
+    /** 活跃帖拿到几个 */
+    active: number;
+    /** 归档帖拿到几个 */
+    archived: number;
+    /** 归档翻了几页 */
+    pages: number;
     /**
      * 帖子**没取全**。
      *
@@ -73,10 +79,12 @@ export async function collectThreads(forum: ForumChannel): Promise<CollectResult
     const found = new Map<string, ThreadChannel>();
     let incomplete = false;
     let reason: string | undefined;
+    let activeCount = 0;
 
     try {
         const active = await forum.threads.fetchActive();
         for (const [id, thread] of active.threads) found.set(id, thread);
+        activeCount = found.size;
     } catch (err) {
         incomplete = true;
         reason = '活跃帖读取失败：' + (err instanceof Error ? err.message : String(err));
@@ -99,7 +107,8 @@ export async function collectThreads(forum: ForumChannel): Promise<CollectResult
             break;
         }
 
-        if (archived.threads.size === 0) break;
+        const size = archived.threads.size;
+        if (size === 0) break;
 
         // 游标只认 archivedAt。混用 createdTimestamp 会让游标跳错位置，
         // 要么漏掉一段，要么在原地打转
@@ -110,7 +119,16 @@ export async function collectThreads(forum: ForumChannel): Promise<CollectResult
             if (ts !== undefined && (oldest === undefined || ts < oldest)) oldest = ts;
         }
 
-        if (!archived.hasMore) break;
+        console.log(`[TitleGuard] 论坛 ${forum.id} 归档第 ${page + 1} 页：`
+            + `拿到 ${size} 个，has_more=${archived.hasMore}，累计 ${found.size}`);
+
+        // **不能只信 has_more。** 这一页要是装满了（拿满 limit 个），
+        // 那后面几乎肯定还有；has_more 在某些情况下会提前报 false，
+        // 只听它的话会在半路无声无息地停下，而且 incomplete 还是 false，
+        // 报表上完全看不出来少了东西。
+        const pageFull = size >= ARCHIVE_PAGE;
+        if (!archived.hasMore && !pageFull) break;
+
         if (oldest === undefined) {
             incomplete = true;
             reason = `归档帖翻到第 ${page + 1} 页时拿不到归档时间，没法继续翻页`;
@@ -130,7 +148,19 @@ export async function collectThreads(forum: ForumChannel): Promise<CollectResult
         reason = `归档帖超过 ${MAX_ARCHIVE_PAGES * ARCHIVE_PAGE} 个，只取了这么多`;
     }
 
-    return { threads: [...found.values()], incomplete, reason };
+    const threads = [...found.values()];
+    console.log(`[TitleGuard] 论坛 ${forum.id} 取帖完毕：`
+        + `活跃 ${activeCount} + 归档 ${threads.length - activeCount} = ${threads.length} 个`
+        + `（翻了 ${page} 页归档）${incomplete ? ' ⚠ 没取全：' + reason : ''}`);
+
+    return {
+        threads,
+        active: activeCount,
+        archived: threads.length - activeCount,
+        pages: page,
+        incomplete,
+        reason,
+    };
 }
 
 // ============================================================
@@ -187,7 +217,14 @@ export async function scanForum(
     guildId: string,
     forumId: string,
     options: { dryRun?: boolean; onProgress?: (p: ScanProgress) => void } = {},
-): Promise<{ rows: ScanRow[]; progress: ScanProgress; incomplete: boolean; reason?: string }> {
+): Promise<{
+    rows: ScanRow[];
+    progress: ScanProgress;
+    incomplete: boolean;
+    reason?: string;
+    active: number;
+    archived: number;
+}> {
     const dryRun = options.dryRun ?? true;
     const settings = db.getSettings(guildId);
 
@@ -197,7 +234,8 @@ export async function scanForum(
     }
     const forum = channel as ForumChannel;
 
-    const { threads, incomplete, reason } = await collectThreads(forum);
+    const collected = await collectThreads(forum);
+    const { threads, incomplete, reason } = collected;
     const rows: ScanRow[] = [];
     const progress: ScanProgress = { scanned: 0, flagged: 0, skipped: 0 };
     const cleanIds: string[] = [];
@@ -261,7 +299,10 @@ export async function scanForum(
     }
 
     options.onProgress?.(progress);
-    return { rows, progress, incomplete, reason };
+    return {
+        rows, progress, incomplete, reason,
+        active: collected.active, archived: collected.archived,
+    };
 }
 
 /**
@@ -283,11 +324,16 @@ export async function scanForums(
     progress: ScanProgress;
     failed: string[];
     incomplete: { forumId: string; reason: string }[];
+    /** 拿到的帖子里，活跃的和已归档的各多少。数字不对劲时一眼看得出缺在哪一半 */
+    active: number;
+    archived: number;
 }> {
     const rows: ScanRow[] = [];
     const total: ScanProgress = { scanned: 0, flagged: 0, skipped: 0 };
     const failed: string[] = [];
     const incomplete: { forumId: string; reason: string }[] = [];
+    let active = 0;
+    let archived = 0;
 
     for (const forumId of forumIds) {
         // 每个论坛内部的进度加上前面已经累计的，报出去才是全局进度
@@ -305,6 +351,8 @@ export async function scanForums(
             total.scanned += r.progress.scanned;
             total.flagged += r.progress.flagged;
             total.skipped += r.progress.skipped;
+            active += r.active;
+            archived += r.archived;
             if (r.incomplete) {
                 incomplete.push({ forumId, reason: r.reason ?? '原因不明' });
             }
@@ -315,7 +363,7 @@ export async function scanForums(
     }
 
     options.onProgress?.(total);
-    return { rows, progress: total, failed, incomplete };
+    return { rows, progress: total, failed, incomplete, active, archived };
 }
 
 // ============================================================

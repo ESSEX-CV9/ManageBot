@@ -261,7 +261,9 @@ const data = new SlashCommandBuilder()
         .addSubcommand(s => s.setName('状态').setDescription('查看进度'))
         .addSubcommand(s => s.setName('暂停').setDescription('暂停队列'))
         .addSubcommand(s => s.setName('继续').setDescription('继续队列'))
-        .addSubcommand(s => s.setName('清空').setDescription('清空队列')));
+        .addSubcommand(s => s.setName('清空').setDescription('清空队列'))
+        .addSubcommand(s => s.setName('重置核查')
+            .setDescription('清掉「已核查合格」记录，让下次全量扫描重新判一遍所有帖子')));
 
 // ============================================================
 // 小工具
@@ -1271,12 +1273,32 @@ async function handleScan(interaction: ChatInputCommandInteraction): Promise<voi
         return;
     }
 
+    // 词表空着照样跑的话，什么都匹配不到、全判合格，
+    // 而 静默:false 会把这一大批帖子记成「已核查合格」—— 一次静悄悄的误判
+    const dictSource = db.dictSourceOf(guildId);
+    const classifiers = db.listDict(dictSource)
+        .filter(d => d.enabled && d.kind === '分类词' && d.group);
+    if (classifiers.length === 0) {
+        await interaction.editReply([
+            '🚨 **词表里一条分类词都没有，扫了也是白扫。**',
+            '',
+            dictSource === guildId
+                ? '本服的词表是空的。先导入：`/标题规范 词典 导入 文件:标题规范词表.xlsx`'
+                : `本服词表跟着服务器 \`${dictSource}\` 走，而那边的词表是空的。`,
+            '',
+            '（不拦住的话，所有帖子都会被判成合格；'
+                + '要是再用了 `静默:false`，它们还会被记成「已核查」。）',
+        ].join('\n'));
+        return;
+    }
+
     await interaction.editReply(
         `🔎 开始扫描${picked ? ` <#${picked.id}>` : `已纳管的 ${forumIds.length} 个论坛`}`
-        + `${dryRun ? '（静默模式：只出报表，不发通知不改动）' : ''}…`);
+        + `（词表 ${classifiers.length} 条分类词）`
+        + `${dryRun ? '　静默模式：只出报表，不发通知不改动' : ''}…`);
 
     try {
-        const { rows, progress, failed, incomplete } = await scanForums(
+        const { rows, progress, failed, incomplete, active, archived } = await scanForums(
             interaction.client, guildId, forumIds, {
             dryRun,
             onProgress: p => {
@@ -1315,7 +1337,8 @@ async function handleScan(interaction: ChatInputCommandInteraction): Promise<voi
 
         await interaction.editReply({
             content: `✅ 扫描完成。\n`
-                + `• 看了 **${progress.scanned}** 个帖子，跳过 ${progress.skipped} 个\n`
+                + `• 看了 **${progress.scanned}** 个帖子`
+                + `（活跃 ${active} + 已归档 ${archived}），跳过 ${progress.skipped} 个\n`
                 + `• 合格 **${progress.scanned - progress.skipped - progress.flagged}** 个`
                 + `${dryRun ? '' : '（已记为已核查）'}\n`
                 + `• 违规 **${progress.flagged}** 个：`
@@ -1478,6 +1501,18 @@ async function handleQueue(interaction: ChatInputCommandInteraction, sub: string
     if (sub === '清空') {
         db.clearBackfill(guildId);
         await interaction.reply(ephemeral('✅ 整改队列已清空（两条都清）。'));
+        return;
+    }
+
+    // 用得着这条的场景：拿一份不对的词表（比如空词表）跑过 静默:false，
+    // 一批帖子被错记成合格。清掉之后重跑全量，它们会按新词表重新判。
+    if (sub === '重置核查') {
+        const n = db.cleanCount(guildId);
+        db.clearClean(guildId);
+        await interaction.reply(ephemeral(n > 0
+            ? `✅ 已清掉 ${n} 条「已核查合格」记录。`
+                + `\n下次 \`/标题规范 扫描\` 会把这些帖子重新判一遍。`
+            : '「已核查合格」本来就是空的，不用清。'));
         return;
     }
 
