@@ -26,6 +26,12 @@ test('未复核的通知会提示可调用 LLM 再次复核', () => {
     assert.ok(content.buttons.some(b => b.label === '申请复核'));
 });
 
+test('AI 判定依据允许帖主查看', () => {
+    const content = buildNoticeContent({ ...BASE, llmReason: '建案时由 AI 定性' });
+    const detail = content.buttons.find(b => b.label === 'AI 判定依据');
+    assert.match(detail?.who ?? '', /帖主/);
+});
+
 test('AI 复核用过后切换为人工复核提示', () => {
     const content = buildNoticeContent({
         ...BASE,

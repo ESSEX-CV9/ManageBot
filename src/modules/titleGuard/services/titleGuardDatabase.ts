@@ -1170,6 +1170,12 @@ const listOpenNoticeCasesStmt = db.prepare(`
     WHERE closed_at IS NULL AND notice_message_id IS NOT NULL
     ORDER BY id
 `);
+const listNoticeCasesForRefreshStmt = db.prepare(`
+    SELECT * FROM tt_cases
+    WHERE notice_message_id IS NOT NULL
+      AND (closed_at IS NULL OR closed_at >= ?)
+    ORDER BY id
+`);
 
 export interface CreateCaseInput {
     guildId: string;
@@ -1254,6 +1260,14 @@ export function listUnnotifiedCases(limit = 20): GuardCase[] {
 /** 已经发过通知、且仍未结案的案件。用于新版上线后原地刷新旧面板文案。 */
 export function listOpenNoticeCases(): GuardCase[] {
     return (listOpenNoticeCasesStmt.all() as CaseRow[]).map(toCase);
+}
+
+/**
+ * 启动修复通知时，除了全部未结案件，也带上近期已结案件。
+ * 这能自动修复旧版本中“作者已完成，但黄色面板没有重画”的历史通知。
+ */
+export function listNoticeCasesForRefresh(recentClosedSince: number): GuardCase[] {
+    return (listNoticeCasesForRefreshStmt.all(recentClosedSince) as CaseRow[]).map(toCase);
 }
 
 // ============================================================

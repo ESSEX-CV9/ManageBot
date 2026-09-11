@@ -32,8 +32,9 @@ import {
     getCompiledConfig,
     inspectThread,
 } from '../services/enforcer';
-import { buildPlan, validateNewTitle } from '../services/rewriter';
+import { buildPlan, validateNewTitle, type RewritePlan } from '../services/rewriter';
 import type { GroupId } from '../services/types';
+import { refreshNotice } from './noticePanel';
 
 export const SELECT_KEEP = 'tt_keep';        // tt_keep:<caseId>
 export const BTN_EDIT_TITLE = 'tt_title';    // tt_title:<caseId>
@@ -44,6 +45,8 @@ export const MODAL_TITLE = 'tt_modal_title'; // tt_modal_title:<caseId>
 const authorChoices = new Map<number, GroupId>();
 /** 作者自己敲的标题 */
 const authorTitles = new Map<number, string>();
+/** 最近一次重算出的预览标题；打开标题弹窗时直接用，不能为了预填值先请求 Discord。 */
+const authorPreviewTitles = new Map<number, string>();
 
 function caseIdOf(customId: string): number | null {
     const id = Number(customId.split(':')[1]);
@@ -86,7 +89,11 @@ async function renderPanel(
 ): Promise<void> {
     const thread = await fetchThread(interaction.client, guardCase.threadId);
     if (!thread) {
-        await interaction.reply({ content: '❌ 找不到这个帖子了。', flags: MessageFlags.Ephemeral });
+        if (interaction.replied || interaction.deferred) {
+            await interaction.editReply({ content: '❌ 找不到这个帖子了。', embeds: [], components: [] });
+        } else {
+            await interaction.reply({ content: '❌ 找不到这个帖子了。', flags: MessageFlags.Ephemeral });
+        }
         return;
     }
 
@@ -98,6 +105,7 @@ async function renderPanel(
     const plan = inspection.plan;
 
     const previewTitle = draftTitle ?? plan?.newTitle ?? thread.name;
+    authorPreviewTitles.set(guardCase.id, previewTitle);
 
     const embed = new EmbedBuilder()
         .setTitle('✏️ 调整你的帖子分类')
@@ -232,13 +240,10 @@ async function openTitleModal(interaction: ButtonInteraction): Promise<void> {
         return;
     }
 
-    const thread = await fetchThread(interaction.client, guardCase.threadId);
-    const inspection = thread
-        ? await inspectThread(thread, { dryRun: true, authorChoice: authorChoices.get(guardCase.id) ?? null })
-        : null;
-
+    const savedPlan = guardCase.plan as RewritePlan | null;
     const prefill = authorTitles.get(guardCase.id)
-        ?? inspection?.plan?.newTitle
+        ?? authorPreviewTitles.get(guardCase.id)
+        ?? savedPlan?.newTitle
         ?? guardCase.originalTitle;
 
     const modal = new ModalBuilder()
@@ -274,9 +279,17 @@ export async function handleTitleGuardModal(interaction: ModalSubmitInteraction)
     }
 
     const candidate = interaction.fields.getTextInputValue('title').trim();
+
+    // 后面要读取帖子并重新校验，先确认这次 Modal 交互，避免超过 Discord 的 3 秒窗口。
+    // deferUpdate 保留原来的自助面板；校验成功后 renderPanel 会原地更新它。
+    await interaction.deferUpdate();
+
     const thread = await fetchThread(interaction.client, guardCase.threadId);
     if (!thread) {
-        await interaction.reply({ content: '❌ 找不到这个帖子了。', flags: MessageFlags.Ephemeral });
+        await interaction.followUp({
+            content: '❌ 找不到这个帖子了。',
+            flags: MessageFlags.Ephemeral,
+        });
         return;
     }
 
@@ -286,7 +299,7 @@ export async function handleTitleGuardModal(interaction: ModalSubmitInteraction)
     const check = validateNewTitle(candidate, candidate, inspection.tags, compiled, { allowAddition: true });
 
     if (!check.ok) {
-        await interaction.reply({
+        await interaction.followUp({
             content: `❌ 这个标题还是不符合规范：${check.reason}\n请再改一下。`,
             flags: MessageFlags.Ephemeral,
         });
@@ -294,7 +307,6 @@ export async function handleTitleGuardModal(interaction: ModalSubmitInteraction)
     }
 
     authorTitles.set(guardCase.id, candidate);
-    await interaction.deferUpdate();
     await renderPanel(interaction, guardCase, '标题已通过检查，点「确认并提交」生效。');
 }
 
@@ -364,7 +376,12 @@ async function applyAuthorPlan(interaction: ButtonInteraction): Promise<void> {
 
     authorChoices.delete(guardCase.id);
     authorTitles.delete(guardCase.id);
+    authorPreviewTitles.delete(guardCase.id);
     db.closeCase(guardCase.id, 'resolved');
+
+    // 作者自助提交不会再有未结案件供 ThreadUpdate 的延迟检查拾取，必须在结案后
+    // 直接重画原通知；否则只会多出绿色完成消息，旧的黄色整改面板会永久留着。
+    await refreshNotice(interaction.client, guardCase.id);
 
     await interaction.editReply('✅ 已按你的方案调整完成，感谢配合！');
 

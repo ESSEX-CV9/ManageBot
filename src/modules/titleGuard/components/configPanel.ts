@@ -731,8 +731,10 @@ export async function handleConfigButton(interaction: ButtonInteraction): Promis
             return true;
         }
 
+        // 大服可能有很多未结案件，批量写入队列前先确认按钮交互。
+        await interaction.deferUpdate();
         const queued = db.enqueueOpenCaseReaudits(guildId, mode, `admin:${interaction.user.id}`);
-        await interaction.update(reauditView(guildId));
+        await interaction.editReply(reauditView(guildId));
         await interaction.followUp({
             content: queued > 0
                 ? `✅ 已将 **${queued}** 个未结案件排入${mode === 'llm' ? '强制 LLM' : '纯规则'}重审核。`

@@ -223,9 +223,9 @@ function buildClosedContent(
             : '本帖分类信息已符合规范，本次检查结束。',
         fields: [{ name: '结论', value: resolution.note || '—' }],
         footer: line ? line + '\n如有疑问，请联系管理组。' : '如有疑问，请联系管理组。',
-        // 结案之后仍然留一颗查依据的按钮，管理组事后复盘要用
+        // 结案之后仍然留一颗查依据的按钮，作者和管理组都可以回看
         buttons: aiTouched(input)
-            ? [{ label: 'AI 判定依据', style: 'secondary', who: '有「接警」权限的身份组' }]
+            ? [{ label: 'AI 判定依据', style: 'secondary', who: '帖主 / 有「接警」权限的身份组' }]
             : [],
     };
 }
@@ -359,10 +359,9 @@ function buildButtonList(input: NoticeInput): NoticeButton[] {
         });
     }
 
-    // AI 参与过才给这颗按钮。理由只对管理组可见——
-    // 摆在公开消息里等于把提示词的轮廓喂给想做注入的人
+    // AI 参与过才给这颗按钮；理由只通过仅本人可见的交互回复展示。
     if (aiTouched(input)) {
-        buttons.push({ label: 'AI 判定依据', style: 'secondary', who: '有「接警」权限的身份组' });
+        buttons.push({ label: 'AI 判定依据', style: 'secondary', who: '帖主 / 有「接警」权限的身份组' });
     }
 
     buttons.push({ label: '人工覆盖', style: 'danger', who: '有「覆盖」权限的身份组' });

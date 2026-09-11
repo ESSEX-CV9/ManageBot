@@ -127,7 +127,15 @@ export async function interactionCreateHandler(interaction: Interaction): Promis
             return;
         }
     } catch (error) {
-        console.error('交互处理错误:', error);
+        const target = interaction.isButton()
+            ? `button:${interaction.customId}`
+            : interaction.isModalSubmit()
+                ? `modal:${interaction.customId}`
+                : interaction.isChatInputCommand()
+                    ? `command:${interaction.commandName}`
+                    : interaction.type.toString();
+        const ageMs = Date.now() - interaction.createdTimestamp;
+        console.error(`交互处理错误 [${target}, age=${ageMs}ms]:`, error);
         try {
             if (interaction.isRepliable()) {
                 if (!interaction.replied && !interaction.deferred) {
@@ -140,7 +148,14 @@ export async function interactionCreateHandler(interaction: Interaction): Promis
                 }
             }
         } catch (replyError) {
-            console.error('回复错误:', replyError);
+            const code = typeof replyError === 'object' && replyError !== null && 'code' in replyError
+                ? (replyError as { code?: unknown }).code
+                : undefined;
+            if (code === 10062) {
+                console.warn(`[Interaction] 错误提示未送达：交互已过期 [${target}, age=${Date.now() - interaction.createdTimestamp}ms]`);
+            } else {
+                console.error('回复错误:', replyError);
+            }
         }
     }
 }

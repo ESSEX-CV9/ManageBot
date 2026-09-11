@@ -7,12 +7,11 @@
 //   申请复核      帖主 + 管理组            → 填一句理由，先走 AI 复核
 //   申请人工复核  帖主 + 管理组            → AI 复核用掉之后变成这个
 //   驳回申诉      有「复核」能力的身份组    → 申诉不成立，恢复倒计时
-//   AI 判定依据   有「接警」能力的身份组    → 仅本人可见地看 AI 说了什么
+//   AI 判定依据   帖主 + 有「接警」能力的身份组 → 仅本人可见地看 AI 说了什么
 //   人工覆盖      有「覆盖」能力的身份组    → 直接放行并写入豁免表
 //
-// **AI 的原话一个字都不进公开消息。** 那些话里带着它读到的规则、它的推理路数、
-// 提示词里的措辞，谁都看得见的话，等于把提示词的轮廓一点点喂给想做注入的人。
-// 公开消息只说「这次经过了 AI 判定」，完整理由走上面那颗按钮。
+// **AI 的原话一个字都不进公开消息。** 公开消息只说「这次经过了 AI 判定」；
+// 完整理由由帖子作者本人或管理组点击上面的按钮后，以仅本人可见消息查看。
 //
 // 复核是**两级**的：
 //   1. AI 复核每个案子只有一次。它维持原判 → 恢复倒计时，作者可以再升人工；
@@ -56,7 +55,6 @@ import { buildJudgeRules } from '../services/llmJudge';
 import type { RewritePlan } from '../services/rewriter';
 import type { NormalizedTitle, Violation } from '../services/types';
 import { buildNoticeContent, buildDoneMessage } from '../services/noticeContent';
-import { openAuthorFixPanel } from './authorFixPanel';
 
 export const BTN_FIX = 'tt_fix';           // tt_fix:<caseId>
 export const BTN_APPEAL = 'tt_appeal';     // tt_appeal:<caseId>
@@ -174,7 +172,7 @@ export function buildNoticeButtons(guardCase: db.GuardCase): ActionRowBuilder<Bu
         );
     }
 
-    // AI 参与过才给这颗。理由只对管理组可见
+    // AI 参与过才给这颗。理由只通过仅本人可见回复交给作者或管理组
     if (guardCase.llmReason || guardCase.aiReviewUpheld !== null) {
         row.addComponents(
             new ButtonBuilder()
@@ -268,7 +266,7 @@ export async function refreshNotice(client: Client, caseId: number): Promise<voi
                 guardCase.plan as RewritePlan | null,
                 tagNamesOf(thread),
             )],
-            // 结案之后其余按钮撤掉，但「AI 判定依据」留着——管理组事后复盘要用
+            // 结案之后其余按钮撤掉，但「AI 判定依据」留着——作者和管理组仍可回看
             components: guardCase.closedAt
                 ? [aiDetailRow(guardCase)].filter(Boolean) as ActionRowBuilder<ButtonBuilder>[]
                 : [buildNoticeButtons(guardCase)],
@@ -345,16 +343,14 @@ function aiDetailRow(guardCase: db.GuardCase): ActionRowBuilder<ButtonBuilder> |
 }
 
 /**
- * 给管理组看 AI 到底说了什么。**仅本人可见**。
- *
- * 之所以要藏起来：这些理由里会复述社区规则、暴露模型的推理路数、
- * 有时还会带出提示词里的原话。公开摆着的话，想做提示词注入的人
- * 可以靠几十条通知反推出提示词长什么样，再针对性地写申诉去绕过它。
+ * 给帖子作者本人或管理组看 AI 到底说了什么。**仅点击者本人可见**，不进入公开通知。
  */
 async function handleAiDetail(interaction: ButtonInteraction, guardCase: db.GuardCase): Promise<void> {
-    if (!hasCapability(memberOf(interaction), guardCase.guildId, '接警')) {
+    const isAuthor = guardCase.authorId !== null && interaction.user.id === guardCase.authorId;
+    const canReceiveAlerts = hasCapability(memberOf(interaction), guardCase.guildId, '接警');
+    if (!isAuthor && !canReceiveAlerts) {
         await interaction.reply({
-            content: '❌ 这个按钮需要「接警」权限。判定依据只对管理组开放。',
+            content: '❌ 只有帖子作者本人和有「接警」权限的管理组可以查看 AI 判定依据。',
             flags: MessageFlags.Ephemeral,
         });
         return;
@@ -385,7 +381,7 @@ async function handleAiDetail(interaction: ButtonInteraction, guardCase: db.Guar
         embed.addFields({ name: '结论', value: '这条案子没有经过 AI 判定。' });
     }
 
-    embed.setFooter({ text: '这些内容不对作者公开，请勿转贴到帖子里。' });
+    embed.setFooter({ text: '这些内容仅对你本人可见，请勿转贴到帖子里。' });
     await interaction.reply({ embeds: [embed], flags: MessageFlags.Ephemeral });
 }
 
@@ -397,6 +393,11 @@ async function handleFix(interaction: ButtonInteraction, guardCase: db.GuardCase
         });
         return;
     }
+    // 打开自助面板前需要读取帖子并重算方案，先占住交互响应窗口。
+    await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+    // authorFixPanel 提交成功后要反过来调用本文件的 refreshNotice。
+    // 这里延迟加载，避免两个面板模块形成静态循环依赖。
+    const { openAuthorFixPanel } = await import('./authorFixPanel');
     await openAuthorFixPanel(interaction, guardCase);
 }
 
@@ -688,7 +689,7 @@ async function escalateToHuman(
     const mention = interaction.guild ? reviewerMentions(interaction.guild) : '';
 
     // 帖子里那条是公开的，**不带任何 AI 原话**——
-    // 管理组要看依据，点通知上的「AI 判定依据」按钮
+    // 作者或管理组要看依据，点通知上的「AI 判定依据」按钮
     const publicBody = [
         `🙋 <@${interaction.user.id}> 提请人工复核，自动整改已暂停。`,
         options.note,
@@ -747,12 +748,12 @@ async function handleReject(interaction: ButtonInteraction, guardCase: db.GuardC
         return;
     }
 
+    await interaction.deferReply({ flags: MessageFlags.Ephemeral });
     const deadline = resumeCountdown(guardCase.id);
     await refreshNotice(interaction.client, guardCase.id);
 
-    await interaction.reply({
+    await interaction.editReply({
         content: `✅ 已驳回申诉，倒计时恢复${deadline ? `，将于 <t:${Math.floor(deadline / 1000)}:R> 到期` : ''}。`,
-        flags: MessageFlags.Ephemeral,
     });
 
     if (interaction.channel && !interaction.channel.isDMBased()) {
@@ -771,6 +772,7 @@ async function handleOverride(interaction: ButtonInteraction, guardCase: db.Guar
         return;
     }
 
+    await interaction.deferReply({ flags: MessageFlags.Ephemeral });
     const thread = await fetchThread(interaction.client, guardCase.threadId);
     const currentTitle = thread?.name ?? guardCase.originalTitle;
 
@@ -778,9 +780,8 @@ async function handleOverride(interaction: ButtonInteraction, guardCase: db.Guar
     db.addExempt(guardCase.guildId, guardCase.threadId, currentTitle, interaction.user.id, '管理组人工覆盖');
     db.closeCase(guardCase.id, 'exempt');
 
-    await interaction.reply({
+    await interaction.editReply({
         content: '✅ 已放行。这个标题以后不会再被判定。\n（作者若再改标题，会重新走一次检查）',
-        flags: MessageFlags.Ephemeral,
     });
 
     await refreshNotice(interaction.client, guardCase.id);

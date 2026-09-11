@@ -41,6 +41,8 @@ let ticking = false;
 /** 启动时抓取一次旧通知，之后每轮少量原地编辑，避免瞬间打满 Discord API。 */
 let noticeRefreshQueue: number[] | null = null;
 const NOTICE_REFRESH_BATCH_SIZE = 20;
+/** 上线后自动修复近期已结案、但可能还停留在黄色整改状态的旧面板。 */
+const CLOSED_NOTICE_REPAIR_WINDOW_MS = 7 * 24 * 60 * 60_000;
 
 /** 上次处理老帖队列的时间（按服务器各自的速率节流） */
 const lastBackfill = new Map<string, number>();
@@ -322,7 +324,8 @@ async function processBackfill(client: Client): Promise<void> {
 
 async function refreshExistingNoticeBatch(client: Client): Promise<void> {
     if (noticeRefreshQueue === null) {
-        noticeRefreshQueue = db.listOpenNoticeCases().map(c => c.id);
+        const recentClosedSince = Date.now() - CLOSED_NOTICE_REPAIR_WINDOW_MS;
+        noticeRefreshQueue = db.listNoticeCasesForRefresh(recentClosedSince).map(c => c.id);
         if (noticeRefreshQueue.length > 0) {
             console.log(`[TitleGuard] 将自动刷新 ${noticeRefreshQueue.length} 条已有通知面板`);
         }
