@@ -41,6 +41,15 @@ import forumTitleExportCommand from '../modules/forumTitleExport/commands/forumT
 import titleGuardCommand from '../modules/titleGuard/commands/titleGuardCommand';
 import { startTitleGuardSystem } from '../modules/titleGuard';
 
+// 5. 分管身份组轮替模块
+import roleRotationCommand from '../modules/roleRotation/commands/roleRotationCommand';
+import callFrogCommand from '../modules/roleRotation/commands/callFrogCommand';
+import {
+    handleRoleRotationMemberRemove,
+    handleRoleRotationMemberUpdate,
+    startRoleRotationSystem,
+} from '../modules/roleRotation';
+
 // --- 进程级兜底日志（避免“无响应但控制台无日志”难以排查） ---
 const FATAL_EXIT_ON_EXCEPTION = String(process.env.FATAL_EXIT_ON_EXCEPTION || '').toLowerCase() === 'true';
 
@@ -120,6 +129,10 @@ client.commands.set(forumTitleExportCommand.data.name, forumTitleExportCommand);
 // 4. 标题与 TAG 规范模块命令注册
 client.commands.set(titleGuardCommand.data.name, titleGuardCommand);
 
+// 5. 分管身份组轮替模块命令注册
+client.commands.set(roleRotationCommand.data.name, roleRotationCommand);
+client.commands.set(callFrogCommand.data.name, callFrogCommand);
+
 // 测试命令仅在测试模式下注册（生产环境不会出现 /募选测试）
 if (isElectionTestMode()) {
     client.commands.set(electionTestCommand.data.name, electionTestCommand);
@@ -147,12 +160,15 @@ client.once(Events.ClientReady, async (readyClient) => {
     await startTemplateSystem(readyClient);
     await startElectionSystem(readyClient);
     await startTitleGuardSystem(readyClient);
+    await startRoleRotationSystem(readyClient);
 
     console.log('\n🤖 机器人已完全启动，所有系统正常运行！');
 });
 
 client.on(Events.InteractionCreate, interactionCreateHandler);
 client.on(Events.MessageCreate, messageCreateHandler);
+client.on(Events.GuildMemberUpdate, handleRoleRotationMemberUpdate);
+client.on(Events.GuildMemberRemove, handleRoleRotationMemberRemove);
 
 function normalizeDiscordToken(raw: string | undefined): string {
     if (!raw) return '';

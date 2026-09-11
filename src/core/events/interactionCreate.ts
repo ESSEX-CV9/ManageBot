@@ -20,6 +20,7 @@ import {
     handleTitleGuardSelect,
     handleTitleGuardModal,
 } from '../../modules/titleGuard';
+import { handleRoleRotationButton } from '../../modules/roleRotation';
 
 const INTERACTION_DEBUG_LOG = String(process.env.INTERACTION_DEBUG_LOG || '').toLowerCase() === 'true';
 
@@ -95,6 +96,8 @@ export async function interactionCreateHandler(interaction: Interaction): Promis
                 // 模块内部自己再分流（配置台 / 自助面板 / 通知面板），
                 // 核心不用知道它有几种面板
                 await handleTitleGuardButton(interaction);
+            } else if (interaction.customId.startsWith('rr_')) {
+                await handleRoleRotationButton(interaction);
             }
             // 新模块：在此追加 else if (customId.startsWith('yourprefix_')) { ... }
             return;

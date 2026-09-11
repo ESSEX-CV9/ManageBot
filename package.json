@@ -10,6 +10,7 @@
     "typecheck": "tsc --noEmit",
     "test": "echo \"Error: no test specified\" && exit 1",
     "test:guard": "tsx --test src/modules/titleGuard/services/engine.test.ts src/modules/titleGuard/services/rewriter.test.ts",
+    "test:rotation": "tsx --test src/modules/roleRotation/services/rotationTime.test.ts",
     "guard:ui": "tsx src/modules/titleGuard/tools/debugServer.ts"
   },
   "keywords": [],
