@@ -58,6 +58,10 @@ const BTN_HOME = `${P}:home`;
 const BTN_PERMS = `${P}:perms`;
 const BTN_FORUMS = `${P}:forums`;
 const BTN_TIMING = `${P}:timing`;
+const BTN_REAUDIT = `${P}:reaudit`;
+const BTN_REAUDIT_RULES = `${P}:reaudit:rules`;
+const BTN_REAUDIT_LLM = `${P}:reaudit:llm`;
+const BTN_REAUDIT_LLM_CONFIRM = `${P}:reaudit:llm-confirm`;
 const BTN_TOGGLE = `${P}:tog`;      // tt_cfg:tog:<key>
 const BTN_DICT = `${P}:dict`;
 // 期限和队列拆成两个弹窗：Discord 一个弹窗最多五个输入框，六项塞不下；
@@ -118,9 +122,10 @@ function homeView(guildId: string): { embeds: EmbedBuilder[]; components: Action
     const s = db.getSettings(guildId);
     const forums = db.listForums(guildId);
     const dict = db.listDict(db.dictSourceOf(guildId));
-    const open = db.listOpenCases(guildId, 100);
+    const openCount = db.countOpenCases(guildId);
     const fast = db.pendingCount(guildId, 'fast');
     const slow = db.pendingCount(guildId, 'slow');
+    const reaudit = db.caseReauditStats(guildId);
 
     const yn = (v: boolean) => (v ? '✅ 开' : '⭕ 关');
 
@@ -167,8 +172,10 @@ function homeView(guildId: string): { embeds: EmbedBuilder[]; components: Action
             {
                 name: '待办',
                 value: [
-                    `未结案件 ${open.length} 件`,
+                    `未结案件 ${openCount} 件`,
                     `排队中：活跃 ${fast} 个 / 老帖 ${slow} 个`,
+                    `重审核：规则 ${reaudit.rulesPending} / LLM ${reaudit.llmPending}`
+                        + (reaudit.running > 0 ? ` / 执行中 ${reaudit.running}` : ''),
                     fast + slow > 0 ? `预计跑完还要 ${queueEta(s, fast, slow)}` : '队列是空的',
                 ].join('\n'),
                 inline: true,
@@ -181,9 +188,99 @@ function homeView(guildId: string): { embeds: EmbedBuilder[]; components: Action
         new ButtonBuilder().setCustomId(BTN_FORUMS).setLabel('论坛').setStyle(ButtonStyle.Primary).setEmoji('📋'),
         new ButtonBuilder().setCustomId(BTN_TIMING).setLabel('时间与开关').setStyle(ButtonStyle.Primary).setEmoji('⏱️'),
         new ButtonBuilder().setCustomId(BTN_DICT).setLabel('词表').setStyle(ButtonStyle.Primary).setEmoji('📖'),
+        new ButtonBuilder().setCustomId(BTN_REAUDIT).setLabel('重审核').setStyle(ButtonStyle.Secondary).setEmoji('🔄'),
     );
 
     return { embeds: [embed], components: [row] };
+}
+
+// ============================================================
+// 未结案件后台重审核
+// ============================================================
+
+function reauditView(guildId: string) {
+    const open = db.countOpenCases(guildId);
+    const stats = db.caseReauditStats(guildId);
+    const llmEnabled = db.getSettings(guildId).llmEnabled;
+
+    const embed = new EmbedBuilder()
+        .setTitle('🔄 未结案件后台重审核')
+        .setColor(0x5865f2)
+        .setDescription(
+            '按帖子**当前标题和当前 TAG**重新生成整改方案，并原地刷新已有通知。\n'
+            + '不会发送新的公开消息，也不会占用作者自己的 AI 复核机会。',
+        )
+        .addFields(
+            {
+                name: '当前状态',
+                value: [
+                    `未结案件：**${open}**`,
+                    `规则排队：**${stats.rulesPending}**　LLM 排队：**${stats.llmPending}**`,
+                    `正在处理：**${stats.running}**　失败：**${stats.failed}**`,
+                ].join('\n'),
+            },
+            {
+                name: '仅规则重审核',
+                value: '使用最新版词表和规则快速重算。遇到必须语义判断的案件会保留旧方案，不会用半成品覆盖。\n'
+                    + 'Bot 每次启动都会自动排入一次这种审核。',
+            },
+            {
+                name: '强制 LLM 重审核',
+                value: '对全部仍有规则命中的未结案件重新调用模型，包含原本可由规则直接处理的案件；不会复用旧的 LLM 缓存。\n'
+                    + '这是批量模型调用，确认后才会入队。',
+            },
+        )
+        .setFooter({ text: '案件若已合规会静默结案；失败时保留旧方案，最多自动重试三次。' });
+
+    return {
+        embeds: [embed],
+        components: [
+            new ActionRowBuilder<ButtonBuilder>().addComponents(
+                new ButtonBuilder()
+                    .setCustomId(BTN_REAUDIT_RULES)
+                    .setLabel('仅规则重审核')
+                    .setStyle(ButtonStyle.Primary)
+                    .setEmoji('📐')
+                    .setDisabled(open === 0),
+                new ButtonBuilder()
+                    .setCustomId(BTN_REAUDIT_LLM)
+                    .setLabel('强制 LLM 重审核')
+                    .setStyle(ButtonStyle.Secondary)
+                    .setEmoji('🤖')
+                    .setDisabled(open === 0 || !llmEnabled),
+                new ButtonBuilder().setCustomId(BTN_HOME)
+                    .setLabel('返回').setStyle(ButtonStyle.Secondary).setEmoji('◀️'),
+            ),
+        ],
+    };
+}
+
+function confirmLlmReauditView(guildId: string) {
+    const open = db.countOpenCases(guildId);
+    const embed = new EmbedBuilder()
+        .setTitle('⚠️ 确认批量调用 LLM')
+        .setColor(0xf0a30a)
+        .setDescription(
+            `即将把当前 **${open}** 个未结案件排入强制 LLM 重审核。\n\n`
+            + '仍有规则命中的案件会重新调用模型且绕过旧缓存；队列在后台限速运行。'
+            + '这不会占用作者的复核次数，也不会发送新通知。',
+        );
+    return {
+        embeds: [embed],
+        components: [
+            new ActionRowBuilder<ButtonBuilder>().addComponents(
+                new ButtonBuilder()
+                    .setCustomId(BTN_REAUDIT_LLM_CONFIRM)
+                    .setLabel(`确认重审 ${open} 件`)
+                    .setStyle(ButtonStyle.Danger)
+                    .setDisabled(open === 0),
+                new ButtonBuilder()
+                    .setCustomId(BTN_REAUDIT)
+                    .setLabel('取消')
+                    .setStyle(ButtonStyle.Secondary),
+            ),
+        ],
+    };
 }
 
 // ============================================================
@@ -547,6 +644,44 @@ export async function handleConfigButton(interaction: ButtonInteraction): Promis
     }
     if (interaction.customId === BTN_DICT) {
         await interaction.update(dictView(guildId));
+        return true;
+    }
+    if (interaction.customId === BTN_REAUDIT) {
+        await interaction.update(reauditView(guildId));
+        return true;
+    }
+
+    if (interaction.customId === BTN_REAUDIT_LLM) {
+        if (!hasCapability(memberOf(interaction), guildId, '设置')) {
+            await denied(interaction, '批量重审核需要「设置」权限。');
+            return true;
+        }
+        await interaction.update(confirmLlmReauditView(guildId));
+        return true;
+    }
+
+    if (interaction.customId === BTN_REAUDIT_RULES
+        || interaction.customId === BTN_REAUDIT_LLM_CONFIRM) {
+        if (!hasCapability(memberOf(interaction), guildId, '设置')) {
+            await denied(interaction, '批量重审核需要「设置」权限。');
+            return true;
+        }
+
+        const mode: db.CaseReauditMode = interaction.customId === BTN_REAUDIT_RULES
+            ? 'rules' : 'llm';
+        if (mode === 'llm' && !db.getSettings(guildId).llmEnabled) {
+            await denied(interaction, '语义判定目前是关闭的，请先在「时间与开关」中启用。');
+            return true;
+        }
+
+        const queued = db.enqueueOpenCaseReaudits(guildId, mode, `admin:${interaction.user.id}`);
+        await interaction.update(reauditView(guildId));
+        await interaction.followUp({
+            content: queued > 0
+                ? `✅ 已将 **${queued}** 个未结案件排入${mode === 'llm' ? '强制 LLM' : '纯规则'}重审核。`
+                : '✅ 当前没有未结案件。',
+            flags: MessageFlags.Ephemeral,
+        });
         return true;
     }
 

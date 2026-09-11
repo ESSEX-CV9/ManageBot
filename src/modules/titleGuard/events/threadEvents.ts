@@ -14,6 +14,7 @@ import * as db from '../services/titleGuardDatabase';
 import { effectiveViolations, inspectThread, isForumThread, openCaseFor } from '../services/enforcer';
 import { refreshNotice } from '../components/noticePanel';
 import { buildResolvedMessage } from '../services/noticeContent';
+import { summarizeJudgement } from '../services/llmJudge';
 
 /** 新帖发布后等一会儿再查，给作者补 TAG 的时间 */
 const NEW_THREAD_DELAY_MS = 60_000;
@@ -60,9 +61,17 @@ async function checkThread(thread: ThreadChannel): Promise<void> {
         return;
     }
 
-    // 已有未结案件：更新违规内容和方案，但**保留原来的截止时间**
+    // 已有未结案件：按帖子当前状态更新违规内容和方案，但**保留原来的截止时间**。
+    // 原通知也必须原地重画；只改数据库会让作者在面板上一直看到旧的错误方案。
     if (openCase) {
-        db.updateCase(openCase.id, { violations, plan: inspection.plan });
+        db.updateCase(openCase.id, {
+            originalTitle: thread.name,
+            originalTagIds: [...thread.appliedTags],
+            violations,
+            plan: inspection.plan,
+            llmReason: summarizeJudgement(inspection.judgement),
+        });
+        await refreshNotice(thread.client, openCase.id);
         return;
     }
 

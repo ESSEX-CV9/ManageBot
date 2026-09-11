@@ -165,10 +165,18 @@ export interface InspectResult {
 
 /**
  * 检测一个帖子。dryRun=true 时不调用 LLM（批量静默扫描用，省钱也快）。
+ * forceModel=true 用于管理组主动发起的后台 LLM 重审核：即使规则本可直判，
+ * 也让模型重新形成整份方案；它与作者的申诉复核是两条完全独立的链路。
  */
 export async function inspectThread(
     thread: ThreadChannel,
-    options: { dryRun?: boolean; authorChoice?: GroupId | null } = {},
+    options: {
+        dryRun?: boolean;
+        authorChoice?: GroupId | null;
+        forceModel?: boolean;
+        /** 后台主动重审需要真问一次，不能复用建案时的旧缓存结论 */
+        bypassLlmCache?: boolean;
+    } = {},
 ): Promise<InspectResult> {
     const guildId = thread.guild.id;
     const forum = thread.parent as ForumChannel | null;
@@ -210,7 +218,7 @@ export async function inspectThread(
     let llmFallback = false;
 
     const settings = db.getSettings(guildId);
-    const llmForced = forumConfig.forceLlmReview;
+    const llmForced = Boolean(options.forceModel || forumConfig.forceLlmReview);
 
     // 程序那一段先跑出来：它决定了「还剩哪几处要问模型」，
     // 也决定了「整改后 TAG 长什么样」。两件事都得在提问之前算好。
@@ -252,7 +260,11 @@ export async function inspectThread(
                 rules: buildJudgeRules(compiled.raw),
                 retryFeedback,
             },
-            { bodyExcerpt, enabled: settings.llmEnabled, cache: llmCache },
+            {
+                bodyExcerpt,
+                enabled: settings.llmEnabled,
+                cache: options.bypassLlmCache ? undefined : llmCache,
+            },
         );
 
         if (outcome.ok) return outcome.judgement;

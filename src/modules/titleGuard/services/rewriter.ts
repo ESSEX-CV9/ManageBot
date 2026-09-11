@@ -183,6 +183,10 @@ export function planProgramStage(input: {
 
     const edits: SpanEdit[] = [];
     const handled = new Set<Match>();
+    // handled 里既有「替换」也有「删除」。处理后续 X 规则时必须分开：
+    // 被 W 删除的旧声明已经不存在，不能再拿它反过来改 TAG；
+    // B 规则替换后的声明仍然存在，相关 TAG 冲突仍需处理。
+    const removedMatches = new Set<Match>();
     const removeTagIds = new Set<string>();
     const addTagIds = new Set<string>();
     const notes: string[] = [];
@@ -191,7 +195,12 @@ export function planProgramStage(input: {
     let keepSource: KeepSource = 'none';
 
     const setKeep = (g: GroupId, source: KeepSource) => {
-        if (!keepGroup) { keepGroup = g; keepSource = source; }
+        // 标题里仍然有效的作者声明高于 TAG/默认优先级。
+        // 但已经被前一步删除的声明不会走到这里，不能推翻 W 的幸存者。
+        if (!keepGroup || (source === 'author' && keepSource !== 'author')) {
+            keepGroup = g;
+            keepSource = source;
+        }
     };
 
     /**
@@ -209,6 +218,7 @@ export function planProgramStage(input: {
         const span = enclosingToken(detectResult, m) ?? { start: m.start, end: m.end };
         edits.push({ start: span.start, end: span.end, replacement: '' });
         handled.add(m);
+        removedMatches.add(m);
     };
 
     const program = detectResult.violations.filter(v => v.arbiter === '程序');
@@ -300,7 +310,15 @@ export function planProgramStage(input: {
         if (v.rule !== 'X') continue;
         const [wordGroup, tagGroup] = v.groups;
 
-        for (const id of v.tagIds) removeTagIds.add(id);
+        // W 规则可能已经删除了造成这条 X 冲突的标题声明。
+        // 旧实现仍拿整改前的那处声明继续算，便会出现：上面写「保留 NTR」，
+        // 下面却因为已删除的「纯爱」反向摘掉 NTR TAG、补上纯爱 TAG。
+        const survivingDeclaration = v.hits.some(m =>
+            declared(m) && classifyingGroup(m) === wordGroup && !removedMatches.has(m));
+        const activeTagIds = v.tagIds.filter(id => !removeTagIds.has(id));
+        if (!survivingDeclaration || activeTagIds.length === 0) continue;
+
+        for (const id of activeTagIds) removeTagIds.add(id);
         setKeep(wordGroup, 'author');
 
         const replacement = tagOfGroup(forumTags, wordGroup);
@@ -310,6 +328,14 @@ export function planProgramStage(input: {
         } else {
             notes.push(`标签区声明的是「${wordGroup}」，摘掉冲突的「${tagGroup}」TAG`
                 + (replacement ? '' : `（本论坛没有「${wordGroup}」TAG，只摘不补）`));
+        }
+    }
+
+    // keepGroup 是整份整改方案的唯一主分类。任何后续规则都不能把这一组
+    // 已经存在的 TAG 摘掉，否则通知里的「保留分类」和 TAG 操作会互相打架。
+    if (keepGroup) {
+        for (const t of tags) {
+            if (t.group === keepGroup) removeTagIds.delete(t.tagId);
         }
     }
 
@@ -417,13 +443,14 @@ export function pendingHits(detectResult: DetectResult, stage: ProgramStage): Ma
 function validateModelPlan(input: {
     finalTitle: string;
     finalTags: AppliedTag[];
+    forumTags: ForumTag[];
     keptWords: Set<string>;
     /** 模型给这篇定的性。它自己那一类的本体词可以留在标题里 */
     verdict: GroupId;
     compiled: CompiledConfig;
     problems: string[];
 }): { ok: true } | { ok: false; reason: string; remaining: string[] } {
-    const { finalTitle, finalTags, keptWords, verdict, compiled, problems } = input;
+    const { finalTitle, finalTags, forumTags, keptWords, verdict, compiled, problems } = input;
 
     if (problems.length > 0) {
         return { ok: false, reason: '处理指令本身有问题', remaining: problems };
@@ -436,6 +463,15 @@ function validateModelPlan(input: {
             ok: false,
             reason: `改出来的标题超长（${finalTitle.length} > 100）`,
             remaining: [`Discord 帖子标题最多 100 个字符，现在是 ${finalTitle.length} 个`],
+        };
+    }
+
+    const verdictTag = tagOfGroup(forumTags, verdict);
+    if (verdictTag && !finalTags.some(t => t.group === verdict)) {
+        return {
+            ok: false,
+            reason: '主分类与最终 TAG 不一致',
+            remaining: [`你把作品定性为「${verdict}」，但最终 TAG 没有保留「${verdictTag.tagName}」`],
         };
     }
 
@@ -545,7 +581,12 @@ export function buildPlan(input: BuildPlanInput): RewritePlan {
     // ---------- 只有第一段 ----------
     if (!needsModel) {
         const newTitle = tidyTitle(applySpanEdits(detectResult, stage.edits));
-        const blocked = stage.blocked.length > 0 ? stage.blocked.join('；') : null;
+        const finalTags = applyTagChanges(tags, stage.removeTagIds, stage.addTagIds, forumTags);
+        const recheck = detect({ title: newTitle, tags: finalTags, config: compiled.raw }, compiled);
+        const safetyBlock = recheck.violations.length > 0
+            ? `整改方案二次校验未通过：${recheck.violations.map(v => v.message).join('；')}`
+            : null;
+        const blocked = [...stage.blocked, ...(safetyBlock ? [safetyBlock] : [])].join('；') || null;
         return {
             ...base,
             newTitle,
@@ -593,6 +634,7 @@ export function buildPlan(input: BuildPlanInput): RewritePlan {
     const check = validateModelPlan({
         finalTitle,
         finalTags: wanted,
+        forumTags,
         keptWords: new Set(applied.kept.map(m => m.entry.word)),
         verdict: judgement.verdict,
         compiled,

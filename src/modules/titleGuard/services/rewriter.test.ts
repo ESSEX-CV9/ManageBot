@@ -127,6 +127,17 @@ test('程序段：【纯爱 NTR】+ NTR TAG → 【NTR】', () => {
     // NTR(40) > 纯爱(10)，是保留顺序判出来的，不是「因为 TAG 挂的是 NTR」
     assert.equal(p.keepSource, 'priority');
     assert.equal(p.newTitle, '【NTR】某某的故事');
+    assert.deepEqual(p.removeTagIds, [], '保留 NTR 时不能反过来摘掉 NTR TAG');
+    assert.deepEqual(p.addTagIds, [], '已删除的纯爱声明不能再触发补纯爱 TAG');
+});
+
+test('程序段：标题内冲突处理后，TAG 方案必须服从幸存分类', () => {
+    const p = plan('【纯爱、NTR】终旅·歧路', [tag('NTR', 'NTR')]);
+    assert.equal(p.autoFixable, true);
+    assert.equal(p.keepGroup, 'NTR');
+    assert.equal(p.newTitle, '【NTR】终旅·歧路');
+    assert.deepEqual(p.removeTagIds, []);
+    assert.deepEqual(p.addTagIds, []);
 });
 
 test('程序段：TAG 挂错了也不影响，保留顺序说了算', () => {
@@ -168,6 +179,15 @@ test('程序段：标签区声明 × TAG 冲突 → 标题赢，改 TAG', () => 
     assert.deepEqual(p.removeTagIds, ['tag_NTR']);
     assert.deepEqual(p.addTagIds, ['tag_纯爱']);
     assert.equal(p.keepSource, 'author');
+});
+
+test('程序段：TAG 自身冲突与标题声明同时出现时，最终方案仍只有一个主分类', () => {
+    const p = plan('【纯爱】某某的故事', [tag('纯爱', '纯爱'), tag('NTR', 'NTR')]);
+    assert.equal(p.autoFixable, true);
+    assert.equal(p.keepGroup, '纯爱');
+    assert.equal(p.keepSource, 'author');
+    assert.deepEqual(p.removeTagIds, ['tag_NTR']);
+    assert.deepEqual(p.addTagIds, ['tag_多路线']);
 });
 
 test('程序段：百破关键字 × 百合 TAG → 摘掉百合 TAG，标题不动', () => {
@@ -265,6 +285,31 @@ test('强制模型复核：只有 TAG 冲突、标题零命中时也必须经过
     assert.equal(reviewed.newTitle, '某某的故事');
     assert.deepEqual(reviewed.removeTagIds, ['tag_纯爱']);
     assert.deepEqual(reviewed.addTagIds, ['tag_多路线']);
+});
+
+test('模型方案：主分类是 NTR 时不能交回纯爱 TAG', () => {
+    const tags = [tag('NTR', 'NTR')];
+    const detectResult = detect({
+        title: '【纯爱 NTR】某某的故事', tags, config: CONFIG,
+    }, compiled);
+    const hits = judgeHitsOf(detectResult);
+    const judgement: Judgement = {
+        verdict: 'NTR',
+        verdictReason: '（测试用）',
+        finalTagGroups: ['纯爱'],
+        decisions: hits.map((_, i) => ({
+            hit: i + 1,
+            action: '删除',
+            why: '（测试用）',
+        })),
+        confidence: 'high',
+    };
+
+    const reviewed = buildPlan({
+        detectResult, tags, forumTags: FORUM_TAGS, compiled, judgement, modelHandlesAll: true,
+    });
+    assert.ok(reviewed.modelRejection);
+    assert.match(reviewed.modelRejection.reason, /主分类与最终 TAG 不一致/);
 });
 
 // ============================================================

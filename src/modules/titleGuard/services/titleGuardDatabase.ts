@@ -171,6 +171,22 @@ db.exec(`
     CREATE INDEX IF NOT EXISTS tt_cases_due
         ON tt_cases (state, deadline) WHERE closed_at IS NULL;
 
+    -- 未结案件后台重审核队列。与作者的申诉复核完全分开，绝不占 ai_review_used。
+    -- 单独落库是为了批量 LLM 重审跑到一半重启后仍能接着跑。
+    CREATE TABLE IF NOT EXISTS tt_case_reaudit (
+        case_id      INTEGER PRIMARY KEY,
+        guild_id     TEXT NOT NULL,
+        mode         TEXT NOT NULL,
+        state        TEXT NOT NULL DEFAULT 'pending',
+        requested_by TEXT NOT NULL,
+        attempts     INTEGER NOT NULL DEFAULT 0,
+        last_error   TEXT,
+        enqueued_at  INTEGER NOT NULL,
+        processed_at INTEGER
+    );
+    CREATE INDEX IF NOT EXISTS tt_case_reaudit_pending
+        ON tt_case_reaudit (state, mode, enqueued_at);
+
     -- 操作流水（可还原）
     CREATE TABLE IF NOT EXISTS tt_actions (
         id             INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1134,6 +1150,9 @@ const listCasesStmt = db.prepare(`
     SELECT * FROM tt_cases WHERE guild_id = ? AND closed_at IS NULL
     ORDER BY created_at DESC LIMIT ?
 `);
+const countOpenCasesStmt = db.prepare(`
+    SELECT COUNT(*) AS count FROM tt_cases WHERE guild_id = ? AND closed_at IS NULL
+`);
 const listDueCasesStmt = db.prepare(`
     SELECT * FROM tt_cases
     WHERE state = 'notified' AND closed_at IS NULL AND deadline IS NOT NULL AND deadline <= ?
@@ -1203,6 +1222,10 @@ export function listOpenCases(guildId: string, limit = 50): GuardCase[] {
     return (listCasesStmt.all(guildId, limit) as CaseRow[]).map(toCase);
 }
 
+export function countOpenCases(guildId: string): number {
+    return (countOpenCasesStmt.get(guildId) as { count: number }).count;
+}
+
 export function listDueCases(now: number, limit = 20): GuardCase[] {
     return (listDueCasesStmt.all(now, limit) as CaseRow[]).map(toCase);
 }
@@ -1214,6 +1237,168 @@ export function listUnnotifiedCases(limit = 20): GuardCase[] {
 /** 已经发过通知、且仍未结案的案件。用于新版上线后原地刷新旧面板文案。 */
 export function listOpenNoticeCases(): GuardCase[] {
     return (listOpenNoticeCasesStmt.all() as CaseRow[]).map(toCase);
+}
+
+// ============================================================
+// 未结案件后台重审核队列
+// ============================================================
+
+export type CaseReauditMode = 'rules' | 'llm';
+
+export interface CaseReauditItem {
+    caseId: number;
+    guildId: string;
+    mode: CaseReauditMode;
+    attempts: number;
+}
+
+const openCasesForReauditStmt = db.prepare(`
+    SELECT id, guild_id FROM tt_cases
+    WHERE closed_at IS NULL AND (? IS NULL OR guild_id = ?)
+    ORDER BY id
+`);
+const enqueueCaseReauditStmt = db.prepare(`
+    INSERT INTO tt_case_reaudit (
+        case_id, guild_id, mode, state, requested_by,
+        attempts, last_error, enqueued_at, processed_at
+    ) VALUES (?, ?, ?, 'pending', ?, 0, NULL, ?, NULL)
+    ON CONFLICT(case_id) DO UPDATE SET
+        guild_id = excluded.guild_id,
+        mode = CASE
+            WHEN tt_case_reaudit.state IN ('pending', 'running')
+                AND tt_case_reaudit.mode = 'llm'
+                THEN 'llm'
+            ELSE excluded.mode
+        END,
+        state = 'pending',
+        requested_by = CASE
+            WHEN tt_case_reaudit.state IN ('pending', 'running')
+                AND tt_case_reaudit.mode = 'llm'
+                THEN tt_case_reaudit.requested_by
+            ELSE excluded.requested_by
+        END,
+        attempts = CASE
+            WHEN tt_case_reaudit.state IN ('pending', 'running')
+                THEN tt_case_reaudit.attempts
+            ELSE 0
+        END,
+        last_error = NULL,
+        enqueued_at = excluded.enqueued_at,
+        processed_at = NULL
+`);
+const discardClosedReauditStmt = db.prepare(`
+    DELETE FROM tt_case_reaudit
+    WHERE NOT EXISTS (
+        SELECT 1 FROM tt_cases c
+        WHERE c.id = tt_case_reaudit.case_id AND c.closed_at IS NULL
+    )
+`);
+const nextCaseReauditStmt = db.prepare(`
+    SELECT q.case_id, q.guild_id, q.mode, q.attempts
+    FROM tt_case_reaudit q
+    JOIN tt_cases c ON c.id = q.case_id AND c.closed_at IS NULL
+    WHERE q.state = 'pending'
+    ORDER BY CASE q.mode WHEN 'llm' THEN 0 ELSE 1 END, q.enqueued_at, q.case_id
+    LIMIT 1
+`);
+const claimCaseReauditStmt = db.prepare(`
+    UPDATE tt_case_reaudit
+    SET state = 'running', attempts = attempts + 1, last_error = NULL
+    WHERE case_id = ? AND state = 'pending'
+`);
+const finishCaseReauditStmt = db.prepare(`
+    UPDATE tt_case_reaudit
+    SET state = 'done', processed_at = ?, last_error = NULL
+    WHERE case_id = ? AND state = 'running'
+`);
+const failCaseReauditStmt = db.prepare(`
+    UPDATE tt_case_reaudit
+    SET state = CASE WHEN attempts < 3 THEN 'pending' ELSE 'failed' END,
+        last_error = ?, processed_at = ?
+    WHERE case_id = ? AND state = 'running'
+`);
+const recoverCaseReauditStmt = db.prepare(`
+    UPDATE tt_case_reaudit SET state = 'pending'
+    WHERE state = 'running'
+`);
+const caseReauditStatsStmt = db.prepare(`
+    SELECT mode, state, COUNT(*) AS count
+    FROM tt_case_reaudit
+    WHERE guild_id = ?
+    GROUP BY mode, state
+`);
+
+/**
+ * 把当前所有未结案件排入后台重审核。相同案件只保留一项；LLM 任务不会被规则任务降级。
+ */
+export const enqueueOpenCaseReaudits = db.transaction((
+    guildId: string | null,
+    mode: CaseReauditMode,
+    requestedBy: string,
+): number => {
+    discardClosedReauditStmt.run();
+    const rows = openCasesForReauditStmt.all(guildId, guildId) as { id: number; guild_id: string }[];
+    const now = Date.now();
+    for (const row of rows) {
+        enqueueCaseReauditStmt.run(row.id, row.guild_id, mode, requestedBy, now);
+    }
+    return rows.length;
+});
+
+/** 重启时把来不及收尾的任务放回队列。 */
+export function recoverCaseReaudits(): void {
+    discardClosedReauditStmt.run();
+    recoverCaseReauditStmt.run();
+}
+
+/** 原子领取一个任务；手动 LLM 重审核优先于启动时的规则重审核。 */
+export const claimNextCaseReaudit = db.transaction((): CaseReauditItem | null => {
+    discardClosedReauditStmt.run();
+    const row = nextCaseReauditStmt.get() as {
+        case_id: number;
+        guild_id: string;
+        mode: string;
+        attempts: number;
+    } | undefined;
+    if (!row || claimCaseReauditStmt.run(row.case_id).changes === 0) return null;
+    return {
+        caseId: row.case_id,
+        guildId: row.guild_id,
+        mode: row.mode === 'llm' ? 'llm' : 'rules',
+        attempts: row.attempts + 1,
+    };
+});
+
+export function finishCaseReaudit(caseId: number): void {
+    finishCaseReauditStmt.run(Date.now(), caseId);
+}
+
+/** 失败任务最多自动重试三次；再次手动入队会重新获得三次机会。 */
+export function failCaseReaudit(caseId: number, error: string): void {
+    failCaseReauditStmt.run(error.slice(0, 500), Date.now(), caseId);
+}
+
+export function caseReauditStats(guildId: string): {
+    rulesPending: number;
+    llmPending: number;
+    running: number;
+    failed: number;
+} {
+    discardClosedReauditStmt.run();
+    const rows = caseReauditStatsStmt.all(guildId) as {
+        mode: string;
+        state: string;
+        count: number;
+    }[];
+    const count = (mode: string | null, state: string) => rows
+        .filter(r => (mode === null || r.mode === mode) && r.state === state)
+        .reduce((sum, r) => sum + r.count, 0);
+    return {
+        rulesPending: count('rules', 'pending'),
+        llmPending: count('llm', 'pending'),
+        running: count(null, 'running'),
+        failed: count(null, 'failed'),
+    };
 }
 
 const updateCaseStmt = db.prepare(`

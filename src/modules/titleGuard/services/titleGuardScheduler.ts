@@ -1,9 +1,10 @@
 // src/modules/titleGuard/services/titleGuardScheduler.ts
 //
-// 后台调度器。三件事：
+// 后台调度器。四件事：
 //   1. 把刚检出、还没通知的案件发出通知
 //   2. 到期复查：作者改好了就结案；没改好且能自动整改的就动手；定不了的转人工
 //   3. 驱动整改队列
+//   4. 限速重审核未结案件并原地修正旧通知
 //
 // 整改一定会在帖子里发通知，而**发消息一定会顶帖**。存量上千个帖子时
 // 一口气跑完等于把论坛首页全刷成机器人翻出来的帖子，所以队列必须限速。
@@ -29,6 +30,7 @@ import { summarizeJudgement } from './llmJudge';
 import { refreshNotice, sendNotice } from '../components/noticePanel';
 import { buildDoneMessage, buildResolvedMessage } from './noticeContent';
 import { runBackfillTick } from './backfillQueue';
+import { runCaseReauditTick } from './caseReaudit';
 
 /** 主循环间隔。到期复查本身不密集，1 分钟一次足够 */
 const TICK_MS = 60_000;
@@ -341,6 +343,7 @@ async function tick(client: Client): Promise<void> {
         await processUnnotified(client);
         await processDue(client);
         await processBackfill(client);
+        await runCaseReauditTick(client);
         await refreshExistingNoticeBatch(client);
     } catch (err) {
         console.error('[TitleGuard] 调度器出错：', err);
@@ -352,6 +355,11 @@ async function tick(client: Client): Promise<void> {
 export function startTitleGuardScheduler(client: Client): void {
     if (timer) return;
     noticeRefreshQueue = null;
+    db.recoverCaseReaudits();
+    const queued = db.enqueueOpenCaseReaudits(null, 'rules', 'startup');
+    if (queued > 0) {
+        console.log(`[TitleGuard] 已排入 ${queued} 个未结案件进行启动规则重审核`);
+    }
     timer = setInterval(() => { void tick(client); }, TICK_MS);
     // 启动后先等一会儿再跑第一轮，让 guild 缓存先填好
     setTimeout(() => { void tick(client); }, 30_000);
