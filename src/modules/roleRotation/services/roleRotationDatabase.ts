@@ -176,6 +176,12 @@ db.exec(`
         PRIMARY KEY (guild_id, user_id)
     );
 
+    CREATE TABLE IF NOT EXISTS rr_frog_caller_role (
+        guild_id   TEXT NOT NULL,
+        role_id    TEXT NOT NULL,
+        PRIMARY KEY (guild_id, role_id)
+    );
+
     CREATE TABLE IF NOT EXISTS rr_round (
         id                      INTEGER PRIMARY KEY AUTOINCREMENT,
         config_id               INTEGER NOT NULL REFERENCES rr_config(id) ON DELETE CASCADE,
@@ -437,6 +443,21 @@ export function setFrogCooldown(guildId: string, cooldownSeconds: number, update
     `).run(guildId, Math.max(1, Math.round(cooldownSeconds)), updatedBy, Date.now());
 }
 
+export function addFrogCallerRole(guildId: string, roleId: string): boolean {
+    return db.prepare('INSERT OR IGNORE INTO rr_frog_caller_role (guild_id, role_id) VALUES (?, ?)')
+        .run(guildId, roleId).changes > 0;
+}
+
+export function removeFrogCallerRole(guildId: string, roleId: string): boolean {
+    return db.prepare('DELETE FROM rr_frog_caller_role WHERE guild_id = ? AND role_id = ?')
+        .run(guildId, roleId).changes > 0;
+}
+
+export function listFrogCallerRoleIds(guildId: string): string[] {
+    return (db.prepare('SELECT role_id FROM rr_frog_caller_role WHERE guild_id = ? ORDER BY role_id')
+        .all(guildId) as { role_id: string }[]).map(row => row.role_id);
+}
+
 /** 原子占用一次呼叫机会，防止同一用户并发点击绕过冷却。 */
 export function claimFrogCall(
     guildId: string,
@@ -492,6 +513,34 @@ export function createRound(input: {
         return roundId;
     });
     return getRound(run())!;
+}
+
+/** 跳过问询，按实时空位直接创建一个公开招募场次。 */
+export function createRecruitmentRound(input: {
+    config: RoleRotationConfig;
+    cycleKey: string;
+    openedAt: number;
+    vacancies: number;
+    createdBy: string;
+}): RotationRound {
+    const result = db.prepare(`
+        INSERT INTO rr_round (
+            config_id, guild_id, role_id, cycle_key, status,
+            opened_at, inquiry_deadline, recruitment_opened_at,
+            vacancies_at_open, created_by
+        ) VALUES (?, ?, ?, ?, 'recruiting', ?, ?, ?, ?, ?)
+    `).run(
+        input.config.id,
+        input.config.guildId,
+        input.config.managedRoleId,
+        input.cycleKey,
+        input.openedAt,
+        input.openedAt,
+        input.openedAt,
+        input.vacancies,
+        input.createdBy,
+    );
+    return getRound(Number(result.lastInsertRowid))!;
 }
 
 export function getRound(id: number): RotationRound | null {

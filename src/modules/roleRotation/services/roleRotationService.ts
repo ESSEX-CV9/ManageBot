@@ -10,6 +10,7 @@ import {
 } from 'discord.js';
 import {
     addAudit,
+    createRecruitmentRound,
     createRound,
     getActiveRound,
     getConfigById,
@@ -442,6 +443,72 @@ export async function settleInquiry(client: Client, roundInput: RotationRound): 
             ok: true,
             message: `问询已结算：保留 ${kept}，卸任 ${removed}，失败 ${removalFailed}；开放 ${vacancies} 个名额。${publish}`,
             round: recruitingRound,
+        };
+    });
+}
+
+/** 不经过留任问询，直接按当前实时人数发布空位招募。 */
+export async function startRecruitmentNow(
+    client: Client,
+    configInput: RoleRotationConfig,
+    createdBy: string,
+): Promise<ServiceResult> {
+    return withConfigLock(configInput.id, async () => {
+        const config = getConfigById(configInput.id);
+        if (!config) return { ok: false, message: '配置已不存在。' };
+        if (!config.recruitmentChannelIds.length) {
+            return { ok: false, message: '尚未配置招募频道，无法发布空位招募。' };
+        }
+        const active = getActiveRound(config.id);
+        if (active) {
+            return {
+                ok: false,
+                message: active.status === 'inquiry'
+                    ? `问询场次 #${active.id} 正在进行，请先结算问询。`
+                    : `招募场次 #${active.id} 已经在进行。`,
+                round: active,
+            };
+        }
+
+        const context = await fetchGuildAndRole(client, config);
+        if ('error' in context) return { ok: false, message: context.error };
+        if (!canManageRole(context.guild, context.role)) {
+            return { ok: false, message: '机器人缺少“管理身份组”权限，或机器人身份组位置不高于目标身份组。' };
+        }
+        await context.guild.members.fetch().catch(error => {
+            console.warn(`[RoleRotation] 立即招募前拉取服务器成员失败，将使用缓存：`, error);
+        });
+        syncRoleMembers(config, context.role);
+        const currentMembers = countNonBotMembers(context.role);
+        const vacancies = Math.max(0, config.capacity - currentMembers);
+        if (vacancies === 0) {
+            return { ok: false, message: `当前非 Bot 成员为 ${currentMembers}/${config.capacity}，没有可招募空位。` };
+        }
+
+        const now = Date.now();
+        const round = createRecruitmentRound({
+            config,
+            cycleKey: `manual-recruit-${now}`,
+            openedAt: now,
+            vacancies,
+            createdBy,
+        });
+        const publish = await ensureRecruitmentMessagesInternal(client, config, round, context.role);
+        const publishedCount = listMessages(round.id, 'recruitment').length;
+        addAudit({
+            guildId: config.guildId,
+            configId: config.id,
+            roundId: round.id,
+            actorId: createdBy,
+            event: 'recruitment_started_manual',
+            detail: `current=${currentMembers}; capacity=${config.capacity}; vacancies=${vacancies}`,
+        });
+        return {
+            ok: publishedCount > 0,
+            message: publishedCount > 0
+                ? `已跳过问询并开放 ${vacancies} 个实时空位。${publish}`
+                : `已创建 ${vacancies} 个空位的招募场次，但所有招募频道均发布失败；后台会定时重试。${publish}`,
+            round: getRound(round.id)!,
         };
     });
 }

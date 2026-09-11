@@ -9,6 +9,7 @@ import {
     addAudit,
     claimFrogCall,
     getFrogSettings,
+    listFrogCallerRoleIds,
     releaseFrogCall,
 } from '../services/roleRotationDatabase';
 
@@ -33,8 +34,14 @@ const command: Command = {
             return interaction.reply({ content: '⚠️ 已配置的蛙人身份组不存在，请管理员重新设置。', flags: MessageFlags.Ephemeral });
         }
         const member = interaction.member as GuildMember | null;
-        if (!member?.roles.cache.has(roleId)) {
-            return interaction.reply({ content: '❌ 只有蛙人身份组成员才能使用此指令。', flags: MessageFlags.Ephemeral });
+        const callerRoleIds = listFrogCallerRoleIds(interaction.guildId);
+        const mayCall = member?.roles.cache.has(roleId)
+            || callerRoleIds.some(allowedRoleId => member?.roles.cache.has(allowedRoleId));
+        if (!mayCall) {
+            return interaction.reply({
+                content: '❌ 你没有使用此指令的身份组。',
+                flags: MessageFlags.Ephemeral,
+            });
         }
         if (!role.mentionable && !interaction.appPermissions?.has(PermissionFlagsBits.MentionEveryone)) {
             return interaction.reply({

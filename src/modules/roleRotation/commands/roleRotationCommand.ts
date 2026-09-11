@@ -11,6 +11,7 @@ import {
     addAudit,
     addChannel,
     addConflictRole,
+    addFrogCallerRole,
     createConfig,
     deleteConfig,
     getActiveRound,
@@ -18,8 +19,10 @@ import {
     getFrogSettings,
     listAudit,
     listConfigs,
+    listFrogCallerRoleIds,
     removeChannel,
     removeConflictRole,
+    removeFrogCallerRole,
     setFrogRole,
     setFrogCooldown,
     updateConfig,
@@ -30,6 +33,7 @@ import {
     countNonBotMembers,
     settleInquiry,
     startInquiry,
+    startRecruitmentNow,
     syncRoleMembers,
 } from '../services/roleRotationService';
 import {
@@ -125,8 +129,23 @@ const data = new SlashCommandBuilder()
         .setDescription('设置每位成员两次呼唤之间的最短时间')
         .addIntegerOption(option => option.setName('冷却秒数').setDescription('默认 60 秒').setMinValue(1).setMaxValue(86400).setRequired(true)))
     .addSubcommand(sub => sub
+        .setName('添加蛙人呼叫组')
+        .setDescription('允许一个额外身份组的成员使用 /呼唤蛙人')
+        .addRoleOption(option => option.setName('身份组').setDescription('要授权的身份组').setRequired(true)))
+    .addSubcommand(sub => sub
+        .setName('移除蛙人呼叫组')
+        .setDescription('取消一个额外身份组使用 /呼唤蛙人的权限')
+        .addRoleOption(option => option.setName('身份组').setDescription('要取消授权的身份组').setRequired(true)))
+    .addSubcommand(sub => sub
+        .setName('查看蛙人设置')
+        .setDescription('查看蛙人目标、额外呼叫身份组和冷却时间'))
+    .addSubcommand(sub => sub
         .setName('立即问询')
         .setDescription('立即手动发起一轮问询，不改变下次月度时间')
+        .addRoleOption(option => option.setName('身份组').setDescription('被管理的身份组').setRequired(true)))
+    .addSubcommand(sub => sub
+        .setName('立即招募')
+        .setDescription('跳过问询，按实时空位立即发布招募')
         .addRoleOption(option => option.setName('身份组').setDescription('被管理的身份组').setRequired(true)))
     .addSubcommand(sub => sub
         .setName('立即结算')
@@ -185,8 +204,11 @@ function auditLabel(event: string): string {
         frog_role_set: '设置蛙人身份组',
         frog_role_cleared: '清除蛙人身份组',
         frog_cooldown_set: '设置蛙人冷却',
+        frog_caller_role_added: '添加蛙人呼叫身份组',
+        frog_caller_role_removed: '移除蛙人呼叫身份组',
         inquiry_started: '发起问询',
         inquiry_settled: '结算问询',
+        recruitment_started_manual: '立即发起招募',
         response_keep: '选择继续担任',
         response_leave: '选择不再担任',
         role_removed_leave: '按选择卸任',
@@ -399,11 +421,58 @@ const command: Command = {
             });
         }
 
+        if (sub === '添加蛙人呼叫组' || sub === '移除蛙人呼叫组') {
+            const role = interaction.options.getRole('身份组', true) as Role;
+            if (role.id === guild.id) {
+                return interaction.reply({ content: '❌ 不能授权 @everyone 使用呼唤指令。', flags: MessageFlags.Ephemeral });
+            }
+            const adding = sub === '添加蛙人呼叫组';
+            const changed = adding
+                ? addFrogCallerRole(guild.id, role.id)
+                : removeFrogCallerRole(guild.id, role.id);
+            if (changed) addAudit({
+                guildId: guild.id,
+                actorId: interaction.user.id,
+                event: adding ? 'frog_caller_role_added' : 'frog_caller_role_removed',
+                detail: `role=${role.id}`,
+            });
+            return interaction.reply({
+                content: `${changed ? '✅' : 'ℹ️'} ${role} ${changed ? `已${adding ? '获得' : '失去'}呼唤蛙人的权限` : '配置没有变化'}。`,
+                flags: MessageFlags.Ephemeral,
+                allowedMentions: { parse: [] },
+            });
+        }
+
+        if (sub === '查看蛙人设置') {
+            const settings = getFrogSettings(guild.id);
+            const callerRoleIds = listFrogCallerRoleIds(guild.id);
+            return interaction.reply({
+                content: [
+                    '**蛙人呼叫设置**',
+                    `被呼叫身份组：${settings.roleId ? `<@&${settings.roleId}>` : '未配置'}`,
+                    `额外可呼叫身份组：${callerRoleIds.map(id => `<@&${id}>`).join('、') || '无'}`,
+                    `每人冷却：${settings.cooldownSeconds} 秒`,
+                    '',
+                    '蛙人身份组自身成员始终拥有呼叫权限。',
+                ].join('\n'),
+                flags: MessageFlags.Ephemeral,
+                allowedMentions: { parse: [] },
+            });
+        }
+
         if (sub === '立即问询') {
             const found = getConfiguredRole(interaction);
             if (!found) return interaction.reply({ content: '❌ 该身份组没有轮替配置。', flags: MessageFlags.Ephemeral });
             await interaction.deferReply({ flags: MessageFlags.Ephemeral });
             const result = await startInquiry(interaction.client, found.config, { createdBy: interaction.user.id });
+            return interaction.editReply(`${result.ok ? '✅' : '⚠️'} ${result.message}`);
+        }
+
+        if (sub === '立即招募') {
+            const found = getConfiguredRole(interaction);
+            if (!found) return interaction.reply({ content: '❌ 该身份组没有轮替配置。', flags: MessageFlags.Ephemeral });
+            await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+            const result = await startRecruitmentNow(interaction.client, found.config, interaction.user.id);
             return interaction.editReply(`${result.ok ? '✅' : '⚠️'} ${result.message}`);
         }
 
