@@ -59,10 +59,14 @@ export function buildInquiryMessage(
     );
 
     return {
-        content: closed ? '' : `<@&${config.managedRoleId}>`,
+        content: closed ? '' : `@here <@&${config.managedRoleId}>`,
         embeds: [embed],
         components: [row],
-        allowedMentions: { roles: closed ? [] : [config.managedRoleId], users: [] },
+        allowedMentions: {
+            parse: closed ? [] as const : ['everyone'] as const,
+            roles: closed ? [] : [config.managedRoleId],
+            users: [],
+        },
     };
 }
 

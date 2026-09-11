@@ -185,6 +185,7 @@ async function sendInquiryMessages(
             buildInquiryMessage(config, round, participantCount),
             `月度留任确认｜${role.name}｜#${round.id}`,
             role,
+            true,
         );
         if ('error' in sent) {
             errors.push(sent.error);
