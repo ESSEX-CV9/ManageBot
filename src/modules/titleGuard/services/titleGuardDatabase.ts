@@ -1311,6 +1311,15 @@ const finishCaseReauditStmt = db.prepare(`
     SET state = 'done', processed_at = ?, last_error = NULL
     WHERE case_id = ? AND state = 'running'
 `);
+const deferCaseReauditStmt = db.prepare(`
+    UPDATE tt_case_reaudit
+    SET state = 'pending', attempts = CASE WHEN attempts > 0 THEN attempts - 1 ELSE 0 END
+    WHERE case_id = ? AND state = 'running'
+`);
+const discardCaseReauditStmt = db.prepare(`
+    DELETE FROM tt_case_reaudit
+    WHERE case_id = ? AND (? = 'llm' OR mode = 'rules')
+`);
 const failCaseReauditStmt = db.prepare(`
     UPDATE tt_case_reaudit
     SET state = CASE WHEN attempts < 3 THEN 'pending' ELSE 'failed' END,
@@ -1371,6 +1380,19 @@ export const claimNextCaseReaudit = db.transaction((): CaseReauditItem | null =>
 
 export function finishCaseReaudit(caseId: number): void {
     finishCaseReauditStmt.run(Date.now(), caseId);
+}
+
+/** 单案立即重审正在执行时，后台领取到同案任务就先放回去，不计失败次数。 */
+export function deferCaseReaudit(caseId: number): void {
+    deferCaseReauditStmt.run(caseId);
+}
+
+/**
+ * 单案立即重审后移除不再需要的后台任务。
+ * 立即规则重审不能取消一项更强的 LLM 批量任务；立即 LLM 重审则两种都覆盖。
+ */
+export function discardCaseReaudit(caseId: number, mode: CaseReauditMode): void {
+    discardCaseReauditStmt.run(caseId, mode);
 }
 
 /** 失败任务最多自动重试三次；再次手动入队会重新获得三次机会。 */

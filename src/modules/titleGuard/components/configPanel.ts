@@ -42,6 +42,7 @@ import { checkAdminPermission } from '../../../core/utils/permissionManager';
 import * as db from '../services/titleGuardDatabase';
 import { invalidateConfigCache } from '../services/enforcer';
 import { autoMapTags } from '../services/backfillQueue';
+import { reauditCaseNow } from '../services/caseReaudit';
 import {
     CAPABILITIES,
     CAPABILITY_HINT,
@@ -62,6 +63,8 @@ const BTN_REAUDIT = `${P}:reaudit`;
 const BTN_REAUDIT_RULES = `${P}:reaudit:rules`;
 const BTN_REAUDIT_LLM = `${P}:reaudit:llm`;
 const BTN_REAUDIT_LLM_CONFIRM = `${P}:reaudit:llm-confirm`;
+const BTN_REAUDIT_ONE_RULES = `${P}:reaudit-one:rules`;
+const BTN_REAUDIT_ONE_LLM = `${P}:reaudit-one:llm`;
 const BTN_TOGGLE = `${P}:tog`;      // tt_cfg:tog:<key>
 const BTN_DICT = `${P}:dict`;
 // 期限和队列拆成两个弹窗：Discord 一个弹窗最多五个输入框，六项塞不下；
@@ -78,6 +81,8 @@ const SEL_FORCE_LLM = `${P}:forcellm`;
 const MODAL_GRACE = `${P}:gracemodal`;
 const MODAL_QUEUE = `${P}:queuemodal`;
 const MODAL_DICTSRC = `${P}:dictsrcmodal`;
+const MODAL_REAUDIT_ONE_RULES = `${P}:reaudit-one-modal:rules`;
+const MODAL_REAUDIT_ONE_LLM = `${P}:reaudit-one-modal:llm`;
 
 // ============================================================
 // 权限判定
@@ -229,6 +234,10 @@ function reauditView(guildId: string) {
                 value: '对全部仍有规则命中的未结案件重新调用模型，包含原本可由规则直接处理的案件；不会复用旧的 LLM 缓存。\n'
                     + '这是批量模型调用，确认后才会入队。',
             },
+            {
+                name: '指定单个案件',
+                value: '点击下面的“立即”按钮并填写案件编号，不进入队列，当场完成并返回结果。',
+            },
         )
         .setFooter({ text: '案件若已合规会静默结案；失败时保留旧方案，最多自动重试三次。' });
 
@@ -248,11 +257,43 @@ function reauditView(guildId: string) {
                     .setStyle(ButtonStyle.Secondary)
                     .setEmoji('🤖')
                     .setDisabled(open === 0 || !llmEnabled),
+            ),
+            new ActionRowBuilder<ButtonBuilder>().addComponents(
+                new ButtonBuilder()
+                    .setCustomId(BTN_REAUDIT_ONE_RULES)
+                    .setLabel('指定案件 · 立即规则重审')
+                    .setStyle(ButtonStyle.Primary)
+                    .setEmoji('🎯')
+                    .setDisabled(open === 0),
+                new ButtonBuilder()
+                    .setCustomId(BTN_REAUDIT_ONE_LLM)
+                    .setLabel('指定案件 · 立即 LLM 重审')
+                    .setStyle(ButtonStyle.Secondary)
+                    .setEmoji('⚡')
+                    .setDisabled(open === 0 || !llmEnabled),
                 new ButtonBuilder().setCustomId(BTN_HOME)
                     .setLabel('返回').setStyle(ButtonStyle.Secondary).setEmoji('◀️'),
             ),
         ],
     };
+}
+
+function immediateReauditModal(mode: db.CaseReauditMode): ModalBuilder {
+    return new ModalBuilder()
+        .setCustomId(mode === 'llm' ? MODAL_REAUDIT_ONE_LLM : MODAL_REAUDIT_ONE_RULES)
+        .setTitle(mode === 'llm' ? '立即 LLM 重审核' : '立即规则重审核')
+        .addComponents(
+            new ActionRowBuilder<TextInputBuilder>().addComponents(
+                new TextInputBuilder()
+                    .setCustomId('caseId')
+                    .setLabel('案件编号')
+                    .setPlaceholder('例如：123（可填写 #123）')
+                    .setStyle(TextInputStyle.Short)
+                    .setRequired(true)
+                    .setMinLength(1)
+                    .setMaxLength(12),
+            ),
+        );
 }
 
 function confirmLlmReauditView(guildId: string) {
@@ -651,6 +692,22 @@ export async function handleConfigButton(interaction: ButtonInteraction): Promis
         return true;
     }
 
+    if (interaction.customId === BTN_REAUDIT_ONE_RULES
+        || interaction.customId === BTN_REAUDIT_ONE_LLM) {
+        if (!hasCapability(memberOf(interaction), guildId, '设置')) {
+            await denied(interaction, '立即重审核需要「设置」权限。');
+            return true;
+        }
+        const mode: db.CaseReauditMode = interaction.customId === BTN_REAUDIT_ONE_LLM
+            ? 'llm' : 'rules';
+        if (mode === 'llm' && !db.getSettings(guildId).llmEnabled) {
+            await denied(interaction, '语义判定目前是关闭的，请先在「时间与开关」中启用。');
+            return true;
+        }
+        await interaction.showModal(immediateReauditModal(mode));
+        return true;
+    }
+
     if (interaction.customId === BTN_REAUDIT_LLM) {
         if (!hasCapability(memberOf(interaction), guildId, '设置')) {
             await denied(interaction, '批量重审核需要「设置」权限。');
@@ -917,7 +974,13 @@ export async function handleConfigSelect(interaction: AnySelectMenuInteraction):
 // 模态框
 // ============================================================
 
-const MODALS = new Set([MODAL_GRACE, MODAL_QUEUE, MODAL_DICTSRC]);
+const MODALS = new Set([
+    MODAL_GRACE,
+    MODAL_QUEUE,
+    MODAL_DICTSRC,
+    MODAL_REAUDIT_ONE_RULES,
+    MODAL_REAUDIT_ONE_LLM,
+]);
 
 export async function handleConfigModal(interaction: ModalSubmitInteraction): Promise<boolean> {
     if (!MODALS.has(interaction.customId)) return false;
@@ -932,6 +995,37 @@ export async function handleConfigModal(interaction: ModalSubmitInteraction): Pr
         interaction.reply({ content: text, flags: MessageFlags.Ephemeral });
     const bad = (text: string) =>
         interaction.reply({ content: `❌ ${text}`, flags: MessageFlags.Ephemeral });
+
+    // ---------- 指定单案立即重审核 ----------
+    if (interaction.customId === MODAL_REAUDIT_ONE_RULES
+        || interaction.customId === MODAL_REAUDIT_ONE_LLM) {
+        const raw = interaction.fields.getTextInputValue('caseId').trim();
+        const match = raw.match(/^#?(\d+)$/);
+        if (!match) {
+            await bad('案件编号格式不对，请填写 `123` 或 `#123`。');
+            return true;
+        }
+
+        const caseId = Number(match[1]);
+        if (!Number.isSafeInteger(caseId) || caseId <= 0) {
+            await bad('案件编号必须是正整数。');
+            return true;
+        }
+
+        const mode: db.CaseReauditMode = interaction.customId === MODAL_REAUDIT_ONE_LLM
+            ? 'llm' : 'rules';
+        if (mode === 'llm' && !db.getSettings(guildId).llmEnabled) {
+            await bad('语义判定目前是关闭的，请先在「时间与开关」中启用。');
+            return true;
+        }
+
+        await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+        const result = await reauditCaseNow(interaction.client, guildId, caseId, mode);
+        await interaction.editReply(
+            `${result.ok ? '✅' : '❌'} 案件 #${caseId}：${result.message}`,
+        );
+        return true;
+    }
 
     // ---------- 词表来源 ----------
     if (interaction.customId === MODAL_DICTSRC) {

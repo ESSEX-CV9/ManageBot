@@ -20,6 +20,15 @@ import { summarizeJudgement } from './llmJudge';
 /** 纯规则很快，可以一轮多跑几条；LLM 一轮只跑一条。 */
 const RULE_BATCH_SIZE = 10;
 const TICK_BUDGET_MS = 45_000;
+const activeCases = new Set<number>();
+
+export type CaseReauditOutcome = 'updated' | 'released' | 'unchanged';
+
+export interface ImmediateCaseReauditResult {
+    ok: boolean;
+    outcome?: CaseReauditOutcome;
+    message: string;
+}
 
 function tagsUnchanged(before: string[], thread: ThreadChannel): boolean {
     return before.length === thread.appliedTags.length
@@ -45,9 +54,14 @@ async function closeAsCompliant(
     await refreshNotice(client, guardCase.id);
 }
 
-async function reauditOne(client: Client, item: db.CaseReauditItem): Promise<void> {
+async function reauditOne(
+    client: Client,
+    item: Pick<db.CaseReauditItem, 'caseId' | 'mode'>,
+): Promise<{ outcome: CaseReauditOutcome; message: string }> {
     const guardCase = db.getCase(item.caseId);
-    if (!guardCase || guardCase.closedAt !== null) return;
+    if (!guardCase || guardCase.closedAt !== null) {
+        return { outcome: 'unchanged', message: '案件已经结案，无需重审核。' };
+    }
 
     const thread = await fetchThread(client, guardCase.threadId);
     if (!thread) throw new Error('找不到帖子，或机器人已无权读取');
@@ -71,8 +85,9 @@ async function reauditOne(client: Client, item: db.CaseReauditItem): Promise<voi
         if (inspection.skipped === '已被管理组豁免') {
             db.closeCase(guardCase.id, 'exempt');
             await refreshNotice(client, guardCase.id);
+            return { outcome: 'released', message: '当前标题已被豁免，案件已静默结案。' };
         }
-        return;
+        return { outcome: 'unchanged', message: `未修改案件：${inspection.skipped}。` };
     }
 
     const violations = effectiveViolations(inspection);
@@ -83,12 +98,17 @@ async function reauditOne(client: Client, item: db.CaseReauditItem): Promise<voi
     // 规则确认没有问题，或者 LLM 认定无需整改：静默放行，只改原通知。
     if (violations.length === 0) {
         await closeAsCompliant(client, guardCase, thread, inspection.plan, llmReason);
-        return;
+        return { outcome: 'released', message: '重审核确认当前帖子无需整改，案件已静默结案。' };
     }
 
     // 纯规则重审碰到语义问题或「本论坛所有问题先经模型」时，旧方案原样保留。
     // 自动启动绝不能用一份还在等待模型的半成品覆盖已经通知给作者的方案。
-    if (!useLlm && inspection.llmPending) return;
+    if (!useLlm && inspection.llmPending) {
+        return {
+            outcome: 'unchanged',
+            message: '此案需要语义判断，纯规则重审未覆盖原方案；可改用立即 LLM 重审。',
+        };
+    }
 
     if (useLlm && inspection.llmPending) {
         throw new Error('LLM 未能给出重审核结论');
@@ -105,6 +125,42 @@ async function reauditOne(client: Client, item: db.CaseReauditItem): Promise<voi
         // state、deadline、申诉和 AI 复核字段一律保留。
     });
     await refreshNotice(client, guardCase.id);
+    return { outcome: 'updated', message: '已按帖子当前标题和 TAG 更新整改方案及原通知。' };
+}
+
+/**
+ * 管理员指定单个案件立即重审核。与批量任务共用同一套逻辑，但不等待调度周期。
+ */
+export async function reauditCaseNow(
+    client: Client,
+    guildId: string,
+    caseId: number,
+    mode: db.CaseReauditMode,
+): Promise<ImmediateCaseReauditResult> {
+    const guardCase = db.getCase(caseId);
+    if (!guardCase || guardCase.guildId !== guildId) {
+        return { ok: false, message: '找不到本服务器的这个案件。' };
+    }
+    if (guardCase.closedAt !== null) {
+        return { ok: false, message: '这个案件已经结案。' };
+    }
+    if (activeCases.has(caseId)) {
+        return { ok: false, message: '这个案件正在重审核，请稍后再试。' };
+    }
+
+    activeCases.add(caseId);
+    try {
+        const result = await reauditOne(client, { caseId, mode });
+        db.discardCaseReaudit(caseId, mode);
+        return { ok: true, ...result };
+    } catch (err) {
+        return {
+            ok: false,
+            message: err instanceof Error ? err.message : String(err),
+        };
+    } finally {
+        activeCases.delete(caseId);
+    }
 }
 
 /**
@@ -118,6 +174,13 @@ export async function runCaseReauditTick(client: Client): Promise<void> {
         const item = db.claimNextCaseReaudit();
         if (!item) return;
 
+        // 单案立即重审已经先拿到内存锁：把批量任务原样放回，下轮再看。
+        if (activeCases.has(item.caseId)) {
+            db.deferCaseReaudit(item.caseId);
+            return;
+        }
+
+        activeCases.add(item.caseId);
         try {
             await reauditOne(client, item);
             db.finishCaseReaudit(item.caseId);
@@ -125,6 +188,8 @@ export async function runCaseReauditTick(client: Client): Promise<void> {
             const message = err instanceof Error ? err.message : String(err);
             db.failCaseReaudit(item.caseId, message);
             console.warn(`[TitleGuard] 后台重审核案件 #${item.caseId} 失败：${message}`);
+        } finally {
+            activeCases.delete(item.caseId);
         }
 
         if (item.mode === 'llm') return;
