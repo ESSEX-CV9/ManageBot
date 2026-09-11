@@ -3,10 +3,18 @@
 // 后台调度器。三件事：
 //   1. 把刚检出、还没通知的案件发出通知
 //   2. 到期复查：作者改好了就结案；没改好且能自动整改的就动手；定不了的转人工
-//   3. 驱动老帖慢速队列（速率可配，默认 20 分钟一个帖子）
+//   3. 驱动整改队列
 //
-// 老帖整改会在帖子里发通知，那**一定会顶帖**。慢速队列就是用来把这个影响摊平的，
-// 存量几百上千个帖子时不至于把论坛首页全刷成老帖。
+// 整改一定会在帖子里发通知，而**发消息一定会顶帖**。存量上千个帖子时
+// 一口气跑完等于把论坛首页全刷成机器人翻出来的帖子，所以队列必须限速。
+//
+// 队列分两条，因为这两类帖子的代价不一样：
+//
+//   快队列  活跃帖 + 最近还有人回的归档帖。发通知不需要（或只需要瞬间）解归档，
+//           作者多半还在看。**一批 50 个，然后歇 30 分钟**——限的是刷屏，不是线程配额。
+//
+//   慢队列  沉寂很久的老帖。发通知要先解归档，顶上来的是一个几个月没人动的帖子，
+//           对首页的打扰最大。**默认 5 分钟一个**，慢慢来。
 
 import type { Client } from 'discord.js';
 
@@ -213,8 +221,56 @@ async function notifyAdminPending(client: Client, guardCase: db.GuardCase, reaso
 }
 
 // ============================================================
-// 3. 老帖队列节流
+// 3. 队列节流
 // ============================================================
+
+/** 快队列在本批里已经发了几个 */
+const fastBatchCount = new Map<string, number>();
+/** 快队列这一批是什么时候开始的 */
+const fastBatchStart = new Map<string, number>();
+
+/**
+ * 快队列：一批 N 个，发满就歇 M 分钟。
+ *
+ * 计数按「批」重置而不是按滑动窗口，是因为管理组要能预期：
+ * 「50 个，歇半小时，再 50 个」一句话说得清；滑动窗口说不清，出了问题也不好查。
+ */
+async function processFastLane(client: Client, guildId: string, now: number): Promise<void> {
+    const settings = db.getSettings(guildId);
+    const size = Math.max(1, settings.fastBatchSize);
+    const pauseMs = Math.max(0, settings.fastBatchPauseMinutes) * 60_000;
+
+    const started = fastBatchStart.get(guildId) ?? 0;
+    let count = fastBatchCount.get(guildId) ?? 0;
+
+    // 上一批发满了，得歇够了才开下一批
+    if (count >= size) {
+        if (now - started < pauseMs) return;
+        count = 0;
+        fastBatchCount.set(guildId, 0);
+        fastBatchStart.set(guildId, now);
+    }
+    if (count === 0) fastBatchStart.set(guildId, now);
+
+    // 一个 tick（1 分钟）里把这批剩下的额度用掉，别一分钟才发一个
+    const remaining = size - count;
+    for (let i = 0; i < remaining; i++) {
+        const handled = await runBackfillTick(client, guildId, 'fast');
+        if (!handled) return; // 队列空了，这批不算数，下次有货再从头计
+        fastBatchCount.set(guildId, (fastBatchCount.get(guildId) ?? 0) + 1);
+    }
+}
+
+/** 慢队列：老老实实 N 分钟一个 */
+async function processSlowLane(client: Client, guildId: string, now: number): Promise<void> {
+    const settings = db.getSettings(guildId);
+    const intervalMs = Math.max(1, settings.queueIntervalMinutes) * 60_000;
+    if (now - (lastBackfill.get(guildId) ?? 0) < intervalMs) return;
+
+    const handled = await runBackfillTick(client, guildId, 'slow');
+    // 队列空的时候不要刷新计时器，否则真有货进来时还得再等一轮
+    if (handled) lastBackfill.set(guildId, now);
+}
 
 async function processBackfill(client: Client): Promise<void> {
     const now = Date.now();
@@ -223,11 +279,8 @@ async function processBackfill(client: Client): Promise<void> {
         const settings = db.getSettings(guild.id);
         if (!settings.enabled || settings.queuePaused) continue;
 
-        const intervalMs = Math.max(1, settings.queueIntervalMinutes) * 60_000;
-        if (now - (lastBackfill.get(guild.id) ?? 0) < intervalMs) continue;
-
-        lastBackfill.set(guild.id, now);
-        await runBackfillTick(client, guild.id);
+        await processFastLane(client, guild.id, now);
+        await processSlowLane(client, guild.id, now);
     }
 }
 

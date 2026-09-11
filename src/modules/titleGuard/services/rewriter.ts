@@ -399,14 +399,18 @@ export function pendingHits(detectResult: DetectResult, stage: ProgramStage): Ma
 /**
  * 模型交回来的方案能不能用。
  *
- * 放行的口子只有一个，而且卡得很死：
- * **正文里的关联词**，模型明确判了「保留」并说明它是在描述人物或情节，
- * 这条冲突才可以留着不管。理由是这类词没污染任何一个受保护关键字
- *（绿帽、黄毛这些词面里既没有「NTR」也没有「纯爱」），搜索不会串行。
+ * 放行的口子只有两个，都卡得很死：
+ *
+ * 一、**本篇自己那一类的本体词**。作品定性为纯爱，标题里写着「纯爱」，
+ *     那不是污染，那正是它该出现的地方。所以只有**别的类**的本体词必须清掉。
+ *
+ * 二、**正文里的关联词**，模型明确判了「保留」并说明它在描述人物或情节。
+ *     这类词没污染任何一个受保护关键字（绿帽、黄毛的词面里既没有「NTR」
+ *     也没有「纯爱」），留着不会让搜索串行。
  *
  * 其余一律打回：
- *   - 本体词在正文里被判保留 → 不行。「纯爱」两个字只要留在标题里，
- *     搜「纯爱」就一定命中，这跟它在句子里当什么成分毫无关系。
+ *   - 别的类的本体词还留在正文里 → 不行。那几个字只要在标题里，
+ *     搜它就一定命中，跟它在句子里当什么成分毫无关系。
  *   - 标签区里还剩冲突 → 不行，那本来就轮不到模型定夺。
  *   - 模型定的 TAG 自己就互斥 → 不行。
  */
@@ -414,10 +418,12 @@ function validateModelPlan(input: {
     finalTitle: string;
     finalTags: AppliedTag[];
     keptWords: Set<string>;
+    /** 模型给这篇定的性。它自己那一类的本体词可以留在标题里 */
+    verdict: GroupId;
     compiled: CompiledConfig;
     problems: string[];
 }): { ok: true } | { ok: false; reason: string; remaining: string[] } {
-    const { finalTitle, finalTags, keptWords, compiled, problems } = input;
+    const { finalTitle, finalTags, keptWords, verdict, compiled, problems } = input;
 
     if (problems.length > 0) {
         return { ok: false, reason: '处理指令本身有问题', remaining: problems };
@@ -453,10 +459,15 @@ function validateModelPlan(input: {
                 offenders.push(`标签区里还留着「${h.entry.word}」`);
                 continue;
             }
+            // 本篇自己那一类的词不算污染，写在标题里天经地义
+            if (classifyingGroup(h) === verdict) continue;
+
             if (tierOf(h) === '本体') {
-                offenders.push(`正文里还留着本体词「${h.entry.word}」`
+                offenders.push(`正文里还留着本体词「${h.entry.word}」，`
+                    + `可你把这篇定性成了「${verdict}」`
                     + '——这几个字只要在标题里，别人搜它就一定搜得到，'
-                    + '不管它在句子里是什么成分，所以不能用「只是描述」放过');
+                    + '不管它在句子里是什么成分，所以不能用「只是描述」放过；'
+                    + '觉得删了不通顺就用「替换」');
                 continue;
             }
             if (!keptWords.has(h.entry.word)) {
@@ -561,15 +572,16 @@ export function buildPlan(input: BuildPlanInput): RewritePlan {
         problems.push(`本论坛没有 ${missing.join(' / ')} 这些 TAG，换一个能挂的`);
     }
 
-    const verdict = validateModelPlan({
+    const check = validateModelPlan({
         finalTitle,
         finalTags: wanted,
         keptWords: new Set(applied.kept.map(m => m.entry.word)),
+        verdict: judgement.verdict,
         compiled,
         problems,
     });
 
-    if (!verdict.ok) {
+    if (!check.ok) {
         return {
             ...base,
             newTitle: originalTitle,
@@ -580,8 +592,8 @@ export function buildPlan(input: BuildPlanInput): RewritePlan {
             awaitingModel: false,
             modelRejection: {
                 titleTried: finalTitle,
-                reason: verdict.reason,
-                remaining: verdict.remaining,
+                reason: check.reason,
+                remaining: check.remaining,
                 tagsAfter: wanted.map(t => t.tagName),
             },
         };

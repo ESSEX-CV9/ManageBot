@@ -171,13 +171,18 @@ export function resolveReplacement(
     config: GuardConfig,
     wanted: string,
 ): { ok: true; word: string } | { ok: false; reason: string } {
-    const want = normalize(wanted).text.trim();
+    const raw = wanted.trim();
+    const want = normalize(raw).text.trim();
     if (!want) return { ok: false, reason: '替换词是空的' };
 
+    // 认出来之后填回去的是**模型写的那个形**（NTR 而不是 ntr）。
+    // 词表里存的 word 是归一化后的匹配用形式，直接塞进标题会变成一串小写，
+    // 作者看了会觉得机器人在乱改。归一化后完全相等已经保证它就是这个词，
+    // 顶多差个大小写或全半角，塞回去是安全的。
     for (const e of config.dict) {
-        if (normalize(e.word).text === want) return { ok: true, word: e.word };
+        if (normalize(e.word).text === want) return { ok: true, word: raw };
         if (e.replaceTo && normalize(e.replaceTo).text === want) {
-            return { ok: true, word: e.replaceTo };
+            return { ok: true, word: raw };
         }
     }
     return {

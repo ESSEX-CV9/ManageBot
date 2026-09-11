@@ -40,6 +40,12 @@ export type DictScope = '全标题' | '仅标记段' | '仅主体段';
 export interface DictEntry {
     /** 词面。存库时即为归一化形式（小写、NFKC） */
     word: string;
+    /**
+     * 管理组录入时的原始写法，如 `NTR`（word 是归一化后的 `ntr`）。
+     * 凡是要把这个词**显示给人看**或**写回标题**的地方都用它，
+     * 否则作者会看到机器人把自己标题里的 NTR 改成了小写的 ntr。
+     */
+    rawWord?: string;
     kind: DictKind;
     /** 所属分类组；白名单为 null */
     group: GroupId | null;

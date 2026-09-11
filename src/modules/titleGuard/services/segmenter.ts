@@ -313,7 +313,11 @@ export function segment(text: string, options: SegmentOptions = {}): Segment[] {
             end,
             text: body,
             wellFormed: true,
-            confident: true,
+            // 主体段恒为 false。confident 问的是「有多确信这是个标签区」，
+            // 主体段压根不是标签区，这个问题对它没有意义。
+            // 读的地方都会先判 segmentKind === 'marker'，所以填什么都不影响判定，
+            // 但填 true 会让调试台把正文标成「已盖章」，看的人要被绕进去。
+            confident: false,
             bracket: null,
         });
     };

@@ -101,9 +101,10 @@ export function buildJudgeHits(
         if (g) groupsInPlay.add(g);
     }
 
+    // 给模型看的、以及最终写回标题的，都用管理组录入的原始写法
     const coreOf = (group: GroupId) => config.dict
         .filter(e => e.group === group && e.tier === '本体' && e.kind === '分类词')
-        .map(e => e.word);
+        .map(e => e.rawWord || e.word);
 
     return pending.map(m => {
         const group = classifyingGroup(m) ?? '';
@@ -115,7 +116,7 @@ export function buildJudgeHits(
         if (m.entry.replaceTo) options.add(m.entry.replaceTo);
 
         return {
-            word: m.entry.word,
+            word: m.entry.rawWord || m.entry.word,
             group,
             where: m.segmentKind === 'marker' ? '标签区' : '正文',
             tier: tierOf(m),
@@ -150,7 +151,7 @@ export function buildJudgeRules(config: GuardConfig): JudgeRules {
     const coreWords: Record<GroupId, string[]> = {};
     for (const e of config.dict) {
         if (e.tier !== '本体' || !e.group) continue;
-        (coreWords[e.group] ??= []).push(e.word);
+        (coreWords[e.group] ??= []).push(e.rawWord || e.word);
     }
 
     return {

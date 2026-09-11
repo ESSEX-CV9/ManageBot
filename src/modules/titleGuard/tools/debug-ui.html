@@ -450,10 +450,10 @@ const PILL = {
   '转人工':'man',
 };
 const RULE_DESC = {
-  T1:'标题含黑名单词',
-  T2:'关键字互斥 · 涉事的词都明写在标签区，可直接判',
-  T3:'关键字互斥 · 有词落在正文或推断出来的区块，需先定性',
-  T4:'TAG 与关键字交叉互斥', G1:'TAG 之间互斥',
+  B:'污染词 · 词面里裹着别组的受保护关键字',
+  W:'关键字 × 关键字互斥',
+  X:'TAG × 关键字交叉互斥（有方向）',
+  G:'TAG × TAG 互斥',
 };
 const KIND_CLS = { '分类词':'', '黑名单':'r', '白名单':'g', '中性标记':'y' };
 
@@ -538,14 +538,14 @@ function renderViolations(r) {
     <td>${esc(v.message)}</td>
     <td>${v.words.map(w => `<span class="tag r">${esc(w)}</span>`).join('') || '—'}
         ${v.tagNames.map(t => `<span class="tag y">TAG:${esc(t)}</span>`).join('')}</td>
-    <td>${v.needsLlm
-      ? '<span class="tag p">需 LLM 定性</span>'
-      : '<span class="tag g">规则可直接判</span>'}</td>
+    <td>${v.arbiter === 'LLM'
+      ? '<span class="tag p">交给模型</span>'
+      : '<span class="tag g">程序直接判</span>'}</td>
   </tr>`).join('');
   return `<div class="card"><h2>判定结果</h2>
     <span class="pill ${PILL[r.disposition]}">${esc(r.disposition)}</span>
     <table style="margin-top:12px"><thead><tr>
-      <th style="width:130px">规则</th><th>说明</th><th style="width:220px">涉及</th><th style="width:130px">能否直接判</th>
+      <th style="width:130px">规则</th><th>说明</th><th style="width:220px">涉及</th><th style="width:130px">谁裁决</th>
     </tr></thead><tbody>${rows}</tbody></table></div>`;
 }
 
@@ -741,15 +741,20 @@ function renderJudgement(r) {
     <div class="verdict">
       <h3>语义判定结果</h3>
       <dl class="kv">
-        <dt>误判命中</dt><dd>${j.falseMatches?.length
-          ? '<span class="tag g">第 ' + j.falseMatches.join('、') + ' 处——这几个字在这儿不是那个分类</span>'
-          : '<span class="tag r">无——命中的都是真的分类词</span>'}</dd>
+        <dt>① 定性</dt><dd><span class="tag y">${esc(j.verdict ?? '—')}</span>
+          <div class="note">${esc(j.verdictReason ?? '')}</div></dd>
+        <dt>② 最终 TAG</dt><dd>${j.finalTagGroups?.length
+          ? j.finalTagGroups.map(g => `<span class="tag g">${esc(g)}</span>`).join('')
+          : '<span class="tag dim">一个分类都不挂</span>'}</dd>
+        <dt>③ 逐处处理</dt><dd>${j.decisions?.length
+          ? '<ul style="margin:0;padding-left:18px">' + j.decisions.map(d =>
+              `<li>[${d.hit}] <b>${esc(d.action)}</b>`
+              + (d.action === '替换' ? ' → ' + esc(d.replaceWith ?? '') : '')
+              + `　<span class="note">${esc(d.why ?? '')}</span></li>`).join('') + '</ul>'
+          : '<span class="tag dim">没给</span>'}</dd>
         <dt>把握程度</dt><dd>${conf}${j.confidence === 'low' ? ' <span class="note">（低把握不会被自动执行）</span>' : ''}</dd>
-        <dt>建议保留</dt><dd>${j.suggestedKeep ? esc(j.suggestedKeep) : '<span class="tag dim">未给出</span>'}</dd>
-        <dt>建议标题</dt><dd class="mono">${j.suggestedTitle ? esc(j.suggestedTitle) : '<span class="tag dim">不改</span>'}</dd>
-        <dt>理由</dt><dd>${esc(j.reason)}</dd>
         <dt>调用方式</dt><dd>${esc(r.modeLabel ?? '—')}</dd>
-        <dt>首楼摘录</dt><dd>${r.usedBody ? '把握低，带正文重判过一次' : '未使用'}</dd>
+        <dt>首楼摘录</dt><dd>${r.usedBody ? '带首楼一起发的' : '未使用（可能被内容审核拦了）'}</dd>
         <dt>打回重写</dt><dd>${r.rewrites > 0
           ? '<span class="tag y">是，重写了 ' + r.rewrites + ' 次</span>'
           : '<span class="tag dim">没有，第一次就过了</span>'}</dd>
@@ -825,9 +830,11 @@ async function runBatch() {
       <div class="stat"><b>${pct(s.总数 - (s.合规 ?? 0))}</b><span>违规率</span></div>
     </div></div>`;
 
-  // T1/T4 是「看位置」：明写在标签区里的直接判，落在正文里的才要先定性
-  const RULE_LLM = { T1:'看位置', T2:'', T3:'恒需', T4:'看位置', G1:'' };
-  const ruleRows = ['T1','T2','G1','T3','T4']
+  // 归谁裁决不看规则编号，看冲突落在哪一段：
+  // 全靠标签区里的词就能成立 → 程序；非得搭上正文里的词才成立 → 模型。
+  // 所以只有 G（纯 TAG 打架）是铁定不用问模型的，其余都看位置。
+  const RULE_LLM = { B:'看位置', W:'看位置', X:'看位置', G:'' };
+  const ruleRows = ['B','W','G','X']
     .map(k => `<tr><td><b>${k}</b></td><td>${esc(RULE_DESC[k])}</td>
       <td style="text-align:right">${r.ruleStats[k] ?? 0}</td>
       <td>${RULE_LLM[k] ? `<span class="tag p">${RULE_LLM[k]}</span>` : ''}</td></tr>`).join('');
@@ -858,7 +865,7 @@ async function runBatch() {
       </select></div>
       <div class="narrow"><select id="bRule">
         <option value="">全部规则</option>
-        ${['T1','T2','T3','T4','G1'].map(k => `<option>${k}</option>`).join('')}
+        ${['B','W','G','X'].map(k => `<option>${k}</option>`).join('')}
       </select></div>
       <div class="auto"><span class="note" id="bCount"></span></div>
     </div>
@@ -1366,9 +1373,12 @@ $('#llmTest').onclick = async () => {
       throw new Error(`[${r.kind ?? '失败'}] ${r.error}${tried}`);
     }
     const j = r.judgement;
-    // 自检样例里「百合破坏」就是那个分类词，正确答案是「没有误判」——
-    // 冲突靠摘掉百合 TAG 解决，不是靠否掉这个词
-    const right = !j.falseMatches?.length;
+    // 自检样例：「百合破坏」是本体词，在这儿确实就是那个分类。
+    // 正确答案是定性为百破、最终不挂百合 TAG、标题那处判「保留」——
+    // 冲突靠摘掉百合 TAG 解决，不是靠改标题
+    const right = j.verdict === '百破'
+      && !(j.finalTagGroups ?? []).includes('百合')
+      && (j.decisions ?? []).every(d => d.action === '保留');
     $('#llmStatus').innerHTML =
       `<span style="color:var(--ok)">接口正常，耗时 ${r.elapsedMs} ms，实际用的是「${esc(r.modeLabel)}」</span>`;
     $('#llmTestOut').innerHTML = `<div class="card">
@@ -1380,10 +1390,13 @@ $('#llmTest').onclick = async () => {
       <div class="verdict">
         <h3>${right ? '✅ 判对了' : '⚠️ 判得不对，可能要调 prompt 或换模型'}</h3>
         <dl class="kv">
-          <dt>误判命中</dt><dd>${j.falseMatches?.length ? '第 ' + j.falseMatches.join('、') + ' 处' : '无'}</dd>
+          <dt>定性</dt><dd>${esc(j.verdict ?? '—')}</dd>
+          <dt>最终 TAG</dt><dd>${(j.finalTagGroups ?? []).join('、') || '一个都不挂'}</dd>
+          <dt>逐处处理</dt><dd>${(j.decisions ?? [])
+            .map(d => `[${d.hit}] ${esc(d.action)}`).join('　') || '没给'}</dd>
           <dt>把握程度</dt><dd>${esc(j.confidence)}</dd>
           <dt>调用方式</dt><dd>${esc(r.modeLabel)}</dd>
-          <dt>理由</dt><dd>${esc(j.reason)}</dd>
+          <dt>理由</dt><dd>${esc(j.verdictReason ?? '')}</dd>
         </dl>
       </div></div>`;
   } catch (e) {

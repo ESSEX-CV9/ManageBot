@@ -31,9 +31,11 @@ export const MODE_LABEL: Record<CallMode, string> = {
 };
 
 /**
- * 默认超时 4 分钟。
- * 思考模式的模型光推理就能跑一两分钟，超时给短了的表现是一律报
- * 「This operation was aborted」，看上去像接口坏了，其实只是没等够。
+ * 默认**闲置**超时 4 分钟——连续这么久一个字节都没回来才算卡死。
+ *
+ * 注意这不是总时长。思考模式的模型光推理就能跑好几分钟，
+ * 拿总时长当超时会把生成到一半的调用自己掐断，报出来还是「请求超时」，
+ * 看着像接口坏了。只要还在往回吐数据，这个计时器就一直被刷新。
  */
 const DEFAULT_TIMEOUT_MS = 240000;
 
@@ -42,9 +44,24 @@ export interface LlmConfig {
     apiKey: string;
     model: string;
     protocol: LlmProtocol;
+    /**
+     * **闲置**超时：连续这么久没收到任何数据就放弃。不是总时长。
+     * 见 postJson。
+     */
     timeoutMs: number;
     /** 默认 cascade：自动降级，不用管模型支不支持 tool_choice */
     toolMode?: ToolMode;
+    /**
+     * 走不走流式。默认走。
+     *
+     * 开着才能让「闲置超时」真的有意义：非流式请求的服务端要等模型整段生成完
+     * 才发第一个字节，这期间连接上一片死寂，闲置超时和总超时就成了同一个数。
+     * 开流之后 token 一个个回来，计时器一直被刷新，只有**真卡住**才触发。
+     *
+     * 万一对面的接口开流就出问题（少数网关不支持流式 tool call），
+     * 用 TITLEGUARD_LLM_STREAM=0 关掉，功能不受影响，只是超时又退化回总时长。
+     */
+    stream?: boolean;
 }
 
 export function readLlmConfig(): LlmConfig | null {
@@ -61,6 +78,9 @@ export function readLlmConfig(): LlmConfig | null {
     const toolMode: ToolMode =
         rawMode === 'forced' || rawMode === 'auto' || rawMode === 'json' ? rawMode : 'cascade';
 
+    const rawStream = (process.env.TITLEGUARD_LLM_STREAM || '').trim().toLowerCase();
+    const stream = !(rawStream === '0' || rawStream === 'false' || rawStream === 'off');
+
     return {
         baseUrl,
         apiKey,
@@ -68,6 +88,7 @@ export function readLlmConfig(): LlmConfig | null {
         protocol,
         timeoutMs: Number.isFinite(timeout) && timeout > 0 ? timeout : DEFAULT_TIMEOUT_MS,
         toolMode,
+        stream,
     };
 }
 
@@ -163,35 +184,191 @@ export function extractJson(text: string): string | null {
 }
 
 // ---------- HTTP ----------
+//
+// 超时算的是**闲置时间**，不是总时长：只要还有数据在往回流，就一直等下去；
+// 连续这么久一个字节都没来，才算它死了。
+//
+// 以前是给整个请求包一个总定时器，那是错的——思考模式的模型光推理就能跑好几分钟，
+// 生成到一半会被自己这边掐断，报出来还是「请求超时」，看着像接口坏了。
+//
+// 光改语义还不够：非流式请求的服务端要等模型全部生成完才发第一个字节，
+// 「闲置时间」和「总时长」就成了同一个数。所以要配合 stream:true 用——
+// token 一个个吐回来，闲置计时器就一直被刷新，只有**真卡住**才会触发。
+
+/** 一个事件一个事件地吐 SSE 的 data 部分。多行 data 按规范用 \n 拼起来 */
+function* sseEvents(raw: string): Generator<string> {
+    for (const block of raw.split(/\r?\n\r?\n/)) {
+        const data = block.split(/\r?\n/)
+            .filter(line => line.startsWith('data:'))
+            .map(line => line.slice(5).replace(/^ /, ''));
+        if (data.length > 0) yield data.join('\n');
+    }
+}
+
+/**
+ * 把 Chat Completions 的流式增量拼回成一个非流式的响应体。
+ *
+ * 这么做是为了让**解析那一段完全不用知道有没有开流**：
+ * callChat 拿到的永远是同一个形状，开不开流只影响传输。
+ *
+ * tool_call 的 arguments 是一小段一小段回来的，必须按 index 分别累加——
+ * 拼错了就是一串残缺 JSON，上层只会报「参数不是合法 JSON」，很难查。
+ */
+function assembleChatSse(raw: string): string {
+    let content = '';
+    const calls = new Map<number, { name?: string; args: string }>();
+
+    for (const data of sseEvents(raw)) {
+        if (data === '[DONE]') break;
+        let ev: {
+            choices?: {
+                delta?: {
+                    content?: string | null;
+                    tool_calls?: {
+                        index?: number;
+                        function?: { name?: string; arguments?: string };
+                    }[];
+                };
+            }[];
+        };
+        try { ev = JSON.parse(data); } catch { continue; }
+
+        const delta = ev.choices?.[0]?.delta;
+        if (!delta) continue;
+        if (typeof delta.content === 'string') content += delta.content;
+
+        for (const tc of delta.tool_calls ?? []) {
+            const i = typeof tc.index === 'number' ? tc.index : 0;
+            const cur = calls.get(i) ?? { args: '' };
+            if (tc.function?.name) cur.name = tc.function.name;
+            if (typeof tc.function?.arguments === 'string') cur.args += tc.function.arguments;
+            calls.set(i, cur);
+        }
+    }
+
+    const toolCalls = [...calls.entries()]
+        .sort((a, b) => a[0] - b[0])
+        .map(([, v]) => ({ type: 'function', function: { name: v.name ?? '', arguments: v.args } }));
+
+    return JSON.stringify({
+        choices: [{ message: { content, ...(toolCalls.length > 0 ? { tool_calls: toolCalls } : {}) } }],
+    });
+}
+
+/**
+ * Responses API 的流式拼装。
+ * 它最后会发一个 response.completed，里面就是完整的非流式对象，有就直接用；
+ * 没有（被中途掐了、或实现不全）才退回自己按增量拼。
+ */
+function assembleResponsesSse(raw: string): string {
+    let completed: unknown = null;
+    let text = '';
+    const argsById = new Map<string, string>();
+    const nameById = new Map<string, string>();
+
+    for (const data of sseEvents(raw)) {
+        if (data === '[DONE]') break;
+        let ev: {
+            type?: string;
+            delta?: string;
+            item_id?: string;
+            response?: unknown;
+            item?: { id?: string; type?: string; name?: string };
+        };
+        try { ev = JSON.parse(data); } catch { continue; }
+
+        if (ev.type === 'response.completed' && ev.response) {
+            completed = ev.response;
+        } else if (ev.type === 'response.output_text.delta' && typeof ev.delta === 'string') {
+            text += ev.delta;
+        } else if (ev.type === 'response.function_call_arguments.delta' && typeof ev.delta === 'string') {
+            const id = String(ev.item_id ?? '0');
+            argsById.set(id, (argsById.get(id) ?? '') + ev.delta);
+        } else if (ev.type === 'response.output_item.added' && ev.item?.type === 'function_call') {
+            nameById.set(String(ev.item.id ?? '0'), String(ev.item.name ?? ''));
+        }
+    }
+
+    if (completed) return JSON.stringify(completed);
+
+    return JSON.stringify({
+        output: [...argsById.entries()].map(([id, args]) => ({
+            type: 'function_call', name: nameById.get(id) ?? '', arguments: args,
+        })),
+        output_text: text,
+    });
+}
 
 async function postJson(
     config: LlmConfig, path: string, payload: unknown,
 ): Promise<{ status: number; text: string }> {
     const controller = new AbortController();
-    let timedOut = false;
-    const timer = setTimeout(() => { timedOut = true; controller.abort(); }, config.timeoutMs);
+    let idle = false;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+
+    /** 重新开始计时。每收到一块数据就调一次 */
+    const arm = () => {
+        if (timer) clearTimeout(timer);
+        timer = setTimeout(() => { idle = true; controller.abort(); }, config.timeoutMs);
+    };
+    arm();
+
     try {
         const res = await fetch(`${config.baseUrl}${path}`, {
             method: 'POST',
             headers: {
                 'content-type': 'application/json',
                 authorization: `Bearer ${config.apiKey}`,
+                accept: 'text/event-stream, application/json',
             },
             body: JSON.stringify(payload),
             signal: controller.signal,
         });
-        return { status: res.status, text: await res.text() };
+        arm(); // 响应头回来了，重新计时
+
+        // 逐块读，每块都刷新闲置计时器。
+        // 不用 res.text()——那要等整个 body 收完才返回，中途收到的数据刷新不了计时器。
+        const decoder = new TextDecoder();
+        const parts: string[] = [];
+        const body = res.body as ReadableStream<Uint8Array> | null;
+        if (body) {
+            const reader = body.getReader();
+            for (;;) {
+                const { done, value } = await reader.read();
+                if (done) break;
+                arm();
+                if (value) parts.push(decoder.decode(value, { stream: true }));
+            }
+            parts.push(decoder.decode());
+        }
+        const raw = parts.join('');
+
+        // 请求了流式但对面回的是普通 JSON（或者这是个错误响应）→ 原样返回，
+        // 上层的解析逻辑一个字都不用改
+        const isSse = (res.headers.get('content-type') ?? '').includes('text/event-stream');
+        if (!isSse || res.status < 200 || res.status >= 300) {
+            return { status: res.status, text: raw };
+        }
+
+        return {
+            status: res.status,
+            text: config.protocol === 'responses'
+                ? assembleResponsesSse(raw)
+                : assembleChatSse(raw),
+        };
     } catch (err) {
         // 光把 AbortError 抛出去，上层只会看到「This operation was aborted」，
         // 归类成 unknown，排查的人根本猜不到是超时
-        if (timedOut) {
+        if (idle) {
+            const secs = Math.round(config.timeoutMs / 1000);
             throw new LlmError('network',
-                `请求超时（已等 ${Math.round(config.timeoutMs / 1000)} 秒）。`
-                + '模型太慢的话，把 TITLEGUARD_LLM_TIMEOUT_MS 调大。');
+                `连续 ${secs} 秒没收到任何数据，判定为卡住了。`
+                + '（算的是两次数据之间的间隔，不是总时长；模型慢不会触发这个。）'
+                + ' 要调就改 TITLEGUARD_LLM_TIMEOUT_MS。');
         }
         throw new LlmError('network', err instanceof Error ? err.message : String(err));
     } finally {
-        clearTimeout(timer);
+        if (timer) clearTimeout(timer);
     }
 }
 
@@ -206,6 +383,9 @@ async function callChat(config: LlmConfig, spec: CallSpec, mode: CallMode): Prom
             { role: 'system', content: spec.systemPrompt },
             { role: 'user', content: userContent },
         ],
+        // 开流不是为了「边生成边显示」——没人看这个过程。
+        // 是为了让连接上一直有数据，闲置超时才量得出「卡住了」和「模型在慢慢想」的区别
+        ...(config.stream === false ? {} : { stream: true }),
     };
 
     const toolDef = {
@@ -253,6 +433,7 @@ async function callResponses(config: LlmConfig, spec: CallSpec, mode: CallMode):
         temperature: 0,
         instructions: spec.systemPrompt,
         input: [{ role: 'user', content: userContent }],
+        ...(config.stream === false ? {} : { stream: true }),
     };
 
     if (mode !== 'json') {
@@ -394,5 +575,7 @@ export function describeLlmConfig(): string {
     const known = knownMode(config);
     return `${config.model} @ ${config.baseUrl}`
         + `（${config.protocol === 'chat' ? 'Chat Completions' : 'Responses API'}`
-        + `${known ? ` · ${MODE_LABEL[known]}` : ''}）`;
+        + `${known ? ` · ${MODE_LABEL[known]}` : ''}`
+        + `${config.stream === false ? ' · 非流式' : ' · 流式'}`
+        + ` · 闲置超时 ${Math.round(config.timeoutMs / 1000)} 秒）`;
 }

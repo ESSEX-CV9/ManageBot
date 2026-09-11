@@ -1,16 +1,21 @@
 // src/modules/titleGuard/services/rewriter.test.ts
 //
-// 改写器测试。重点验两件事：
-//   1. 标记段改写能改对，且改完能过复核
-//   2. 「只能删字不能加字」这道安全阀确实拦得住
+// 整改方案测试。分三块：
+//   一、程序那一段：标签区和 TAG 之间的冲突，按保留顺序直接改，**绝不碰正文**
+//   二、模型那一段：删/换/留三选一落成新标题，以及校验拦不拦得住乱来的答卷
+//   三、人工那一段：作者自己敲标题时的安全阀
 
 import test from 'node:test';
 import assert from 'node:assert/strict';
 
-import { compileConfig, detect, judgeHitsOf } from './ruleEngine';
-import { buildPlan, isDeletionOnly, tidyTitle, validateNewTitle } from './rewriter';
+import { compileConfig, detect } from './ruleEngine';
+import {
+    buildPlan, isDeletionOnly, pendingHits, planProgramStage, previewTagPlan,
+    tidyTitle, validateNewTitle,
+} from './rewriter';
 import type { AppliedTag, DictEntry, GuardConfig } from './types';
 import type { Judgement } from './llmJudge';
+import type { HitDecision } from './titleEdit';
 
 function word(
     w: string,
@@ -22,6 +27,7 @@ function word(
         word: w.toLowerCase(),
         kind,
         group,
+        tier: '关联',
         scope: '全标题',
         replaceTo: null,
         asciiBoundary: /^[a-z0-9]+$/i.test(w),
@@ -29,35 +35,36 @@ function word(
     };
 }
 
+const core = (w: string, group: string) => word(w, '分类词', group, { tier: '本体' });
+
 const CONFIG: GuardConfig = {
     dict: [
-        word('纯爱', '分类词', '纯爱'),
-        word('NTR', '分类词', 'NTR'),
-        word('NTL', '分类词', 'NTL'),
+        core('纯爱', '纯爱'),
+        word('1v1', '分类词', '纯爱'),
+        core('NTR', 'NTR'),
         word('牛头人', '分类词', 'NTR'),
-        word('百合', '分类词', '百合'),
-        word('百合破坏', '分类词', '百破'),
+        word('绿帽', '分类词', 'NTR'),
+        core('NTL', 'NTL'),
+        word('黄毛', '分类词', 'NTL'),
+        core('百合', '百合'),
+        core('百合破坏', '百破'),
         word('纯爱牛', '黑名单', 'NTR', { replaceTo: 'NTR' }),
         word('多路线', '中性标记', null),
     ],
-    // 三个维度分开配。百合和百破在关键字层面不互斥（「百合破坏」本来就带「百合」两个字），
-    // 只有交叉互斥：挂了百合 TAG 就不许标题里写百破。
+    // 关键字维度必须成对配：NTR 和 NTL 在这一层是兼容的
     exclusiveSets: [
         { dimension: 'tag', groups: ['纯爱', 'NTR', 'NTL'] },
-        { dimension: 'word', groups: ['纯爱', 'NTR', 'NTL'] },
+        { dimension: 'word', groups: ['纯爱', 'NTR'] },
+        { dimension: 'word', groups: ['纯爱', 'NTL'] },
     ],
     crossExclusions: [
         { tagGroup: '百合', wordGroup: '百破' },
         { tagGroup: '纯爱', wordGroup: 'NTR' },
         { tagGroup: '纯爱', wordGroup: 'NTL' },
         { tagGroup: 'NTR', wordGroup: '纯爱' },
-        { tagGroup: 'NTR', wordGroup: 'NTL' },
         { tagGroup: 'NTL', wordGroup: '纯爱' },
-        { tagGroup: 'NTL', wordGroup: 'NTR' },
     ],
-    // 社区既定规则：NTR > NTL > 纯爱
     groupPriority: { NTR: 40, NTL: 20, 纯爱: 10 },
-    // 分词词库：测试里用几条来验证补词/拆词确实生效
     segmenterWords: [
         { word: '牛逼', action: '补词' },
         { word: '戴绿帽', action: '拆词' },
@@ -71,368 +78,298 @@ function tag(name: string, group: string | null): AppliedTag {
     return { tagId: `tag_${name}`, tagName: name, group };
 }
 
-/** 论坛里有「多路线」这个 TAG */
-const AVAILABLE: AppliedTag[] = [
-    { tagId: 'tag_多路线', tagName: '多路线', group: '多路线' },
+/** 论坛里能挂的全部 TAG */
+const FORUM_TAGS: AppliedTag[] = [
+    tag('纯爱', '纯爱'),
+    tag('NTR', 'NTR'),
+    tag('NTL', 'NTL'),
+    tag('百合', '百合'),
+    tag('多路线', '多路线'),
 ];
 
 function plan(title: string, tags: AppliedTag[], judgement?: Judgement | null) {
     const detectResult = detect({ title, tags, config: CONFIG }, compiled);
-    return buildPlan({ detectResult, tags, availableTags: AVAILABLE, compiled, judgement });
+    return buildPlan({ detectResult, tags, forumTags: FORUM_TAGS, compiled, judgement });
 }
 
-// ---------- 标记段改写 ----------
+/** 这条标题还剩哪几处要问模型（编号 1 起，和提示词里一致） */
+function pending(title: string, tags: AppliedTag[]) {
+    const detectResult = detect({ title, tags, config: CONFIG }, compiled);
+    const stage = planProgramStage({ detectResult, tags, forumTags: FORUM_TAGS, compiled });
+    return pendingHits(detectResult, stage);
+}
 
-test('改写：【NTL NTR】+ NTR TAG → 【NTR】', () => {
-    const p = plan('【NTL NTR】某某的故事', [tag('NTR', 'NTR')]);
+/** 造一份模型答卷：对每一处待定命中给同一种处理 */
+function answer(
+    title: string,
+    tags: AppliedTag[],
+    verdict: string,
+    finalTagGroups: string[],
+    decide: (word: string, index: number) => HitDecision,
+): Judgement {
+    return {
+        verdict,
+        verdictReason: '（测试用）',
+        finalTagGroups,
+        decisions: pending(title, tags).map((m, i) => decide(m.entry.word, i + 1)),
+        confidence: 'high',
+    };
+}
+
+// ============================================================
+// 一、程序那一段
+// ============================================================
+
+test('程序段：【纯爱 NTR】+ NTR TAG → 【NTR】', () => {
+    const p = plan('【纯爱 NTR】某某的故事', [tag('NTR', 'NTR')]);
     assert.equal(p.autoFixable, true);
     assert.equal(p.keepGroup, 'NTR');
-    // NTR(40) > NTL(20)，是优先级判出来的，不是「因为 TAG 挂的是 NTR」
+    // NTR(40) > 纯爱(10)，是保留顺序判出来的，不是「因为 TAG 挂的是 NTR」
     assert.equal(p.keepSource, 'priority');
     assert.equal(p.newTitle, '【NTR】某某的故事');
 });
 
-test('改写：【NTL+NTR+多路线】+ NTL TAG → 留 NTR，多路线不动', () => {
-    // TAG 挂的是 NTL，但 NTR(40) > NTL(20)，优先级说了算：
-    // 标题留 NTR，NTL 的 TAG 也一并摘掉。中性标记「多路线」不受影响。
-    const p = plan('【NTL+NTR+多路线】某某', [tag('NTL', 'NTL')]);
+test('程序段：TAG 挂错了也不影响，保留顺序说了算', () => {
+    // TAG 挂的是纯爱，但 NTR(40) > 纯爱(10)：标题留 NTR，纯爱的 TAG 一并摘掉。
+    // 中性标记「多路线」不受影响。
+    const p = plan('【纯爱+NTR+多路线】某某', [tag('纯爱', '纯爱')]);
     assert.equal(p.autoFixable, true);
     assert.equal(p.keepGroup, 'NTR');
-    assert.equal(p.newTitle, '【NTR+多路线】某某');
-    assert.deepEqual(p.removeTagIds, ['tag_NTL']);
+    assert.ok(p.newTitle.includes('多路线'), p.newTitle);
+    assert.ok(!p.newTitle.includes('纯爱'), p.newTitle);
 });
 
-test('改写：尾部标记段 某某【NTL 纯爱】+ NTL TAG', () => {
-    const p = plan('某某【NTL 纯爱】', [tag('NTL', 'NTL')]);
-    assert.equal(p.autoFixable, true);
-    assert.equal(p.newTitle, '某某【NTL】');
+test('程序段：作者自己选过就压过保留顺序', () => {
+    const detectResult = detect({
+        title: '【纯爱 NTR】某某的故事', tags: [], config: CONFIG,
+    }, compiled);
+    const p = buildPlan({
+        detectResult, tags: [], forumTags: FORUM_TAGS, compiled, authorChoice: '纯爱',
+    });
+    assert.equal(p.keepGroup, '纯爱');
+    assert.equal(p.keepSource, 'author');
+    assert.equal(p.newTitle, '【纯爱】某某的故事');
 });
 
-test('改写：黑名单词整词替换为规范写法', () => {
-    const p = plan('【纯爱牛】某某', [tag('NTR', 'NTR')]);
-    assert.equal(p.autoFixable, true);
-    assert.equal(p.newTitle, '【NTR】某某');
-});
-
-// ---------- 交叉互斥：优先级低的那边输，不管它在哪一侧 ----------
-
-/** 论坛里 TAG 齐全的场景 */
-const FULL_FORUM: AppliedTag[] = [
-    ...AVAILABLE,
-    tag('NTR', 'NTR'),
-    tag('NTL', 'NTL'),
-    tag('纯爱', '纯爱'),
-    tag('百合', '百合'),
-];
-
-function planWithForum(title: string, tags: AppliedTag[]) {
-    const detectResult = detect({ title, tags, config: CONFIG }, compiled);
-    return buildPlan({ detectResult, tags, availableTags: FULL_FORUM, compiled });
-}
-
-test('交叉互斥：输的是 TAG 那边 → 摘 TAG，标题一个字不动', () => {
-    // 标题写 NTR(40)、TAG 挂纯爱(10) → 纯爱输，而纯爱在 TAG 侧
-    const p = planWithForum('【NTR】某某', [tag('纯爱', '纯爱')]);
-    assert.equal(p.autoFixable, true);
-    assert.equal(p.newTitle, '【NTR】某某', '赢的一方在标题里，标题不该动');
-    assert.deepEqual(p.removeTagIds, ['tag_纯爱']);
-    assert.deepEqual(p.addTagIds, ['tag_NTR'], '摘完要补上和标题一致的 TAG');
-});
-
-test('交叉互斥：输的是关键字那边 → 删标题里的词，TAG 不动', () => {
-    // 反过来：标题写纯爱(10)、TAG 挂 NTR(40) → 还是纯爱输，这回纯爱在关键字侧
-    const p = planWithForum('【纯爱】某某', [tag('NTR', 'NTR')]);
-    assert.equal(p.autoFixable, true);
-    assert.equal(p.newTitle, '某某', '标题里的纯爱该被删掉');
-    assert.deepEqual(p.removeTagIds, [], 'NTR TAG 赢了，不该动');
-    assert.deepEqual(p.addTagIds, [], '被删掉的分类不该反过来补成 TAG');
-});
-
-test('交叉互斥：NTL 撞上 NTR TAG，NTL 优先级更低，删标题里的 NTL', () => {
-    const p = planWithForum('【NTL】某某的故事', [tag('NTR', 'NTR')]);
-    assert.equal(p.autoFixable, true);
-    assert.equal(p.newTitle, '某某的故事');
-    assert.deepEqual(p.removeTagIds, []);
-});
-
-test('交叉互斥：论坛里没有对应 TAG 时，摘掉输的那个就行，不硬补', () => {
-    // AVAILABLE 里只有「多路线」，没有 NTR
-    const p = plan('【NTR】某某', [tag('纯爱', '纯爱')]);
-    assert.equal(p.autoFixable, true);
-    assert.equal(p.newTitle, '【NTR】某某');
-    assert.deepEqual(p.removeTagIds, ['tag_纯爱']);
-    assert.deepEqual(p.addTagIds, []);
-});
-
-test('交叉互斥：两边优先级都没配 → 按规矩本身办，摘 TAG', () => {
-    // 百合和百破都没配优先级，规矩写的是「挂百合 TAG 就不许标题里写百破」
-    const p = planWithForum('【百合破坏】某某', [tag('百合', '百合')]);
-    assert.equal(p.autoFixable, true);
-    assert.equal(p.newTitle, '【百合破坏】某某', '标题不该动');
-    assert.deepEqual(p.removeTagIds, ['tag_百合']);
-    assert.deepEqual(p.addTagIds, [], '百破没有自己的 TAG，只摘不补');
-});
-
-test('标签区和 TAG 一致时不折腾', () => {
-    const p = planWithForum('【NTR】某某', [tag('NTR', 'NTR')]);
-    assert.equal(p.newTitle, '【NTR】某某');
-    assert.deepEqual(p.removeTagIds, []);
-    assert.deepEqual(p.addTagIds, []);
-});
-
-test('百合破坏：关键字层面不互斥，标题里并存不该动', () => {
-    const p = planWithForum('【百合/百合破坏】某某', [tag('百合', '百合')]);
-    assert.equal(p.autoFixable, true);
-    assert.equal(p.newTitle, '【百合/百合破坏】某某', '百合和百破不是互斥关键词，标题不该动');
-    assert.deepEqual(p.removeTagIds, ['tag_百合']);
-});
-
-// ---------- 定不了保留组时必须转人工 ----------
-
-// ---------- TAG 互斥：按社区优先级自动定，不再转人工 ----------
-
-test('G1：多个互斥 TAG 按优先级 NTR > NTL > 纯爱 保留', () => {
-    const p = plan('某某的故事', [tag('NTR', 'NTR'), tag('纯爱', '纯爱')]);
+test('程序段：TAG 之间打架 → 留优先级高的，补多路线', () => {
+    const p = plan('某某的故事', [tag('纯爱', '纯爱'), tag('NTR', 'NTR')]);
     assert.equal(p.autoFixable, true);
     assert.equal(p.keepGroup, 'NTR');
-    assert.equal(p.keepSource, 'priority');
+    assert.equal(p.newTitle, '某某的故事', '纯 TAG 冲突不该动标题');
     assert.deepEqual(p.removeTagIds, ['tag_纯爱']);
-});
-
-test('G1：NTL 优先于纯爱', () => {
-    const p = plan('某某的故事', [tag('NTL', 'NTL'), tag('纯爱', '纯爱')]);
-    assert.equal(p.keepGroup, 'NTL');
-    assert.deepEqual(p.removeTagIds, ['tag_纯爱']);
-});
-
-test('G1：三个都挂时留 NTR', () => {
-    const p = plan('某某', [tag('NTR', 'NTR'), tag('NTL', 'NTL'), tag('纯爱', '纯爱')]);
-    assert.equal(p.keepGroup, 'NTR');
-    assert.deepEqual(p.removeTagIds.sort(), ['tag_NTL', 'tag_纯爱']);
-});
-
-test('G1：摘掉互斥 TAG 后自动补上「多路线」TAG', () => {
-    const p = plan('某某的故事', [tag('NTR', 'NTR'), tag('纯爱', '纯爱')]);
     assert.deepEqual(p.addTagIds, ['tag_多路线']);
 });
 
-test('G1：已经挂了多路线就不重复补', () => {
-    const p = plan('某某', [tag('NTR', 'NTR'), tag('纯爱', '纯爱'), tag('多路线', '多路线')]);
+test('程序段：标签区声明 × TAG 冲突 → 标题赢，改 TAG', () => {
+    // 标题是作者一个字一个字敲的，TAG 是随手点的
+    const p = plan('【纯爱】某某的故事', [tag('NTR', 'NTR')]);
+    assert.equal(p.autoFixable, true);
+    assert.equal(p.newTitle, '【纯爱】某某的故事', '标题一个字都不该动');
+    assert.deepEqual(p.removeTagIds, ['tag_NTR']);
+    assert.deepEqual(p.addTagIds, ['tag_纯爱']);
+    assert.equal(p.keepSource, 'author');
+});
+
+test('程序段：百破关键字 × 百合 TAG → 摘掉百合 TAG，标题不动', () => {
+    // 百破没有自己的 TAG，所以只摘不补 —— 这就是「不保留 > 百合TAG」
+    const p = plan('【百合破坏】某某', [tag('百合', '百合')]);
+    assert.equal(p.autoFixable, true);
+    assert.equal(p.newTitle, '【百合破坏】某某');
+    assert.deepEqual(p.removeTagIds, ['tag_百合']);
     assert.deepEqual(p.addTagIds, []);
 });
 
-test('标题里的「多路线」三个字机器人不会替作者加', () => {
-    const p = plan('【NTL NTR】某某的故事', [tag('NTR', 'NTR'), tag('纯爱', '纯爱')]);
+test('程序段：标签区里的污染词换成规范写法', () => {
+    const p = plan('【纯爱牛】某某的故事', []);
+    assert.equal(p.autoFixable, true);
     assert.equal(p.newTitle, '【NTR】某某的故事');
-    assert.ok(!p.newTitle.includes('多路线'), '标题不该被塞进多路线');
 });
 
-test('TAG 冲突时标题也按同一个保留组改写', () => {
-    // 标题里有 NTL/NTR，TAG 挂着 NTL/纯爱。三处打架，但优先级只有一个答案：NTR。
-    const p = plan('【NTL NTR】某某', [tag('NTL', 'NTL'), tag('纯爱', '纯爱')]);
-    assert.equal(p.keepGroup, 'NTR');
-    assert.equal(p.newTitle, '【NTR】某某');
-    assert.deepEqual(p.removeTagIds.sort(), ['tag_NTL', 'tag_纯爱']);
-});
-
-test('保底：完全没有 TAG 时，按分类优先级留一个，不转人工', () => {
-    const p = plan('【NTL NTR】某某', []);
-    assert.equal(p.autoFixable, true, '有优先级就该自动改，不该卡在人工队列');
-    assert.equal(p.keepGroup, 'NTR');
-    assert.equal(p.keepSource, 'priority');
-    assert.equal(p.newTitle, '【NTR】某某');
-});
-
-test('保底：纯爱 vs NTL 无 TAG → 留 NTL（权重更高）', () => {
-    // 用户实际遇到的例子
-    const p = plan('【纯爱/NTL / 手枪卡/ 可后宫/缘之空同人二创】缘之空', []);
-    assert.equal(p.autoFixable, true);
-    assert.equal(p.keepGroup, 'NTL');
-    assert.equal(p.keepSource, 'priority');
-    assert.ok(!p.newTitle.includes('纯爱'), '纯爱应被删掉：' + p.newTitle);
-    assert.ok(p.newTitle.includes('NTL') || p.newTitle.includes('ntl'), 'NTL 应保留：' + p.newTitle);
-});
-
-test('保底：优先级没配时才真的转人工', () => {
-    const noPriority = { ...CONFIG, groupPriority: {} };
-    const c2 = compileConfig(noPriority);
-    const dr = detect({ title: '【NTL NTR】某某', tags: [], config: noPriority }, c2);
-    const p = buildPlan({ detectResult: dr, tags: [], compiled: c2 });
+test('程序段：绝不碰标题主体', () => {
+    // 标签区里凑齐了冲突，程序可以处理标签区那一半；
+    // 正文里那个「纯爱」不归它管，得留给模型
+    const p = plan('【纯爱】某某其实是ntr的故事', []);
+    assert.equal(p.awaitingModel, true, '有正文冲突时应该在等模型，而不是转人工');
     assert.equal(p.autoFixable, false);
-    assert.equal(p.keepGroup, null);
+    assert.equal(p.blockedReason, null, '等模型不是「转人工的理由」');
 });
 
-// ---------- 删的单位是整个 token，不是关键词 ----------
-
-test('改写：「可纯爱」整块删掉，不留孤零零的「可」', () => {
-    const p = plan('【乱伦/姐弟/NTL/可纯爱/隐奸】某某', [tag('NTL', 'NTL')]);
-    assert.equal(p.newTitle, '【乱伦/姐弟/NTL/隐奸】某某');
-});
-
-test('改写：「NTL？」整块删掉，不留「？」', () => {
-    // TAG 挂 NTR，标题里的 NTL 和纯爱都输给它，两个 token 整块删掉
-    const p = plan('【NTL？/纯爱/肘击】某某', [tag('NTR', 'NTR')]);
-    assert.equal(p.keepGroup, 'NTR');
-    assert.equal(p.newTitle, '【肘击】某某');
-});
-
-test('改写：标记段被删空后整个括号一起消失', () => {
-    const p = plan('【更新】【NTL/纯爱】某某', [tag('NTL', 'NTL'), tag('纯爱', '纯爱')]);
-    assert.ok(!p.newTitle.includes('【】'), '不该留下空括号：' + p.newTitle);
-});
-
-// ---------- 只能删字，不能加字 ----------
-
-test('子序列校验：删字通过', () => {
-    assert.equal(isDeletionOnly('纯爱牛头人日记', '牛头人日记'), true);
-    assert.equal(isDeletionOnly('【NTL NTR】某某', '【NTR】某某'), true);
-});
-
-test('子序列校验：加字、改字一律拦下', () => {
-    assert.equal(isDeletionOnly('纯爱牛头人日记', 'NTR牛头人日记'), false);
-    assert.equal(isDeletionOnly('牛头人日记', '牛头人的日记'), false);
-    assert.equal(isDeletionOnly('某某', '某某某'), false);
-});
-
-test('子序列校验：顺序变了也拦下', () => {
-    assert.equal(isDeletionOnly('abc定', '定cba'), false);
-});
-
-test('LLM 给了会加字的标题 → 放弃自动改，转人工', () => {
-    const bad: Judgement = {
-        falseMatches: [],
-        conflictingGroups: ['纯爱', 'NTR'],
-        suggestedKeep: 'NTR',
-        suggestedTitle: '【NTR】牛头人日记', // 凭空加了「【NTR】」
-        confidence: 'high',
-        reason: '测试用',
-    };
-    const p = plan('纯爱牛头人日记', [tag('NTR', 'NTR')], bad);
-    assert.equal(p.autoFixable, false);
-    assert.match(p.blockedReason ?? '', /校验/);
-});
-
-test('LLM 给了合法的删字标题 → 采纳', () => {
-    const good: Judgement = {
-        falseMatches: [],
-        conflictingGroups: ['纯爱', 'NTR'],
-        suggestedKeep: 'NTR',
-        suggestedTitle: '牛头人日记',
-        confidence: 'high',
-        reason: '标题无句子结构，两个分类词直接叠加',
-    };
-    const p = plan('纯爱牛头人日记', [tag('NTR', 'NTR')], good);
-    assert.equal(p.autoFixable, true);
-    assert.equal(p.newTitle, '牛头人日记');
-});
-
-test('LLM 把握低时不采纳它的保留建议，改走优先级保底', () => {
-    const unsure: Judgement = {
-        falseMatches: [],
-        conflictingGroups: ['纯爱', 'NTR'],
-        suggestedKeep: 'NTR',
-        suggestedTitle: '牛头人日记',
-        confidence: 'low',
-        reason: '拿不准',
-    };
-    const p = plan('纯爱牛头人日记', [], unsure);
-    // 不是采纳 LLM，而是按优先级——结果凑巧同为 NTR，但依据不同
-    assert.equal(p.keepSource, 'priority');
-    assert.equal(p.keepGroup, 'NTR');
-});
-
-// ---------- 模型只能否掉「误判的那几个字」 ----------
-
-test('模型说「是句子成分」不算数：百合破坏 + 百合 TAG 照样摘 TAG', () => {
-    // 关键字层面百合和百破并不互斥（「百合破坏」四个字里天然含百合），
-    // 唯一的冲突是「百合 TAG × 百破 关键字」的交叉互斥，
-    // 常规处置就是摘掉百合 TAG、标题一个字不动。
-    //
-    // 模型没有「因为整条读起来像句子所以放过」这种权力——
-    // 它只能指出某几个字在这儿不是那个意思，而这里「百合破坏」就是那个词。
-    const noFalseMatch: Judgement = {
-        falseMatches: [],
-        conflictingGroups: ['百破'],
-        suggestedKeep: null,
-        suggestedTitle: null,
-        confidence: 'high',
-        reason: '百合破坏在这儿就是那个分类词',
-    };
-    const p = plan('《真正的橘子味世界不允许百合破坏的存在！》', [tag('百合', '百合')], noFalseMatch);
-    assert.equal(p.newTitle, '《真正的橘子味世界不允许百合破坏的存在！》', '标题不该动');
-    assert.deepEqual(p.removeTagIds, ['tag_百合'], '该摘掉百合 TAG');
-    assert.equal(p.autoFixable, true);
-});
-
-test('对照组：标记段里的百合破坏 + 百合 TAG → 同样是摘 TAG', () => {
-    const p = plan('【百合破坏】某某', [tag('百合', '百合')]);
-    assert.equal(p.autoFixable, true);
-    assert.deepEqual(p.removeTagIds, ['tag_百合']);
-});
-
-test('模型标出误判命中 → 只有被标的那一处不算数，冲突跟着消失', () => {
-    // 模型是**按编号**指认误判的，编号来自 judgeHitsOf()。
-    // 这条测的是机制：标了第几处，第几处就不参与判定。
-    // 「这一处到底算不算误判」是模型的判断，不归这里管。
-    const title = '纯爱战士也逃不过NTR的结局';
-    const detectResult = detect({ title, tags: [], config: CONFIG }, compiled);
-    const hits = judgeHitsOf(detectResult);
-    const nth = hits.findIndex(h => h.entry.word === '纯爱') + 1;
-    assert.ok(nth > 0, '这条标题应该命中「纯爱」');
-    assert.ok(detectResult.violations.some(v => v.rule === 'T3'), '没标误判之前应该有关键字冲突');
-
-    const p = plan(title, [], {
-        falseMatches: [nth],
-        conflictingGroups: [],
-        suggestedKeep: null,
-        suggestedTitle: null,
-        confidence: 'high',
-        reason: '「纯爱战士」是个梗，这两个字在这儿不是分类',
+test('程序段：previewTagPlan 和真方案算的是同一份', () => {
+    const detectResult = detect({
+        title: '【纯爱】某某的故事', tags: [tag('NTR', 'NTR')], config: CONFIG,
+    }, compiled);
+    const preview = previewTagPlan({
+        detectResult, tags: [tag('NTR', 'NTR')], forumTags: FORUM_TAGS, compiled,
     });
-    // 只剩 NTR 一个分类，冲突不成立 → 什么都不用改
-    assert.equal(p.newTitle, title);
-    assert.deepEqual(p.removeTagIds, []);
-    assert.equal(p.autoFixable, true);
+    assert.deepEqual(preview.after, ['纯爱']);
+    assert.ok(preview.changes.some(c => c.includes('NTR')), preview.changes.join('；'));
 });
 
-test('模型没标误判 → 冲突照旧成立，该改还得改', () => {
-    const title = '纯爱战士也逃不过NTR的结局';
-    const p = plan(title, [], {
-        falseMatches: [],
-        conflictingGroups: ['纯爱', 'NTR'],
-        suggestedKeep: 'NTR',
-        suggestedTitle: 'NTR的结局',
+// ============================================================
+// 二、模型那一段
+// ============================================================
+
+const GREEN_HAT = '明明是绿帽癖的我，怎么会被辣妹逆推，这辈子好像只能搞纯爱了';
+
+test('模型段：正文里的关联词判成描述 → 标题一个字不改', () => {
+    // 这条是整套规范的核心用例。「绿帽癖」是在写人设，不是在给作品归类；
+    // 真正表明类型的是句尾那个「只能搞纯爱了」。
+    const tags = [tag('NTR', 'NTR')];
+    const hits = pending(GREEN_HAT, tags);
+    assert.ok(hits.length >= 2, '应该有绿帽和纯爱两处待定：'
+        + hits.map(h => h.entry.word).join('、'));
+
+    const j = answer(GREEN_HAT, tags, '纯爱', ['纯爱'], (w, i) => ({
+        hit: i,
+        action: '保留',
+        why: w === '绿帽' ? '这是在描述主角的癖好，不是给作品归类' : '本篇就是纯爱',
+    }));
+
+    const p = plan(GREEN_HAT, tags, j);
+    assert.equal(p.modelRejection, null,
+        '不该被打回：' + JSON.stringify(p.modelRejection));
+    assert.equal(p.newTitle, GREEN_HAT, '标题一个字都不该动');
+    assert.equal(p.keepGroup, '纯爱');
+    assert.equal(p.keepSource, 'llm');
+    // TAG 从 NTR 改成纯爱
+    assert.deepEqual(p.removeTagIds, ['tag_NTR']);
+    assert.deepEqual(p.addTagIds, ['tag_纯爱']);
+});
+
+test('模型段：本体词在正文里拿「只是形容词」蒙混 → 打回', () => {
+    // 老版本真实犯过的错。「纯爱」两个字只要留在标题里，搜它就一定命中，
+    // 跟它在句子里当什么成分没关系。
+    const title = '纯爱牛头人日记';
+    const tags = [tag('NTR', 'NTR')];
+    const j = answer(title, tags, 'NTR', ['NTR'], (w, i) => ({
+        hit: i,
+        action: '保留',
+        why: '这几个字在句子里只是个形容词，不算分类标记',
+    }));
+
+    const p = plan(title, tags, j);
+    assert.ok(p.modelRejection, '必须打回');
+    assert.ok(p.modelRejection.remaining.some(m => m.includes('本体词')),
+        p.modelRejection.remaining.join(' / '));
+});
+
+test('模型段：替换只动那几个字，句子结构不变', () => {
+    const title = '这辈子好像只能搞纯爱了';
+    const tags = [tag('NTR', 'NTR')];
+    const j = answer(title, tags, 'NTR', ['NTR'], (w, i) => ({
+        hit: i,
+        action: '替换',
+        replaceWith: 'NTR',
+        why: '本篇是 NTR 作品',
+    }));
+
+    const p = plan(title, tags, j);
+    assert.equal(p.modelRejection, null, JSON.stringify(p.modelRejection));
+    assert.equal(p.newTitle, '这辈子好像只能搞NTR了');
+});
+
+test('模型段：删除会连带删掉整个小句', () => {
+    const title = '某某的故事，这辈子好像只能搞纯爱了', tags = [tag('NTR', 'NTR')];
+    const j = answer(title, tags, 'NTR', ['NTR'], (w, i) => ({
+        hit: i, action: '删除', why: '本篇是 NTR 作品',
+    }));
+
+    const p = plan(title, tags, j);
+    assert.equal(p.modelRejection, null, JSON.stringify(p.modelRejection));
+    assert.ok(!p.newTitle.includes('纯爱'), p.newTitle);
+    assert.ok(p.newTitle.startsWith('某某的故事'), p.newTitle);
+});
+
+test('模型段：替换词不在词表里 → 打回，不许自己编词', () => {
+    const title = '这辈子好像只能搞纯爱了', tags = [tag('NTR', 'NTR')];
+    const j = answer(title, tags, 'NTR', ['NTR'], (w, i) => ({
+        hit: i,
+        action: '替换',
+        replaceWith: '一部温馨治愈的作品',
+        why: '换个说法',
+    }));
+
+    const p = plan(title, tags, j);
+    assert.ok(p.modelRejection, '必须打回');
+    assert.ok(p.modelRejection.remaining.some(m => m.includes('词表')),
+        p.modelRejection.remaining.join(' / '));
+});
+
+test('模型段：漏答一处 → 打回', () => {
+    const title = '纯爱牛头人日记', tags = [tag('NTR', 'NTR')];
+    const hits = pending(title, tags);
+    assert.ok(hits.length >= 2);
+
+    const j: Judgement = {
+        verdict: 'NTR',
+        verdictReason: '（测试用）',
+        finalTagGroups: ['NTR'],
+        // 只答第一处，故意漏掉其余
+        decisions: [{ hit: 1, action: '删除', why: '本篇是 NTR' }],
         confidence: 'high',
-        reason: '两个都是真的分类词',
-    });
-    assert.notEqual(p.newTitle, title, '标题该被改');
+    };
+
+    const p = plan(title, tags, j);
+    assert.ok(p.modelRejection, '必须打回');
+    assert.ok(p.modelRejection.remaining.some(m => m.includes('没给处理方式')),
+        p.modelRejection.remaining.join(' / '));
 });
 
-// ---------- 收尾清理 ----------
+test('模型段：模型定的 TAG 自己互斥 → 打回', () => {
+    const title = '某某的故事，纯爱牛头人日记', tags = [tag('NTR', 'NTR')];
+    const j = answer(title, tags, 'NTR', ['NTR', '纯爱'], (w, i) => ({
+        hit: i, action: '删除', why: '（测试用）',
+    }));
 
-test('收尾清理：空括号、连续分隔符、首尾空格', () => {
-    assert.equal(tidyTitle('【】某某'), '某某');
-    assert.equal(tidyTitle('【NTR++多路线】某某'), '【NTR+多路线】某某');
-    assert.equal(tidyTitle('【 + NTR】某某'), '【NTR】某某');
-    assert.equal(tidyTitle('  某某  '), '某某');
+    const p = plan(title, tags, j);
+    assert.ok(p.modelRejection, '必须打回');
+    assert.ok(p.modelRejection.remaining.some(m => m.includes('互斥')),
+        p.modelRejection.remaining.join(' / '));
 });
 
-// ---------- 标题校验的其余两条 ----------
+test('模型段：本论坛没有的 TAG → 打回', () => {
+    const title = '纯爱牛头人日记', tags = [tag('NTR', 'NTR')];
+    const j = answer(title, tags, '百破', ['百破'], (w, i) => ({
+        hit: i, action: '删除', why: '（测试用）',
+    }));
 
-test('校验：超长拦下', () => {
-    const long = '啊'.repeat(101);
-    const check = validateNewTitle(long, long, [], compiled, { allowAddition: true });
-    assert.equal(check.ok, false);
-    assert.match(check.reason ?? '', /超长/);
+    const p = plan(title, tags, j);
+    assert.ok(p.modelRejection, '必须打回');
+    assert.ok(p.modelRejection.remaining.some(m => m.includes('百破')),
+        p.modelRejection.remaining.join(' / '));
 });
 
-test('校验：改完仍然违规就拦下', () => {
-    const check = validateNewTitle('【NTL NTR】某某', '【NTL NTR】某某', [], compiled, { allowAddition: true });
-    assert.equal(check.ok, false);
-    assert.match(check.reason ?? '', /仍然违规/);
+// ============================================================
+// 三、人工那一段
+// ============================================================
+
+test('安全阀：只能删字不能加字', () => {
+    assert.equal(isDeletionOnly('【纯爱 NTR】某某', '【NTR】某某'), true);
+    assert.equal(isDeletionOnly('【NTL】某某', '【NTL】某某的新篇章'), false);
+    // 归一化之后比，作者顺手把全角敲成半角不该被当成加字
+    assert.equal(isDeletionOnly('【ＮＴＲ】某某', '【NTR】某某'), true);
 });
 
-test('校验：空标题拦下', () => {
-    const check = validateNewTitle('某某', '  ', [], compiled, { allowAddition: true });
-    assert.equal(check.ok, false);
+test('作者手敲的标题：仍然要过一遍检测', () => {
+    const tags = [tag('NTR', 'NTR')];
+    const bad = validateNewTitle('【纯爱 NTR】某某', '【纯爱 NTR】某某', tags, compiled);
+    assert.equal(bad.ok, false);
+
+    const good = validateNewTitle('【纯爱 NTR】某某', '【NTR】某某', tags, compiled);
+    assert.equal(good.ok, true, good.reason ?? '');
+});
+
+test('作者手敲的标题：正文里的冲突照样算数', () => {
+    // 没有模型参与，不能给「把词挪进正文就没事」留后门
+    const r = validateNewTitle(
+        '纯爱牛头人日记', '纯爱牛头人日记', [tag('NTR', 'NTR')], compiled,
+    );
+    assert.equal(r.ok, false);
+});
+
+test('收尾清理：空括号和多余分隔符', () => {
+    assert.equal(tidyTitle('【】某某的故事'), '某某的故事');
+    assert.equal(tidyTitle('【/NTR/】某某'), '【NTR】某某');
+    assert.equal(tidyTitle('【NTR//多路线】某某'), '【NTR/多路线】某某');
+    assert.equal(tidyTitle('【 NTR 】某某'), '【NTR】某某');
 });

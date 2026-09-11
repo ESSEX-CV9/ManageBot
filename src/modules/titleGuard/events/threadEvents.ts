@@ -33,7 +33,8 @@ function scheduleCheck(thread: ThreadChannel, delayMs: number): void {
 }
 
 async function checkThread(thread: ThreadChannel): Promise<void> {
-    const settings = db.getSettings(thread.guild.id);
+    const guildId = thread.guild.id;
+    const settings = db.getSettings(guildId);
     if (!settings.enabled) return;
 
     const inspection = await inspectThread(thread);
@@ -42,9 +43,15 @@ async function checkThread(thread: ThreadChannel): Promise<void> {
     const violations = effectiveViolations(inspection);
     const openCase = db.getOpenCase(thread.id);
 
+    // 帖子动过了，之前那个「已核查合格」不作数了。
+    // 下面会按最新规则重新判一次，该合格的再标回去。
+    db.unmarkClean(guildId, thread.id);
+
     // 已经合规了：关掉未结案件，并把原通知改口成「已结束」
     // （只撤按钮不够，正文还写着「请在期限前修改」）
     if (violations.length === 0) {
+        const forumId = thread.parentId;
+        if (forumId) db.markClean(guildId, forumId, [thread.id]);
         if (openCase) {
             db.closeCase(openCase.id, 'resolved');
             await refreshNotice(thread.client, openCase.id);

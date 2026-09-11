@@ -45,7 +45,9 @@ import { describeLlmConfig, summarizeJudgement } from '../services/llmJudge';
 import { cutForDebug } from '../services/wordBoundary';
 import { openConfigPanel } from '../components/configPanel';
 import { normalize } from '../services/normalizer';
-import type { DictKind, DictScope, ExclusiveDimension, SegmenterWord } from '../services/types';
+import type {
+    DictKind, DictScope, ExclusiveDimension, SegmenterWord, WordTier,
+} from '../services/types';
 
 // ============================================================
 // 权限
@@ -117,7 +119,14 @@ const data = new SlashCommandBuilder()
         .addIntegerOption(o => o.setName('老帖沉寂小时')
             .setDescription('已归档且沉寂超过多少小时算老帖（看最近回复，不看发帖时间），默认 72')
             .setMinValue(1))
-        .addIntegerOption(o => o.setName('队列间隔分钟').setDescription('老帖队列多久处理一个，默认 20').setMinValue(1)))
+        .addIntegerOption(o => o.setName('队列间隔分钟')
+            .setDescription('老帖队列多久发一个，默认 5').setMinValue(1))
+        .addIntegerOption(o => o.setName('快队列每批')
+            .setDescription('活跃帖一批最多发几条，默认 50').setMinValue(1))
+        .addIntegerOption(o => o.setName('快队列间歇分钟')
+            .setDescription('活跃帖每批之间歇多久，默认 30').setMinValue(0))
+        .addStringOption(o => o.setName('词表来源')
+            .setDescription('词表跟着哪个服务器走。填服务器ID；填 self 改回用自己的')))
 
     .addSubcommandGroup(g => g.setName('权限').setDescription('哪些身份组能干哪些事')
         .addSubcommand(s => s.setName('授予').setDescription('把一项能力发给一个身份组')
@@ -132,10 +141,12 @@ const data = new SlashCommandBuilder()
 
     .addSubcommandGroup(g => g.setName('论坛').setDescription('管哪些论坛')
         .addSubcommand(s => s.setName('添加').setDescription('把一个论坛纳入管理')
-            .addChannelOption(o => o.setName('论坛').setDescription('论坛频道').addChannelTypes(ChannelType.GuildForum).setRequired(true))
+            .addChannelOption(o => o.setName('论坛').setDescription('论坛频道（和「频道id」二选一）').addChannelTypes(ChannelType.GuildForum))
+            .addStringOption(o => o.setName('频道id').setDescription('直接填论坛频道 ID，频道太多不好翻时用'))
             .addBooleanOption(o => o.setName('正文给llm').setDescription('是否允许把首楼摘录发给 LLM（露骨内容多的论坛建议关）')))
         .addSubcommand(s => s.setName('移除').setDescription('移出管理')
-            .addChannelOption(o => o.setName('论坛').setDescription('论坛频道').addChannelTypes(ChannelType.GuildForum).setRequired(true)))
+            .addChannelOption(o => o.setName('论坛').setDescription('论坛频道（和「频道id」二选一）').addChannelTypes(ChannelType.GuildForum))
+            .addStringOption(o => o.setName('频道id').setDescription('直接填论坛频道 ID')))
         .addSubcommand(s => s.setName('列表').setDescription('列出已纳入管理的论坛')))
 
     .addSubcommandGroup(g => g.setName('词典').setDescription('维护关键词表')
@@ -149,6 +160,11 @@ const data = new SlashCommandBuilder()
                     { name: '中性标记（如多路线）', value: '中性标记' },
                 ))
             .addStringOption(o => o.setName('分类组').setDescription('归属的分类组，如 NTR'))
+            .addStringOption(o => o.setName('词档').setDescription('本体词管得严，关联词看上下文；不填保持原样')
+                .addChoices(
+                    { name: '本体词（就是大家搜的那几个字，严格处理）', value: '本体' },
+                    { name: '关联词（只是相关，写在正文里多半是描述）', value: '关联' },
+                ))
             .addStringOption(o => o.setName('替换为').setDescription('黑名单词替换成什么，如 NTR'))
             .addStringOption(o => o.setName('范围').setDescription('在哪里生效，默认全标题')
                 .addChoices(
@@ -295,9 +311,31 @@ async function handleConfig(interaction: ChatInputCommandInteraction): Promise<v
         ['老帖宽限小时', 'graceOldHours'],
         ['老帖沉寂小时', 'oldPostInactiveHours'],
         ['队列间隔分钟', 'queueIntervalMinutes'],
+        ['快队列每批', 'fastBatchSize'],
+        ['快队列间歇分钟', 'fastBatchPauseMinutes'],
     ] as const) {
         const value = o.getInteger(option);
         if (value !== null) { (patch as Record<string, unknown>)[key] = value; changed = true; }
+    }
+
+    const dictSource = o.getString('词表来源');
+    if (dictSource !== null) {
+        const trimmed = dictSource.trim();
+        const target = trimmed === '' || trimmed.toLowerCase() === 'self' || trimmed === guildId
+            ? '' : trimmed;
+        if (target && !/^\d{17,20}$/.test(target)) {
+            await interaction.reply(ephemeral('❌ 词表来源要填服务器 ID（一串数字），'
+                + '或者填 `self` 改回用本服自己的词表。'));
+            return;
+        }
+        if (target && db.listDict(target).length === 0) {
+            await interaction.reply(ephemeral(`❌ 服务器 \`${target}\` 的词表是空的。`
+                + '先去那个服务器把词表配好，再回来指过去——'
+                + '指向一个空词表等于把本服的判定全关掉。'));
+            return;
+        }
+        patch.dictSourceGuildId = target;
+        changed = true;
     }
 
     const settings = changed ? db.saveSettings(patch) : db.getSettings(guildId);
@@ -325,7 +363,21 @@ async function handleConfig(interaction: ChatInputCommandInteraction): Promise<v
                 value: `已归档且沉寂超过 ${settings.oldPostInactiveHours} 小时`,
                 inline: true,
             },
-            { name: '队列速率', value: `${settings.queueIntervalMinutes} 分钟 / 帖`, inline: true },
+            {
+                name: '队列速率',
+                value: `活跃帖 ${settings.fastBatchSize} 条/批，间歇 ${settings.fastBatchPauseMinutes} 分钟`
+                    + `
+老帖 ${settings.queueIntervalMinutes} 分钟 / 帖`,
+                inline: true,
+            },
+            {
+                name: '词表来源',
+                value: settings.dictSourceGuildId
+                    ? `跟着服务器 \`${settings.dictSourceGuildId}\` 走`
+                        + `（本服的词典指令会被拦下，去那边改）`
+                    : '本服自己的',
+                inline: true,
+            },
             { name: '队列状态', value: settings.queuePaused ? '⏸️ 已暂停' : '▶️ 运行中', inline: true },
             {
                 name: '接警身份组',
@@ -423,6 +475,64 @@ async function handlePerms(interaction: ChatInputCommandInteraction, sub: string
     await interaction.reply({ embeds: [embed], flags: MessageFlags.Ephemeral });
 }
 
+/**
+ * 从「论坛」选择器或「频道id」里拿到论坛频道。
+ *
+ * 有两件事必须拦住，否则指令会回一句 ✅ 然后什么都不发生，你根本查不出来：
+ *
+ *   1. **填的是别的服务器的频道 ID。** 论坛名单是按服务器存的，而机器人检查帖子时
+ *      是拿「帖子所在的服」去查名单的。在 A 服把 B 服的论坛加进来，记录会落在 A 服名下，
+ *      B 服的帖子永远查不到它 —— 加了等于没加。要管 B 服的论坛，就去 B 服敲这条指令。
+ *   2. 填的 ID 根本不是论坛频道。
+ */
+async function resolveForum(
+    interaction: ChatInputCommandInteraction,
+): Promise<ForumChannel | null> {
+    const picked = interaction.options.getChannel('论坛');
+    if (picked) return picked as ForumChannel;
+
+    const raw = (interaction.options.getString('频道id') ?? '').trim();
+    if (!raw) {
+        await interaction.reply(ephemeral('❌ 「论坛」和「频道id」至少要给一个。'));
+        return null;
+    }
+
+    const id = raw.replace(/[<#>]/g, '');
+    if (!/^\d{17,20}$/.test(id)) {
+        await interaction.reply(ephemeral(`❌ \`${raw}\` 不像一个频道 ID。`));
+        return null;
+    }
+
+    const channel = await interaction.client.channels.fetch(id).catch(() => null);
+    if (!channel) {
+        await interaction.reply(ephemeral(`❌ 找不到频道 \`${id}\`，`
+            + '可能是机器人不在那个服务器，或者没有查看权限。'));
+        return null;
+    }
+    if (channel.type !== ChannelType.GuildForum) {
+        await interaction.reply(ephemeral(`❌ \`${id}\` 不是论坛频道。`));
+        return null;
+    }
+
+    const forum = channel as ForumChannel;
+    if (forum.guildId !== interaction.guildId) {
+        await interaction.reply(ephemeral([
+            `❌ \`${forum.name}\` 在另一个服务器，不能从这儿加。`,
+            '',
+            '论坛名单是按服务器分开存的，机器人检查帖子时会去**帖子所在那个服**的名单里找。',
+            '从这边加进来，记录会落在本服名下，那边永远查不到 —— 加了等于没加。',
+            '',
+            '**去那个服务器敲同一条指令就行。**',
+            '词表不用重配：在那边跑一次 `/标题规范 配置 词表来源:'
+                + `${interaction.guildId}\`，两边就共用一份词表了；`,
+            '身份组和通知仍然各用各服自己的。',
+        ].join('\n')));
+        return null;
+    }
+
+    return forum;
+}
+
 async function handleForum(interaction: ChatInputCommandInteraction, sub: string): Promise<void> {
     const guildId = interaction.guildId!;
 
@@ -439,7 +549,8 @@ async function handleForum(interaction: ChatInputCommandInteraction, sub: string
         return;
     }
 
-    const forum = interaction.options.getChannel('论坛', true) as ForumChannel;
+    const forum = await resolveForum(interaction);
+    if (!forum) return;
 
     if (sub === '移除') {
         db.removeForum(guildId, forum.id);
@@ -467,6 +578,8 @@ async function handleDict(interaction: ChatInputCommandInteraction, sub: string)
         const word = interaction.options.getString('词', true);
         const kind = interaction.options.getString('类型', true) as DictKind;
         const group = interaction.options.getString('分类组');
+        // 不填就保持原样：别把管理组辛苦标好的本体词，因为改了个备注就悄悄降回关联
+        const tier = (interaction.options.getString('词档') ?? undefined) as WordTier | undefined;
         const replaceTo = interaction.options.getString('替换为');
         const scope = (interaction.options.getString('范围') ?? '全标题') as DictScope;
         const note = interaction.options.getString('备注');
@@ -476,12 +589,15 @@ async function handleDict(interaction: ChatInputCommandInteraction, sub: string)
             return;
         }
 
-        const record = db.upsertDict(guildId, { rawWord: word, kind, group, replaceTo, scope, note });
+        const record = db.upsertDict(guildId, {
+            rawWord: word, kind, group, tier, replaceTo, scope, note,
+        });
         invalidateConfigCache();
 
         await interaction.reply(ephemeral(
             `✅ 已保存词条 **${record.rawWord}**\n`
-            + `类型：${record.kind}　分类组：${record.group ?? '—'}　范围：${record.scope}\n`
+            + `类型：${record.kind}　分类组：${record.group ?? '—'}　`
+            + `词档：${record.tier}　范围：${record.scope}\n`
             + `替换为：${record.replaceTo ?? '—'}　词边界：${record.asciiBoundary ? '是' : '否'}`,
         ));
         return;
@@ -503,12 +619,17 @@ async function handleDict(interaction: ChatInputCommandInteraction, sub: string)
         }
         const byKind = new Map<string, string[]>();
         for (const d of dict) {
-            const line = `${d.rawWord}${d.group ? `→${d.group}` : ''}${d.replaceTo ? ` ⇒${d.replaceTo}` : ''}${d.enabled ? '' : '（停用）'}`;
+            // 本体词单独打个星，管理组一眼看得出哪些词是从严处理的
+            const line = `${d.tier === '本体' ? '★' : ''}${d.rawWord}`
+                + `${d.group ? `→${d.group}` : ''}${d.replaceTo ? ` ⇒${d.replaceTo}` : ''}`
+                + `${d.enabled ? '' : '（停用）'}`;
             const list = byKind.get(d.kind);
             if (list) list.push(line);
             else byKind.set(d.kind, [line]);
         }
-        const embed = new EmbedBuilder().setTitle(`📖 词典（共 ${dict.length} 条）`).setColor(0x5865f2);
+        const embed = new EmbedBuilder().setTitle(`📖 词典（共 ${dict.length} 条）`).setColor(0x5865f2)
+            .setFooter({ text: '★ = 本体词，写进标题就一定被搜到，所以从严处理；'
+                + '其余是关联词，落在正文里要结合上下文判' });
         for (const [kind, lines] of byKind) {
             embed.addFields({ name: `${kind}（${lines.length}）`, value: lines.join('、').slice(0, 1024) });
         }
@@ -526,6 +647,7 @@ async function handleDict(interaction: ChatInputCommandInteraction, sub: string)
             { header: '词', key: 'word', width: 20 },
             { header: '类型', key: 'kind', width: 12 },
             { header: '分类组', key: 'group', width: 12 },
+            { header: '词档', key: 'tier', width: 8 },
             { header: '范围', key: 'scope', width: 12 },
             { header: '替换为', key: 'replaceTo', width: 12 },
             { header: '词边界', key: 'boundary', width: 8 },
@@ -537,6 +659,7 @@ async function handleDict(interaction: ChatInputCommandInteraction, sub: string)
                 word: d.rawWord,
                 kind: d.kind,
                 group: d.group ?? '',
+                tier: d.tier,
                 scope: d.scope,
                 replaceTo: d.replaceTo ?? '',
                 boundary: d.asciiBoundary ? '是' : '否',
@@ -642,11 +765,14 @@ async function handleDict(interaction: ChatInputCommandInteraction, sub: string)
                         rawWord: word,
                         kind: (cell(2) || '分类词') as DictKind,
                         group: cell(3) || null,
-                        scope: (cell(4) || '全标题') as DictScope,
-                        replaceTo: cell(5) || null,
-                        asciiBoundary: cell(6) ? cell(6) === '是' : undefined,
-                        enabled: cell(7) ? cell(7) === '是' : true,
-                        note: cell(8) || null,
+                        // 老版本导出的文件没有「词档」这一列，留空就保持原样
+                        tier: cell(4) === '本体' ? '本体'
+                            : cell(4) === '关联' ? '关联' : undefined,
+                        scope: (cell(5) || '全标题') as DictScope,
+                        replaceTo: cell(6) || null,
+                        asciiBoundary: cell(7) ? cell(7) === '是' : undefined,
+                        enabled: cell(8) ? cell(8) === '是' : true,
+                        note: cell(9) || null,
                     });
                     imported++;
                 } catch (err) {
@@ -1096,36 +1222,44 @@ async function handleScan(interaction: ChatInputCommandInteraction): Promise<voi
             { header: '论坛', key: 'forumName', width: 18 },
             { header: '标题', key: 'title', width: 50 },
             { header: 'TAG', key: 'tags', width: 24 },
-            { header: '老帖', key: 'isOldPost', width: 8 },
+            { header: '活跃状态', key: 'activity', width: 12 },
+            { header: '处置', key: 'disposition', width: 12 },
             { header: '命中规则', key: 'rules', width: 14 },
             { header: '说明', key: 'detail', width: 50 },
-            { header: '需LLM', key: 'needsLlm', width: 8 },
             { header: '建议新标题', key: 'suggestedTitle', width: 50 },
             { header: '建议摘除TAG', key: 'removeTags', width: 20 },
-            { header: '可自动改', key: 'autoFixable', width: 10 },
             { header: '不能自动改的原因', key: 'blockedReason', width: 40 },
             { header: '作者ID', key: 'authorId', width: 22 },
             { header: '链接', key: 'threadUrl', width: 60 },
         ];
         for (const r of rows) {
-            ws.addRow({
-                ...r,
-                isOldPost: r.isOldPost ? '是' : '否',
-                needsLlm: r.needsLlm ? '是' : '否',
-                autoFixable: r.autoFixable ? '是' : '否',
-            } satisfies Record<keyof ScanRow, unknown> & Record<string, unknown>);
+            ws.addRow({ ...r } satisfies Record<keyof ScanRow, unknown> & Record<string, unknown>);
         }
         ws.getRow(1).font = { bold: true };
 
         const buffer = await wb.xlsx.writeBuffer();
-        const needsLlmCount = rows.filter(r => r.needsLlm).length;
+        const count = (pick: (r: ScanRow) => boolean) => rows.filter(pick).length;
+        const fastLane = count(r => r.activity !== '老帖');
+        const slowLane = count(r => r.activity === '老帖');
+        const settings = db.getSettings(interaction.guildId!);
 
         await interaction.editReply({
             content: `✅ 扫描完成。\n`
                 + `• 看了 **${progress.scanned}** 个帖子，跳过 ${progress.skipped} 个\n`
-                + `• 命中 **${progress.flagged}** 个，其中 ${needsLlmCount} 个需要 LLM 定性\n`
-                + `• 老帖 ${rows.filter(r => r.isOldPost).length} 个${dryRun ? '' : '（已进入慢速队列）'}\n`
-                + (dryRun ? '\n静默模式没有发任何通知、没有改任何东西。' : ''),
+                + `• 合格 **${progress.scanned - progress.skipped - progress.flagged}** 个`
+                + `${dryRun ? '' : '（已记为已核查）'}\n`
+                + `• 违规 **${progress.flagged}** 个：`
+                + `可自动整改 ${count(r => r.disposition === '可自动整改')}、`
+                + `需模型定性 ${count(r => r.disposition === '需模型定性')}、`
+                + `转人工 ${count(r => r.disposition === '转人工')}\n`
+                + `• 分队：活跃/近期归档 **${fastLane}** 个、老帖 **${slowLane}** 个\n`
+                + (dryRun
+                    ? '\n静默模式：没发任何通知、没改任何东西、也没记账。'
+                        + '\n确认这份表没问题之后，去掉 `静默:true` 再跑一次才会真动。'
+                    : `\n已入队。按当前速率：活跃那批约 `
+                        + `${Math.ceil(fastLane / Math.max(1, settings.fastBatchSize))} 批 × `
+                        + `${settings.fastBatchPauseMinutes} 分钟，`
+                        + `老帖那批约 ${Math.ceil(slowLane * settings.queueIntervalMinutes / 60)} 小时。`),
             files: [new AttachmentBuilder(Buffer.from(buffer), { name: `扫描结果_${forum.name}.xlsx` })],
         });
     } catch (err) {
@@ -1285,6 +1419,11 @@ async function handleQueue(interaction: ChatInputCommandInteraction, sub: string
  * 每组子命令需要哪项能力。列表里任意一项满足即可。
  * 键是子命令组名；没有组的（配置/检查/扫描/还原）用子命令名。
  */
+/** 这几组指令改的都是词表本身，跟着别的服走时不能在本服改 */
+const DICT_GROUPS = new Set(['词典', '分词', '互斥组']);
+/** 这些只是看看，不改东西，跟随方也放行 */
+const READ_ONLY_DICT_SUBS = new Set(['列表', '导出']);
+
 const CAPS_FOR: Record<string, GuardCapability[]> = {
     词典: ['词表'],
     分词: ['词表'],
@@ -1318,6 +1457,22 @@ const command: Command = {
             }
         } else if (!await requireCap(interaction, CAPS_FOR[group ?? sub] ?? ['设置'])) {
             return;
+        }
+
+        // 词表跟着别的服走的时候，在本服改词表是无效的——改完了也不会被用上。
+        // 不拦住的话管理组会在这儿改半天，然后发现判定一点没变，很难想到是这个原因。
+        // 只拦「写」，查看和导出照常放行（想对照一下很正常）。
+        if (DICT_GROUPS.has(group ?? '') && !READ_ONLY_DICT_SUBS.has(sub)) {
+            const source = db.getSettings(interaction.guildId!).dictSourceGuildId;
+            if (source) {
+                await interaction.reply(ephemeral([
+                    `⚠️ 本服的词表跟着服务器 \`${source}\` 走，在这儿改不生效。`,
+                    '去那个服务器改，改完两边一起生效。',
+                    '',
+                    '想让本服用自己的词表：`/标题规范 配置 词表来源:self`',
+                ].join('\n')));
+                return;
+            }
         }
 
         try {

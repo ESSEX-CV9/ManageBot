@@ -212,6 +212,18 @@ db.exec(`
     );
     CREATE INDEX IF NOT EXISTS tt_queue_pending ON tt_queue (state, enqueued_at);
 
+    -- 快扫判定为合格的帖子。
+    -- 这**只是个「还剩多少活要干」的标记**，不是缓存：
+    -- 帖子改名改 TAG 有事件兜着，重跑全量扫描时也会无视这张表一律重判，
+    -- 所以它永远不会让你漏掉东西，也就不需要做失效判断。
+    CREATE TABLE IF NOT EXISTS tt_clean (
+        guild_id   TEXT NOT NULL,
+        forum_id   TEXT NOT NULL,
+        thread_id  TEXT NOT NULL,
+        checked_at INTEGER NOT NULL,
+        PRIMARY KEY (guild_id, thread_id)
+    );
+
     -- LLM 判定缓存
     CREATE TABLE IF NOT EXISTS tt_llm_cache (
         cache_key   TEXT PRIMARY KEY,
@@ -327,6 +339,18 @@ ensureColumn('tt_cases', 'llm_review_reason', 'TEXT');
 // 免得点一下按钮就白赚一整个宽限期
 ensureColumn('tt_cases', 'paused_remaining_ms', 'INTEGER');
 ensureColumn('tt_groups', 'priority', 'INTEGER NOT NULL DEFAULT 0');
+// 队列拆成快慢两条：
+//   fast —— 活跃帖 + 近期归档帖，50 个一批，批间隔 30 分钟
+//   slow —— 老帖，默认 5 分钟一个，发通知前要先解归档
+// 老库里的排队项一律按 slow 算（当年入队的本来就只有老帖）
+ensureColumn('tt_queue', 'lane', "TEXT NOT NULL DEFAULT 'slow'");
+// 词表来源：留空 = 用自己这个服的。填别的服务器 ID = 词表跟着那个服走。
+// 只影响词表（词条/互斥/优先级/分词），身份组、论坛名单、案件、TAG 映射一律各归各的服。
+ensureColumn('tt_settings', 'dict_source_guild_id', "TEXT NOT NULL DEFAULT ''");
+// 快队列：一批最多发多少条、批与批之间隔多久。
+// 一口气把上百条通知发出去，论坛首页会被这上百个帖子全顶上来，等于刷屏。
+ensureColumn('tt_settings', 'fast_batch_size', 'INTEGER NOT NULL DEFAULT 50');
+ensureColumn('tt_settings', 'fast_batch_pause_minutes', 'INTEGER NOT NULL DEFAULT 30');
 seedWordTier();
 
 // ============================================================
@@ -402,10 +426,24 @@ export interface GuardSettings {
     llmEnabled: boolean;
     /** LLM 判出的违规是否需要管理组点确认才执行 */
     llmNeedsConfirm: boolean;
+    /** 慢队列（老帖）多少分钟发一个 */
     queueIntervalMinutes: number;
+    /** 快队列（活跃帖 + 近期归档帖）一批最多发多少条 */
+    fastBatchSize: number;
+    /** 快队列每批之间歇多少分钟 */
+    fastBatchPauseMinutes: number;
     queuePaused: boolean;
     /** 「多路线」这个中性 TAG 对应的分类组名。空 = 不自动补多路线 TAG */
     multiRouteGroup: string;
+    /**
+     * 词表跟着哪个服务器走。空 = 用自己这个服的。
+     *
+     * 分类规范（词条、互斥规则、优先级、分词）是**整个社区一套**，
+     * 两个服理应完全一致，维护两份迟早跑偏。
+     * 而身份组、论坛名单、案件、TAG 映射是每个服自己的事，一律不共享——
+     * 尤其身份组：A 服的身份组 ID 贴到 B 服的帖子里会显示成一串坏掉的编号。
+     */
+    dictSourceGuildId: string;
 }
 
 const DEFAULT_SETTINGS: Omit<GuardSettings, 'guildId'> = {
@@ -418,9 +456,12 @@ const DEFAULT_SETTINGS: Omit<GuardSettings, 'guildId'> = {
     autoFixEnabled: false,
     llmEnabled: true,
     llmNeedsConfirm: true,
-    queueIntervalMinutes: 20,
+    queueIntervalMinutes: 5,
+    fastBatchSize: 50,
+    fastBatchPauseMinutes: 30,
     queuePaused: false,
     multiRouteGroup: '多路线',
+    dictSourceGuildId: '',
 };
 
 interface SettingsRow {
@@ -435,6 +476,9 @@ interface SettingsRow {
     llm_enabled: number;
     llm_needs_confirm: number;
     queue_interval_minutes: number;
+    fast_batch_size: number;
+    fast_batch_pause_minutes: number;
+    dict_source_guild_id: string | null;
     queue_paused: number;
     multi_route_group: string;
 }
@@ -456,6 +500,9 @@ export function getSettings(guildId: string): GuardSettings {
         llmEnabled: Boolean(row.llm_enabled),
         llmNeedsConfirm: Boolean(row.llm_needs_confirm),
         queueIntervalMinutes: row.queue_interval_minutes,
+        fastBatchSize: row.fast_batch_size,
+        fastBatchPauseMinutes: row.fast_batch_pause_minutes,
+        dictSourceGuildId: row.dict_source_guild_id ?? '',
         queuePaused: Boolean(row.queue_paused),
         multiRouteGroup: row.multi_route_group || DEFAULT_SETTINGS.multiRouteGroup,
     };
@@ -466,12 +513,14 @@ const upsertSettingsStmt = db.prepare(`
         guild_id, enabled, alert_role_ids, alert_channel_id,
         grace_new_hours, grace_old_hours, old_post_inactive_hours,
         auto_fix_enabled, llm_enabled, llm_needs_confirm,
-        queue_interval_minutes, queue_paused, multi_route_group, updated_at
+        queue_interval_minutes, fast_batch_size, fast_batch_pause_minutes,
+        queue_paused, multi_route_group, dict_source_guild_id, updated_at
     ) VALUES (
         @guild_id, @enabled, @alert_role_ids, @alert_channel_id,
         @grace_new_hours, @grace_old_hours, @old_post_inactive_hours,
         @auto_fix_enabled, @llm_enabled, @llm_needs_confirm,
-        @queue_interval_minutes, @queue_paused, @multi_route_group, @updated_at
+        @queue_interval_minutes, @fast_batch_size, @fast_batch_pause_minutes,
+        @queue_paused, @multi_route_group, @dict_source_guild_id, @updated_at
     )
     ON CONFLICT(guild_id) DO UPDATE SET
         enabled = excluded.enabled,
@@ -484,6 +533,9 @@ const upsertSettingsStmt = db.prepare(`
         llm_enabled = excluded.llm_enabled,
         llm_needs_confirm = excluded.llm_needs_confirm,
         queue_interval_minutes = excluded.queue_interval_minutes,
+        fast_batch_size = excluded.fast_batch_size,
+        fast_batch_pause_minutes = excluded.fast_batch_pause_minutes,
+        dict_source_guild_id = excluded.dict_source_guild_id,
         queue_paused = excluded.queue_paused,
         multi_route_group = excluded.multi_route_group,
         updated_at = excluded.updated_at
@@ -503,6 +555,9 @@ export function saveSettings(patch: Partial<GuardSettings> & { guildId: string }
         llm_enabled: merged.llmEnabled ? 1 : 0,
         llm_needs_confirm: merged.llmNeedsConfirm ? 1 : 0,
         queue_interval_minutes: merged.queueIntervalMinutes,
+        fast_batch_size: merged.fastBatchSize,
+        fast_batch_pause_minutes: merged.fastBatchPauseMinutes,
+        dict_source_guild_id: merged.dictSourceGuildId,
         queue_paused: merged.queuePaused ? 1 : 0,
         multi_route_group: merged.multiRouteGroup,
         updated_at: Date.now(),
@@ -908,17 +963,33 @@ export function touchTagMapping(
  * 把库里的词典 + 互斥集合 + 禁令组装成引擎能吃的配置。
  * 词典和互斥集合都不内置默认值——库里是空的就等于不管任何词。
  */
+/**
+ * 词表实际该从哪个服务器读。
+ *
+ * 只跳一层，不做链式解析：A→B→C 这种配法解析起来要防环，
+ * 而且没人真的需要，配错了还很难看出来。B 要是自己也指向别人，就当它没指。
+ */
+export function dictSourceOf(guildId: string): string {
+    const source = getSettings(guildId).dictSourceGuildId.trim();
+    if (!source || source === guildId) return guildId;
+    return source;
+}
+
 export function buildGuardConfig(guildId: string): GuardConfig {
-    const dict = (listEnabledDictStmt.all(guildId) as DictRow[]).map(toDict);
+    // 词条、互斥、优先级、分词都跟着来源服走；
+    // 「多路线」用哪个 TAG 是本服自己的事（TAG ID 按服务器分），所以读本服的
+    const src = dictSourceOf(guildId);
+
+    const dict = (listEnabledDictStmt.all(src) as DictRow[]).map(toDict);
     const groupPriority: Record<string, number> = {};
-    for (const g of listGroups(guildId)) groupPriority[g.groupId] = g.priority;
+    for (const g of listGroups(src)) groupPriority[g.groupId] = g.priority;
 
     return {
         dict,
-        exclusiveSets: listExclusiveSets(guildId)
+        exclusiveSets: listExclusiveSets(src)
             .map(s => ({ dimension: s.dimension, groups: s.groups })),
-        crossExclusions: listCrossExclusions(guildId),
-        segmenterWords: listSegmenterWords(guildId),
+        crossExclusions: listCrossExclusions(src),
+        segmenterWords: listSegmenterWords(src),
         groupPriority,
         multiRouteGroup: getSettings(guildId).multiRouteGroup || null,
     };
@@ -1326,22 +1397,31 @@ export function listExempt(guildId: string, limit = 50): {
 // 老帖队列
 // ============================================================
 
+/** 走哪条队列。见迁移处的说明 */
+export type QueueLane = 'fast' | 'slow';
+
 export interface QueueItem {
     guildId: string;
     forumId: string;
     threadId: string;
+    lane: QueueLane;
     state: string;
     attempts: number;
     lastError: string | null;
 }
 
 const enqueueStmt = db.prepare(`
-    INSERT INTO tt_queue (guild_id, forum_id, thread_id, state, enqueued_at)
-    VALUES (?, ?, ?, 'pending', ?)
-    ON CONFLICT(guild_id, thread_id) DO NOTHING
+    INSERT INTO tt_queue (guild_id, forum_id, thread_id, lane, state, enqueued_at)
+    VALUES (?, ?, ?, ?, 'pending', ?)
+    ON CONFLICT(guild_id, thread_id) DO UPDATE SET
+        lane = excluded.lane
+    WHERE tt_queue.state = 'pending'
 `);
 const nextQueueStmt = db.prepare(`
-    SELECT * FROM tt_queue WHERE state = 'pending' ORDER BY enqueued_at LIMIT 1
+    SELECT * FROM tt_queue WHERE state = 'pending' AND lane = ? ORDER BY enqueued_at LIMIT 1
+`);
+const pendingCountStmt = db.prepare(`
+    SELECT COUNT(*) AS c FROM tt_queue WHERE guild_id = ? AND state = 'pending' AND lane = ?
 `);
 const finishQueueStmt = db.prepare(`
     UPDATE tt_queue SET state = ?, attempts = attempts + 1, last_error = ?, processed_at = ?
@@ -1352,13 +1432,15 @@ const queueStatsStmt = db.prepare(`
 `);
 const clearQueueStmt = db.prepare('DELETE FROM tt_queue WHERE guild_id = ?');
 
-export function enqueueBackfill(guildId: string, forumId: string, threadId: string): void {
-    enqueueStmt.run(guildId, forumId, threadId, Date.now());
+export function enqueueBackfill(
+    guildId: string, forumId: string, threadId: string, lane: QueueLane = 'slow',
+): void {
+    enqueueStmt.run(guildId, forumId, threadId, lane, Date.now());
 }
 
-export function nextBackfillItem(): QueueItem | null {
-    const row = nextQueueStmt.get() as {
-        guild_id: string; forum_id: string; thread_id: string;
+export function nextBackfillItem(lane: QueueLane): QueueItem | null {
+    const row = nextQueueStmt.get(lane) as {
+        guild_id: string; forum_id: string; thread_id: string; lane: string;
         state: string; attempts: number; last_error: string | null;
     } | undefined;
     if (!row) return null;
@@ -1366,10 +1448,16 @@ export function nextBackfillItem(): QueueItem | null {
         guildId: row.guild_id,
         forumId: row.forum_id,
         threadId: row.thread_id,
+        lane: row.lane === 'fast' ? 'fast' : 'slow',
         state: row.state,
         attempts: row.attempts,
         lastError: row.last_error,
     };
+}
+
+/** 某条队列还排着多少个 */
+export function pendingCount(guildId: string, lane: QueueLane): number {
+    return (pendingCountStmt.get(guildId, lane) as { c: number }).c;
 }
 
 export function finishBackfillItem(
@@ -1385,6 +1473,45 @@ export function backfillStats(guildId: string): Record<string, number> {
 
 export function clearBackfill(guildId: string): void {
     clearQueueStmt.run(guildId);
+}
+
+// ============================================================
+// 已核查合格
+// ============================================================
+
+const markCleanStmt = db.prepare(`
+    INSERT INTO tt_clean (guild_id, forum_id, thread_id, checked_at)
+    VALUES (?, ?, ?, ?)
+    ON CONFLICT(guild_id, thread_id) DO UPDATE SET
+        forum_id = excluded.forum_id,
+        checked_at = excluded.checked_at
+`);
+const unmarkCleanStmt = db.prepare('DELETE FROM tt_clean WHERE guild_id = ? AND thread_id = ?');
+const cleanCountStmt = db.prepare('SELECT COUNT(*) AS c FROM tt_clean WHERE guild_id = ?');
+const clearCleanStmt = db.prepare('DELETE FROM tt_clean WHERE guild_id = ?');
+
+/** 批量记账。一次事务，两万条也就一眨眼 */
+export const markClean = db.transaction(
+    (guildId: string, forumId: string, threadIds: string[]) => {
+        const now = Date.now();
+        for (const id of threadIds) markCleanStmt.run(guildId, forumId, id, now);
+    },
+);
+
+/**
+ * 帖子有变动就把「合格」撤掉。
+ * 改名、改 TAG、重新建案时都要调，否则管理组看到的「还剩多少活」是错的。
+ */
+export function unmarkClean(guildId: string, threadId: string): void {
+    unmarkCleanStmt.run(guildId, threadId);
+}
+
+export function cleanCount(guildId: string): number {
+    return (cleanCountStmt.get(guildId) as { c: number }).c;
+}
+
+export function clearClean(guildId: string): void {
+    clearCleanStmt.run(guildId);
 }
 
 // ============================================================

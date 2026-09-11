@@ -40,6 +40,8 @@ const toEntry = (e: any): DictEntry => {
     const tier: WordTier = e.tier === '本体' || CORE_WORDS.includes(word) ? '本体' : '关联';
     return {
         word,
+        // 种子文件里的写法就是原始写法，显示和写回标题都用它
+        rawWord: String(e.word).trim(),
         kind: e.kind,
         group: e.kind === '白名单' ? null : (e.group || null),
         tier,
