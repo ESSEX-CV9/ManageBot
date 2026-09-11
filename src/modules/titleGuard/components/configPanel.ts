@@ -57,11 +57,18 @@ const BTN_PERMS = `${P}:perms`;
 const BTN_FORUMS = `${P}:forums`;
 const BTN_TIMING = `${P}:timing`;
 const BTN_TOGGLE = `${P}:tog`;      // tt_cfg:tog:<key>
-const BTN_EDIT_TIME = `${P}:time`;
+const BTN_DICT = `${P}:dict`;
+// 期限和队列拆成两个弹窗：Discord 一个弹窗最多五个输入框，六项塞不下；
+// 而且这两组东西本来就是两回事，分开填也更好懂
+const BTN_EDIT_GRACE = `${P}:grace`;
+const BTN_EDIT_QUEUE = `${P}:queue`;
+const BTN_EDIT_DICTSRC = `${P}:dictsrc`;
 const SEL_CAP = `${P}:cap`;         // 选哪一项能力
 const SEL_ROLES = `${P}:roles`;     // tt_cfg:roles:<capability>
 const SEL_FORUMS = `${P}:forumsel`;
-const MODAL_TIME = `${P}:timemodal`;
+const MODAL_GRACE = `${P}:gracemodal`;
+const MODAL_QUEUE = `${P}:queuemodal`;
+const MODAL_DICTSRC = `${P}:dictsrcmodal`;
 
 // ============================================================
 // 权限判定
@@ -88,11 +95,27 @@ async function denied(
 // 首页
 // ============================================================
 
+/**
+ * 按当前速率，队列里这些还要跑多久。管理组最常问的就是这个。
+ * 两条队列是并行跑的，所以取较慢那条，不是相加。
+ */
+function queueEta(s: db.GuardSettings, fast: number, slow: number): string {
+    const fastBatches = Math.ceil(fast / Math.max(1, s.fastBatchSize));
+    const fastMin = Math.max(0, fastBatches - 1) * s.fastBatchPauseMinutes;
+    const slowMin = slow * s.queueIntervalMinutes;
+    const total = Math.max(fastMin, slowMin);
+    if (total < 60) return `${total} 分钟`;
+    if (total < 60 * 48) return `${Math.round(total / 60)} 小时`;
+    return `${Math.round(total / 60 / 24)} 天`;
+}
+
 function homeView(guildId: string): { embeds: EmbedBuilder[]; components: ActionRowBuilder<ButtonBuilder>[] } {
     const s = db.getSettings(guildId);
     const forums = db.listForums(guildId);
-    const dict = db.listDict(guildId);
+    const dict = db.listDict(db.dictSourceOf(guildId));
     const open = db.listOpenCases(guildId, 100);
+    const fast = db.pendingCount(guildId, 'fast');
+    const slow = db.pendingCount(guildId, 'slow');
 
     const yn = (v: boolean) => (v ? '✅ 开' : '⭕ 关');
 
@@ -103,22 +126,46 @@ function homeView(guildId: string): { embeds: EmbedBuilder[]; components: Action
         .addFields(
             {
                 name: '开关',
-                value: `总开关 ${yn(s.enabled)}　自动整改 ${yn(s.autoFixEnabled)}\n`
-                    + `语义判定 ${yn(s.llmEnabled)}　判定需确认 ${yn(s.llmNeedsConfirm)}\n`
-                    + `老帖队列 ${s.queuePaused ? '⏸ 暂停' : '▶ 运行中'}`,
+                value: [
+                    `总开关 ${yn(s.enabled)}　自动整改 ${yn(s.autoFixEnabled)}`,
+                    `语义判定 ${yn(s.llmEnabled)}　判定需确认 ${yn(s.llmNeedsConfirm)}`,
+                    `整改队列 ${s.queuePaused ? '⏸ 暂停' : '▶ 运行中'}`,
+                ].join('\n'),
                 inline: true,
             },
             {
                 name: '时限',
-                value: `活帖宽限 ${s.graceNewHours} 小时\n`
-                    + `老帖宽限 ${s.graceOldHours} 小时\n`
-                    + `沉寂 ${s.oldPostInactiveHours} 小时算老帖\n`
-                    + `队列 ${s.queueIntervalMinutes} 分钟一个`,
+                value: [
+                    `活帖宽限 ${s.graceNewHours} 小时`,
+                    `老帖宽限 ${s.graceOldHours} 小时`,
+                    `沉寂 ${s.oldPostInactiveHours} 小时算老帖`,
+                ].join('\n'),
+                inline: true,
+            },
+            {
+                name: '队列速率',
+                value: [
+                    `活跃帖 ${s.fastBatchSize} 条/批，歇 ${s.fastBatchPauseMinutes} 分`,
+                    `老　帖 ${s.queueIntervalMinutes} 分钟一个`,
+                ].join('\n'),
                 inline: true,
             },
             {
                 name: '规模',
-                value: `纳管论坛 ${forums.length} 个\n词条 ${dict.length} 条\n未结案件 ${open.length} 件`,
+                value: [
+                    `纳管论坛 ${forums.length} 个`,
+                    `词条 ${dict.length} 条${s.dictSourceGuildId ? '（借用别服的）' : ''}`,
+                    `已核查合格 ${db.cleanCount(guildId)} 个`,
+                ].join('\n'),
+                inline: true,
+            },
+            {
+                name: '待办',
+                value: [
+                    `未结案件 ${open.length} 件`,
+                    `排队中：活跃 ${fast} 个 / 老帖 ${slow} 个`,
+                    fast + slow > 0 ? `预计跑完还要 ${queueEta(s, fast, slow)}` : '队列是空的',
+                ].join('\n'),
                 inline: true,
             },
         )
@@ -128,6 +175,7 @@ function homeView(guildId: string): { embeds: EmbedBuilder[]; components: Action
         new ButtonBuilder().setCustomId(BTN_PERMS).setLabel('权限').setStyle(ButtonStyle.Primary).setEmoji('🔑'),
         new ButtonBuilder().setCustomId(BTN_FORUMS).setLabel('论坛').setStyle(ButtonStyle.Primary).setEmoji('📋'),
         new ButtonBuilder().setCustomId(BTN_TIMING).setLabel('时间与开关').setStyle(ButtonStyle.Primary).setEmoji('⏱️'),
+        new ButtonBuilder().setCustomId(BTN_DICT).setLabel('词表').setStyle(ButtonStyle.Primary).setEmoji('📖'),
     );
 
     return { embeds: [embed], components: [row] };
@@ -254,15 +302,25 @@ function timingView(guildId: string) {
         .addFields(
             {
                 name: '处理期限',
-                value: `**活帖** ${s.graceNewHours} 小时　**老帖** ${s.graceOldHours} 小时\n`
-                    + `**老帖门槛**：已归档且沉寂超过 ${s.oldPostInactiveHours} 小时\n`
-                    + `**老帖队列**：${s.queueIntervalMinutes} 分钟处理一个`,
+                value: [
+                    `**活帖** ${s.graceNewHours} 小时　**老帖** ${s.graceOldHours} 小时`,
+                    `**老帖门槛**：已归档且沉寂超过 ${s.oldPostInactiveHours} 小时`,
+                ].join('\n'),
             },
             {
-                name: '这几个时长是干什么的',
-                value: '没归档的帖子、以及刚沉下去不久的帖子，都按**活帖**给宽限。\n'
-                    + '沉得够久的才算老帖——给它发通知一定会顶帖，'
-                    + '所以要给足时间、并且靠队列慢慢来，不然论坛首页会被老帖刷屏。',
+                name: '队列速率',
+                value: [
+                    `**活跃帖 + 近期归档**：一批 ${s.fastBatchSize} 条，然后歇 ${s.fastBatchPauseMinutes} 分钟`,
+                    `**老帖**：${s.queueIntervalMinutes} 分钟一个`,
+                ].join('\n'),
+            },
+            {
+                name: '这些数是干什么的',
+                value: '没归档的帖子、以及刚沉下去不久的帖子，都按**活帖**给宽限，走快队列。\n'
+                    + '沉得够久的才算老帖——给它发通知要先解归档，而且一定会顶帖，'
+                    + '所以给足时间、走慢队列。\n'
+                    + '两条队列都要限速，因为**发消息就会顶帖**：一口气发几百条，'
+                    + '论坛首页会被这几百个帖子全顶上来。',
             },
         );
 
@@ -281,8 +339,74 @@ function timingView(guildId: string) {
         components: [
             ...toggleRows,
             new ActionRowBuilder<ButtonBuilder>().addComponents(
-                new ButtonBuilder().setCustomId(BTN_EDIT_TIME).setLabel('改时长').setStyle(ButtonStyle.Primary).setEmoji('✏️'),
+                new ButtonBuilder().setCustomId(BTN_EDIT_GRACE).setLabel('改期限').setStyle(ButtonStyle.Primary).setEmoji('⏳'),
+                new ButtonBuilder().setCustomId(BTN_EDIT_QUEUE).setLabel('改队列速率').setStyle(ButtonStyle.Primary).setEmoji('🐢'),
                 new ButtonBuilder().setCustomId(BTN_HOME).setLabel('返回').setStyle(ButtonStyle.Secondary).setEmoji('◀️'),
+            ),
+        ],
+    };
+}
+
+// ============================================================
+// 词表页
+// ============================================================
+
+/**
+ * 词表这一页**不提供逐条编辑**，只管「这个服用谁的词表」。
+ *
+ * 逐条改词用指令；要动几十条就导出 xlsx 改完再导入——
+ * 在 Discord 面板里一条一条点，比敲指令还慢。
+ */
+function dictView(guildId: string) {
+    const source = db.dictSourceOf(guildId);
+    const borrowed = source !== guildId;
+    const dict = db.listDict(source);
+    const core = dict.filter(d => d.tier === '本体');
+    const sets = db.listExclusiveSets(source);
+    const cross = db.listCrossExclusions(source);
+
+    const embed = new EmbedBuilder()
+        .setTitle('📖 词表')
+        .setColor(borrowed ? 0xfaa61a : 0x5865f2)
+        .addFields(
+            {
+                name: '来源',
+                value: borrowed
+                    ? `跟着服务器 \`${source}\` 走。`
+                        + `**在本服改词表不生效**，要改去那个服务器改，改完两边一起变。`
+                    : '本服自己的。',
+            },
+            {
+                name: '规模',
+                value: [
+                    `词条 ${dict.length} 条，其中本体词 ${core.length} 个`,
+                    `互斥集合 ${sets.length} 组，交叉互斥 ${cross.length} 条`,
+                ].join('\n'),
+            },
+            {
+                name: '本体词',
+                value: core.length > 0
+                    ? core.map(d => d.rawWord).join('、').slice(0, 1024)
+                    : '_一个都没标。_ 本体词是大家真的会打进搜索框的那几个分类名，'
+                        + '它们在正文里也从严处理；其余是关联词，落在正文里要结合上下文判。',
+            },
+            {
+                name: '怎么改词条',
+                value: [
+                    '改一两条：`/标题规范 词典 添加` / `删除`',
+                    '改一大批：`/标题规范 词典 导出` → 在 Excel 里改（含「词档」列）→ `导入`',
+                ].join('\n'),
+            },
+        );
+
+    return {
+        embeds: [embed],
+        components: [
+            new ActionRowBuilder<ButtonBuilder>().addComponents(
+                new ButtonBuilder().setCustomId(BTN_EDIT_DICTSRC)
+                    .setLabel('改词表来源').setStyle(ButtonStyle.Primary).setEmoji('🔗'),
+                new ButtonBuilder().setCustomId(BTN_HOME)
+                    .setLabel('返回').setStyle(ButtonStyle.Secondary).setEmoji('◀️'),
             ),
         ],
     };
@@ -340,6 +464,10 @@ export async function handleConfigButton(interaction: ButtonInteraction): Promis
         await interaction.update(timingView(guildId));
         return true;
     }
+    if (interaction.customId === BTN_DICT) {
+        await interaction.update(dictView(guildId));
+        return true;
+    }
 
     if (interaction.customId.startsWith(BTN_TOGGLE)) {
         if (!hasCapability(memberOf(interaction), guildId, '设置')) {
@@ -356,9 +484,9 @@ export async function handleConfigButton(interaction: ButtonInteraction): Promis
         return true;
     }
 
-    if (interaction.customId === BTN_EDIT_TIME) {
+    if (interaction.customId === BTN_EDIT_GRACE || interaction.customId === BTN_EDIT_QUEUE) {
         if (!hasCapability(memberOf(interaction), guildId, '设置')) {
-            await denied(interaction, '改时长需要「设置」权限。');
+            await denied(interaction, '改这些需要「设置」权限。');
             return true;
         }
         const s = db.getSettings(guildId);
@@ -371,11 +499,36 @@ export async function handleConfigButton(interaction: ButtonInteraction): Promis
             );
 
         await interaction.showModal(
-            new ModalBuilder().setCustomId(MODAL_TIME).setTitle('改时长').addComponents(
-                field('graceNew', '活帖宽限（小时）', s.graceNewHours, '默认 24'),
-                field('graceOld', '老帖宽限（小时）', s.graceOldHours, '默认 168'),
-                field('inactive', '沉寂多少小时算老帖', s.oldPostInactiveHours, '默认 72'),
-                field('queue', '老帖队列间隔（分钟）', s.queueIntervalMinutes, '默认 20'),
+            interaction.customId === BTN_EDIT_GRACE
+                ? new ModalBuilder().setCustomId(MODAL_GRACE).setTitle('改期限').addComponents(
+                    field('graceNew', '活帖宽限（小时）', s.graceNewHours, '默认 24'),
+                    field('graceOld', '老帖宽限（小时）', s.graceOldHours, '默认 168'),
+                    field('inactive', '沉寂多少小时算老帖', s.oldPostInactiveHours, '默认 48'),
+                )
+                : new ModalBuilder().setCustomId(MODAL_QUEUE).setTitle('改队列速率').addComponents(
+                    field('fastSize', '活跃帖：一批发几条', s.fastBatchSize, '默认 50'),
+                    field('fastPause', '活跃帖：每批歇几分钟', s.fastBatchPauseMinutes, '默认 30'),
+                    field('slowGap', '老帖：几分钟发一个', s.queueIntervalMinutes, '默认 5'),
+                ),
+        );
+        return true;
+    }
+
+    if (interaction.customId === BTN_EDIT_DICTSRC) {
+        if (!hasCapability(memberOf(interaction), guildId, '设置')) {
+            await denied(interaction, '改词表来源需要「设置」权限。');
+            return true;
+        }
+        await interaction.showModal(
+            new ModalBuilder().setCustomId(MODAL_DICTSRC).setTitle('词表来源').addComponents(
+                new ActionRowBuilder<TextInputBuilder>().addComponents(
+                    new TextInputBuilder()
+                        .setCustomId('source')
+                        .setLabel('跟着哪个服务器的词表走')
+                        .setValue(db.getSettings(guildId).dictSourceGuildId)
+                        .setPlaceholder('填服务器 ID；留空 = 用本服自己的')
+                        .setStyle(TextInputStyle.Short).setRequired(false).setMaxLength(20),
+                ),
             ),
         );
         return true;
@@ -458,47 +611,94 @@ export async function handleConfigSelect(interaction: AnySelectMenuInteraction):
 // 模态框
 // ============================================================
 
+const MODALS = new Set([MODAL_GRACE, MODAL_QUEUE, MODAL_DICTSRC]);
+
 export async function handleConfigModal(interaction: ModalSubmitInteraction): Promise<boolean> {
-    if (interaction.customId !== MODAL_TIME) return false;
+    if (!MODALS.has(interaction.customId)) return false;
     const guildId = interaction.guildId!;
 
     if (!hasCapability(memberOf(interaction), guildId, '设置')) {
-        await denied(interaction, '改时长需要「设置」权限。');
+        await denied(interaction, '改这些需要「设置」权限。');
         return true;
     }
 
-    const num = (id: string): number | null => {
+    const ok = (text: string) =>
+        interaction.reply({ content: text, flags: MessageFlags.Ephemeral });
+    const bad = (text: string) =>
+        interaction.reply({ content: `❌ ${text}`, flags: MessageFlags.Ephemeral });
+
+    // ---------- 词表来源 ----------
+    if (interaction.customId === MODAL_DICTSRC) {
+        const raw = interaction.fields.getTextInputValue('source').trim();
+        const target = raw === '' || raw === guildId ? '' : raw;
+
+        if (target && !/^\d{17,20}$/.test(target)) {
+            await bad('要填服务器 ID（一串 17~20 位数字），或者留空改回用本服自己的词表。');
+            return true;
+        }
+        // 指过去的词表要是空的，等于把本服的判定整个关掉，而且不会有任何报错。必须当场拦住
+        if (target && db.listDict(target).length === 0) {
+            await bad(`服务器 \`${target}\` 的词表是空的，指过去等于把本服的判定全关了。`
+                + '先去那个服务器把词表配好再回来。');
+            return true;
+        }
+
+        db.saveSettings({ guildId, dictSourceGuildId: target });
+        invalidateConfigCache();
+        await ok(target
+            ? `✅ 本服词表改为跟着服务器 \`${target}\` 走。`
+                + '之后在本服敲词典指令会被拦下，提示你去那个服务器改。'
+            : '✅ 本服改回使用自己的词表。');
+        return true;
+    }
+
+    // ---------- 数值类 ----------
+    const num = (id: string, min: number): number | null => {
         const n = Number(interaction.fields.getTextInputValue(id).trim());
-        return Number.isFinite(n) && n >= 1 ? Math.trunc(n) : null;
+        return Number.isFinite(n) && n >= min ? Math.trunc(n) : null;
     };
 
-    const graceNew = num('graceNew');
-    const graceOld = num('graceOld');
-    const inactive = num('inactive');
-    const queue = num('queue');
+    if (interaction.customId === MODAL_GRACE) {
+        const graceNew = num('graceNew', 1);
+        const graceOld = num('graceOld', 1);
+        const inactive = num('inactive', 1);
 
-    if (graceNew === null || graceOld === null || inactive === null || queue === null) {
-        await interaction.reply({
-            content: '❌ 四个都得填**不小于 1 的整数**，没有一项被保存。',
-            flags: MessageFlags.Ephemeral,
+        // 全有全无：只存一半会留下一份自相矛盾的配置，比报错难查得多
+        if (graceNew === null || graceOld === null || inactive === null) {
+            await bad('三个都得填**不小于 1 的整数**，一项都没保存。');
+            return true;
+        }
+
+        db.saveSettings({
+            guildId,
+            graceNewHours: graceNew,
+            graceOldHours: graceOld,
+            oldPostInactiveHours: inactive,
         });
+        invalidateConfigCache();
+        await ok(`✅ 已保存：活帖 ${graceNew} 小时 · 老帖 ${graceOld} 小时 · `
+            + `沉寂 ${inactive} 小时算老帖。（面板点「返回」刷新）`);
+        return true;
+    }
+
+    // MODAL_QUEUE
+    const fastSize = num('fastSize', 1);
+    const fastPause = num('fastPause', 0);
+    const slowGap = num('slowGap', 1);
+
+    if (fastSize === null || fastPause === null || slowGap === null) {
+        await bad('每批条数和老帖间隔要**不小于 1**，间歇分钟可以填 0，一项都没保存。');
         return true;
     }
 
     db.saveSettings({
         guildId,
-        graceNewHours: graceNew,
-        graceOldHours: graceOld,
-        oldPostInactiveHours: inactive,
-        queueIntervalMinutes: queue,
+        fastBatchSize: fastSize,
+        fastBatchPauseMinutes: fastPause,
+        queueIntervalMinutes: slowGap,
     });
     invalidateConfigCache();
-
-    await interaction.reply({
-        content: `✅ 已保存：活帖 ${graceNew} 小时 · 老帖 ${graceOld} 小时 · `
-            + `沉寂 ${inactive} 小时算老帖 · 队列 ${queue} 分钟一个。\n`
-            + '（原来那个面板点一下「返回」就能刷新）',
-        flags: MessageFlags.Ephemeral,
-    });
+    await ok(`✅ 已保存：活跃帖 ${fastSize} 条/批歇 ${fastPause} 分钟 · `
+        + `老帖 ${slowGap} 分钟一个。（面板点「返回」刷新）`);
     return true;
 }
