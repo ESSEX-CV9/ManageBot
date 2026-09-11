@@ -15,11 +15,13 @@ import {
     deleteConfig,
     getActiveRound,
     getConfigByRole,
+    getFrogSettings,
     listAudit,
     listConfigs,
     removeChannel,
     removeConflictRole,
     setFrogRole,
+    setFrogCooldown,
     updateConfig,
     type RotationChannelKind,
 } from '../services/roleRotationDatabase';
@@ -119,6 +121,10 @@ const data = new SlashCommandBuilder()
         .setName('清除蛙人')
         .setDescription('关闭 /呼唤蛙人 功能'))
     .addSubcommand(sub => sub
+        .setName('设置蛙人冷却')
+        .setDescription('设置每位成员两次呼唤之间的最短时间')
+        .addIntegerOption(option => option.setName('冷却秒数').setDescription('默认 60 秒').setMinValue(1).setMaxValue(86400).setRequired(true)))
+    .addSubcommand(sub => sub
         .setName('立即问询')
         .setDescription('立即手动发起一轮问询，不改变下次月度时间')
         .addRoleOption(option => option.setName('身份组').setDescription('被管理的身份组').setRequired(true)))
@@ -178,6 +184,7 @@ function auditLabel(event: string): string {
         conflict_removed: '移除冲突身份组',
         frog_role_set: '设置蛙人身份组',
         frog_role_cleared: '清除蛙人身份组',
+        frog_cooldown_set: '设置蛙人冷却',
         inquiry_started: '发起问询',
         inquiry_settled: '结算问询',
         response_keep: '选择继续担任',
@@ -367,10 +374,28 @@ const command: Command = {
             }
             setFrogRole(guild.id, role?.id ?? null, interaction.user.id);
             addAudit({ guildId: guild.id, actorId: interaction.user.id, event: role ? 'frog_role_set' : 'frog_role_cleared', detail: role?.id });
+            const cooldown = getFrogSettings(guild.id).cooldownSeconds;
             return interaction.reply({
-                content: role ? `✅ 已将 ${role} 设置为蛙人身份组；其成员现在可以使用 \`/呼唤蛙人\`。` : '✅ 已关闭呼唤蛙人功能。',
+                content: role
+                    ? `✅ 已将 ${role} 设置为蛙人身份组；其成员现在可以使用 \`/呼唤蛙人\`，每人冷却 ${cooldown} 秒。`
+                    : '✅ 已关闭呼唤蛙人功能。',
                 flags: MessageFlags.Ephemeral,
                 allowedMentions: { parse: [] },
+            });
+        }
+
+        if (sub === '设置蛙人冷却') {
+            const cooldownSeconds = interaction.options.getInteger('冷却秒数', true);
+            setFrogCooldown(guild.id, cooldownSeconds, interaction.user.id);
+            addAudit({
+                guildId: guild.id,
+                actorId: interaction.user.id,
+                event: 'frog_cooldown_set',
+                detail: `seconds=${cooldownSeconds}`,
+            });
+            return interaction.reply({
+                content: `✅ 每位成员的蛙人呼唤冷却已设置为 ${cooldownSeconds} 秒。`,
+                flags: MessageFlags.Ephemeral,
             });
         }
 

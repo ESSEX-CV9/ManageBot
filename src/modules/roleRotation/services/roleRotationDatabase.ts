@@ -76,6 +76,11 @@ export interface RotationAudit {
     createdAt: number;
 }
 
+export interface FrogSettings {
+    roleId: string | null;
+    cooldownSeconds: number;
+}
+
 interface ConfigRow {
     id: number;
     guild_id: string;
@@ -157,10 +162,18 @@ db.exec(`
     );
 
     CREATE TABLE IF NOT EXISTS rr_guild_settings (
-        guild_id       TEXT PRIMARY KEY,
-        frog_role_id   TEXT,
-        updated_by     TEXT,
-        updated_at     INTEGER NOT NULL
+        guild_id               TEXT PRIMARY KEY,
+        frog_role_id           TEXT,
+        frog_cooldown_seconds  INTEGER NOT NULL DEFAULT 60,
+        updated_by             TEXT,
+        updated_at             INTEGER NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS rr_frog_call (
+        guild_id       TEXT NOT NULL,
+        user_id        TEXT NOT NULL,
+        last_called_at INTEGER NOT NULL,
+        PRIMARY KEY (guild_id, user_id)
     );
 
     CREATE TABLE IF NOT EXISTS rr_round (
@@ -247,6 +260,11 @@ db.exec(`
     CREATE UNIQUE INDEX IF NOT EXISTS idx_rr_message_destination
         ON rr_message(round_id, phase, destination_id);
 `);
+
+const guildSettingsColumns = db.pragma('table_info(rr_guild_settings)') as { name: string }[];
+if (!guildSettingsColumns.some(column => column.name === 'frog_cooldown_seconds')) {
+    db.exec('ALTER TABLE rr_guild_settings ADD COLUMN frog_cooldown_seconds INTEGER NOT NULL DEFAULT 60');
+}
 
 function mapRound(row: RoundRow): RotationRound {
     return {
@@ -384,8 +402,8 @@ export function removeConflictRole(configId: number, roleId: string): boolean {
 
 export function setFrogRole(guildId: string, roleId: string | null, updatedBy: string): void {
     db.prepare(`
-        INSERT INTO rr_guild_settings (guild_id, frog_role_id, updated_by, updated_at)
-        VALUES (?, ?, ?, ?)
+        INSERT INTO rr_guild_settings (guild_id, frog_role_id, frog_cooldown_seconds, updated_by, updated_at)
+        VALUES (?, ?, 60, ?, ?)
         ON CONFLICT(guild_id) DO UPDATE SET
             frog_role_id = excluded.frog_role_id,
             updated_by = excluded.updated_by,
@@ -394,9 +412,56 @@ export function setFrogRole(guildId: string, roleId: string | null, updatedBy: s
 }
 
 export function getFrogRoleId(guildId: string): string | null {
-    const row = db.prepare('SELECT frog_role_id FROM rr_guild_settings WHERE guild_id = ?')
-        .get(guildId) as { frog_role_id: string | null } | undefined;
-    return row?.frog_role_id ?? null;
+    return getFrogSettings(guildId).roleId;
+}
+
+export function getFrogSettings(guildId: string): FrogSettings {
+    const row = db.prepare(`
+        SELECT frog_role_id, frog_cooldown_seconds
+        FROM rr_guild_settings WHERE guild_id = ?
+    `).get(guildId) as { frog_role_id: string | null; frog_cooldown_seconds: number } | undefined;
+    return {
+        roleId: row?.frog_role_id ?? null,
+        cooldownSeconds: Math.max(1, row?.frog_cooldown_seconds ?? 60),
+    };
+}
+
+export function setFrogCooldown(guildId: string, cooldownSeconds: number, updatedBy: string): void {
+    db.prepare(`
+        INSERT INTO rr_guild_settings (guild_id, frog_role_id, frog_cooldown_seconds, updated_by, updated_at)
+        VALUES (?, NULL, ?, ?, ?)
+        ON CONFLICT(guild_id) DO UPDATE SET
+            frog_cooldown_seconds = excluded.frog_cooldown_seconds,
+            updated_by = excluded.updated_by,
+            updated_at = excluded.updated_at
+    `).run(guildId, Math.max(1, Math.round(cooldownSeconds)), updatedBy, Date.now());
+}
+
+/** 原子占用一次呼叫机会，防止同一用户并发点击绕过冷却。 */
+export function claimFrogCall(
+    guildId: string,
+    userId: string,
+    cooldownSeconds: number,
+): { allowed: true; claimedAt: number } | { allowed: false; retryAt: number } {
+    const now = Date.now();
+    const cooldownMs = Math.max(1, cooldownSeconds) * 1000;
+    const result = db.prepare(`
+        INSERT INTO rr_frog_call (guild_id, user_id, last_called_at)
+        VALUES (?, ?, ?)
+        ON CONFLICT(guild_id, user_id) DO UPDATE SET
+            last_called_at = excluded.last_called_at
+        WHERE rr_frog_call.last_called_at <= ?
+    `).run(guildId, userId, now, now - cooldownMs);
+    if (result.changes > 0) return { allowed: true, claimedAt: now };
+    const row = db.prepare('SELECT last_called_at FROM rr_frog_call WHERE guild_id = ? AND user_id = ?')
+        .get(guildId, userId) as { last_called_at: number };
+    return { allowed: false, retryAt: row.last_called_at + cooldownMs };
+}
+
+/** Discord 消息发送失败时撤销本次占位，不让网络错误消耗用户冷却。 */
+export function releaseFrogCall(guildId: string, userId: string, claimedAt: number): void {
+    db.prepare('DELETE FROM rr_frog_call WHERE guild_id = ? AND user_id = ? AND last_called_at = ?')
+        .run(guildId, userId, claimedAt);
 }
 
 export function createRound(input: {
