@@ -19,14 +19,18 @@ import { readFileSync, writeFileSync, existsSync } from 'node:fs';
 import ExcelJS from 'exceljs';
 
 import { compileConfig, detect, type CompiledConfig } from '../services/ruleEngine';
-import { buildPlan } from '../services/rewriter';
+import {
+    buildPlan, pendingHits, planProgramStage, previewTagPlan,
+} from '../services/rewriter';
+import { planWithModel } from '../services/planner';
 import { matchWithDebug, compileDict, makeIsWholeDictWord } from '../services/matcher';
 import { normalize, shouldForceAsciiBoundary } from '../services/normalizer';
 import { segment, POSITION_LABEL, tokenizeMarker } from '../services/segmenter';
 import { cutForDebug } from '../services/wordBoundary';
 import { buildNoticeContent, buildDoneMessage, type NoticeContent } from '../services/noticeContent';
+import { APPEAL_MAX_LENGTH, reviewAppeal, screenAppealText } from '../services/llmAppeal';
 import {
-    judge, MODE_LABEL, buildJudgeRules,
+    judge, MODE_LABEL, buildJudgeHits, buildJudgeRules, summarizeJudgement,
     type Judgement, type LlmConfig, type LlmProtocol, type ToolMode,
 } from '../services/llmJudge';
 import type {
@@ -35,6 +39,7 @@ import type {
     DictKind,
     DictScope,
     GuardConfig,
+    WordTier,
 } from '../services/types';
 
 const PORT = Number(process.env.TITLEGUARD_UI_PORT || 5180);
@@ -49,6 +54,8 @@ interface SeedEntry {
     word: string;
     kind: DictKind;
     group: string | null;
+    /** 词档。种子文件里可以不写，不写就按「关联」算 */
+    tier?: WordTier;
     scope?: DictScope;
     replaceTo?: string | null;
     note?: string;
@@ -77,6 +84,8 @@ function seedToConfig(seed: Seed): GuardConfig {
             word,
             kind: e.kind,
             group: e.kind === '白名单' ? null : (e.group || null),
+            // 种子文件里没有词档这一列，统一按「关联」算，跟线上新词的默认一致
+            tier: e.tier === '本体' ? '本体' : '关联',
             scope: e.scope ?? '全标题',
             replaceTo: e.replaceTo || null,
             asciiBoundary: shouldForceAsciiBoundary(word),
@@ -430,7 +439,7 @@ interface AnalyzeResult {
         rule: string;
         message: string;
         groups: string[];
-        needsLlm: boolean;
+        arbiter: string;
         words: string[];
         tagNames: string[];
     }[];
@@ -446,7 +455,7 @@ interface AnalyzeResult {
         notes: string[];
     } | null;
     /** 处置结论 */
-    disposition: '合规' | '可自动整改' | '需LLM定性' | '转人工';
+    disposition: '合规' | '可自动整改' | '需LLM定性' | '需LLM兜底' | '转人工';
     /** 发给作者的通知原文（和 Discord 上一字不差） */
     notice: NoticeContent | null;
     /** 到期整改完成后帖内回的那条 */
@@ -483,15 +492,18 @@ function analyze(
     // 论坛里有「多路线」TAG 时才能补，这里按有来算，方便看到完整方案
     const availableTags = availableTagsFromConfig();
 
-    // 有 LLM 结论时，按结论重算方案：判定「不是分类标记」就把需 LLM 的违规全部作废
-    const llmCleared = judgement !== null && !judgement.isClassification;
-    const effectiveViolations = llmCleared
-        ? result.violations.filter(v => !v.needsLlm)
-        : result.violations;
-
     const plan = result.violations.length > 0
-        ? buildPlan({ detectResult: result, tags, availableTags, compiled, judgement, llmCleared })
+        ? buildPlan({ detectResult: result, tags, forumTags: availableTags, compiled, judgement })
         : null;
+
+    // 模型看过之后以**方案**为准：方案说「标题不用改、TAG 不用动」，
+    // 那就是真的没事。跟真机上 effectiveViolations 那套判断保持一致。
+    const modelCleared = Boolean(judgement) && Boolean(plan)
+        && plan!.autoFixable
+        && plan!.newTitle === plan!.originalTitle
+        && plan!.removeTagIds.length === 0
+        && plan!.addTagIds.length === 0;
+    const effectiveViolations = modelCleared ? [] : result.violations;
 
     const src = (start: number, end: number) => {
         if (norm.text.length === 0) return '';
@@ -539,19 +551,27 @@ function analyze(
         rule: v.rule,
         message: v.message,
         groups: v.groups,
-        needsLlm: v.needsLlm,
+        arbiter: v.arbiter,
         words: v.hits.map(h => h.entry.word),
         tagNames: v.tagIds.map(id => tags.find(t => t.tagId === id)?.tagName ?? id),
     }));
 
+    // 这里的 analyze() 是**不调模型**的（调试台每敲一个字都会重算，不能每次都花钱），
+    // 所以「还没问过模型」和「问过了也没辙」必须分开说，否则一律显示转人工就是撒谎。
     let disposition: AnalyzeResult['disposition'] = '合规';
     if (effectiveViolations.length === 0) {
         disposition = '合规';
-    } else if (judgement === null && effectiveViolations.some(v => v.needsLlm)) {
+    } else if (judgement === null && effectiveViolations.some(v => v.arbiter === 'LLM')) {
+        // 判定阶段就说了这些词得先定性
         disposition = '需LLM定性';
     } else if (plan?.autoFixable) {
         disposition = '可自动整改';
+    } else if (judgement === null) {
+        // 规则判得清清楚楚，但方案出不来或没过校验。
+        // 真机上 enforcer 会在这里**兜底调一次模型**要改写方案，所以还不是转人工。
+        disposition = '需LLM兜底';
     } else {
+        // 模型也说过话了，方案还是立不住 —— 这才是真的转人工
         disposition = '转人工';
     }
 
@@ -565,7 +585,8 @@ function analyze(
     // 通知预览：截止时间按「新帖 24 小时」算，纯为让界面能看到时间格式。
     // 还没拿到 LLM 结论时不出通知——方案没定，通知里只能写「不知道怎么办」。
     // 没有实际违规（LLM 判定放过了）就不该有通知；还没拿到判定结论也不该有
-    const notice = plan && effectiveViolations.length > 0 && disposition !== '需LLM定性'
+    const needsModel = disposition === '需LLM定性' || disposition === '需LLM兜底';
+    const notice = plan && effectiveViolations.length > 0 && !needsModel
         ? buildNoticeContent({
             authorId: 'AUTHOR',
             originalTitle: title,
@@ -581,6 +602,9 @@ function analyze(
             deadline: Date.now() + 24 * 3600 * 1000,
             isOldPost: false,
             normalized: norm,
+            // 跑过 LLM 之后，通知底下那行小字也要能预览出来——
+            // 不然这里显示的通知和机器人真发的不是一份
+            llmReason: summarizeJudgement(judgement),
         })
         : null;
 
@@ -694,7 +718,9 @@ interface BatchItem {
 
 function runBatch(): { items: BatchItem[]; stats: Record<string, number>; ruleStats: Record<string, number>; wordStats: [string, number][]; forumStats: [string, number, number][] } {
     const items: BatchItem[] = [];
-    const stats: Record<string, number> = { 总数: rows.length, 合规: 0, 可自动整改: 0, 需LLM定性: 0, 转人工: 0 };
+    const stats: Record<string, number> = {
+        总数: rows.length, 合规: 0, 可自动整改: 0, 需LLM定性: 0, 需LLM兜底: 0, 转人工: 0,
+    };
     const ruleStats: Record<string, number> = {};
     const wordCount = new Map<string, number>();
     const forumTotal = new Map<string, number>();
@@ -889,7 +915,8 @@ const server = http.createServer(async (req, res) => {
             llmConfig = {
                 baseUrl, apiKey, model,
                 protocol: (body.protocol === 'responses' ? 'responses' : 'chat') as LlmProtocol,
-                timeoutMs: Number(body.timeoutMs) > 0 ? Number(body.timeoutMs) : 30000,
+                // 和 llmClient.ts 的默认值保持一致。思考模式的模型光推理就能跑一两分钟
+                timeoutMs: Number(body.timeoutMs) > 0 ? Number(body.timeoutMs) : 240000,
                 toolMode: (['forced', 'auto', 'json'].includes(rawMode) ? rawMode : 'cascade') as ToolMode,
             };
             json(res, { ok: true, apiKeyMasked: maskKey(apiKey) });
@@ -906,12 +933,31 @@ const server = http.createServer(async (req, res) => {
         if (url.pathname === '/api/llm-test' && req.method === 'POST') {
             if (!llmConfig) { json(res, { ok: false, error: '还没配置 LLM' }, 400); return; }
             const t0 = Date.now();
+            const probeTitle = '《真正的橘子味世界不允许百合破坏的存在！》';
+            const probeTags = toAppliedTags(['百合']);
+            const probeDetect = detect({ title: probeTitle, tags: probeTags, config }, compiled);
+            const probeStage = planProgramStage({
+                detectResult: probeDetect, tags: probeTags,
+                forumTags: availableTagsFromConfig(), compiled,
+            });
+            const probePending = pendingHits(probeDetect, probeStage);
+
             const outcome = await judge(
                 {
-                    title: '《真正的橘子味世界不允许百合破坏的存在！》',
+                    title: probeTitle,
                     forumName: '测试论坛',
-                    hits: [{ word: '百合破坏', group: '百破', where: 'body' }],
-                    tags: [{ name: '百合', group: '百合' }],
+                    segments: probeDetect.segments.map(seg => ({
+                        kind: seg.kind === 'marker' && seg.confident
+                            ? '标签区' as const : '正文' as const,
+                        text: seg.text,
+                    })),
+                    hits: buildJudgeHits(probeDetect, probePending, config),
+                    tags: probeTags.map(t => ({ name: t.tagName, group: t.group })),
+                    violations: probeDetect.violations.map(v => v.message),
+                    tagPlan: previewTagPlan({
+                        detectResult: probeDetect, tags: probeTags,
+                        forumTags: availableTagsFromConfig(), compiled,
+                    }),
                     rules: buildJudgeRules(config),
                 },
                 { config: llmConfig },
@@ -924,7 +970,9 @@ const server = http.createServer(async (req, res) => {
                         judgement: outcome.judgement,
                         mode: outcome.mode,
                         modeLabel: MODE_LABEL[outcome.mode],
-                        expected: '这条是完整句子，正确答案是「不是分类标记」',
+                        expected: '「百合破坏」是本体词，在这儿确实就是那个分类。'
+                            + '正确答案是：定性为百破，最终不挂百合 TAG，标题那处判「保留」——'
+                            + '这条冲突靠摘掉百合 TAG 解决，标题一个字都不用动。',
                     }
                     : { kind: outcome.kind, error: outcome.error, triedModes: outcome.triedModes }),
             });
@@ -950,20 +998,37 @@ const server = http.createServer(async (req, res) => {
             const tags = toAppliedTags(tagNames);
             const detectResult = detect({ title, tags, config }, compiled);
 
+            // 闭包里 TS 看不到上面那句 null 判断的收窄，先固化一份
+            const cfg = llmConfig;
             const t0 = Date.now();
-            const outcome = await judge(
+            // 跟真机一样：先跑程序那一段，才知道还剩哪几处要问模型
+            const stage = planProgramStage({
+                detectResult, tags, forumTags: availableTagsFromConfig(), compiled,
+            });
+            const pending = pendingHits(detectResult, stage);
+
+            const askOnce = async (retryFeedback?: string) => judge(
                 {
                     title,
                     forumName,
-                    hits: detectResult.matches
-                        .filter(m => m.entry.group)
-                        .map(m => ({ word: m.entry.word, group: m.entry.group!, where: m.segmentKind })),
+                    segments: detectResult.segments.map(seg => ({
+                        kind: seg.kind === 'marker' && seg.confident
+                            ? '标签区' as const : '正文' as const,
+                        text: seg.text,
+                    })),
+                    hits: buildJudgeHits(detectResult, pending, config),
                     tags: tags.map(t => ({ name: t.tagName, group: t.group })),
+                    violations: detectResult.violations.map(v => v.message),
+                    tagPlan: previewTagPlan({
+                        detectResult, tags, forumTags: availableTagsFromConfig(), compiled,
+                    }),
                     rules: buildJudgeRules(config),
+                    retryFeedback,
                 },
-                { config: llmConfig, bodyExcerpt: body.bodyExcerpt },
+                { config: cfg, bodyExcerpt: body.bodyExcerpt },
             );
 
+            const outcome = await askOnce();
             if (!outcome.ok) {
                 json(res, {
                     ok: false, kind: outcome.kind, error: outcome.error,
@@ -972,16 +1037,111 @@ const server = http.createServer(async (req, res) => {
                 return;
             }
 
-            // 拿判定结果重算一遍，得到最终方案和通知
+            // 和机器人走同一条路：模型给的标题要是不合规，把「哪儿还不合规」
+            // 告诉它让它重写一次，而不是直接判转人工。
+            // 这里必须用同一个 planWithModel，两边各写一套迟早对不上。
+            let rewriteFeedback: string | null = null;
+            const { judgement: finalJudgement, rewrites } = await planWithModel(
+                {
+                    detectResult,
+                    tags,
+                    forumTags: availableTagsFromConfig(),
+                    compiled,
+                    judgement: outcome.judgement,
+                },
+                async feedback => {
+                    rewriteFeedback = feedback;
+                    const again = await askOnce(feedback);
+                    return again.ok ? again.judgement : null;
+                },
+            );
+
             json(res, {
                 ok: true,
                 elapsedMs: Date.now() - t0,
                 usedBody: outcome.usedBody,
                 mode: outcome.mode,
                 modeLabel: MODE_LABEL[outcome.mode],
-                judgement: outcome.judgement,
+                judgement: finalJudgement ?? outcome.judgement,
+                rewrites,
+                firstJudgement: rewrites > 0 ? outcome.judgement : null,
+                rewriteFeedback,
                 before: { disposition: before.disposition },
-                after: analyze(title, tagNames, outcome.judgement),
+                after: analyze(title, tagNames, finalJudgement ?? outcome.judgement),
+            });
+            return;
+        }
+
+        // --- 申诉复核试跑：安检 + 复核两步，和真机同一条路 ---
+        if (url.pathname === '/api/appeal-review' && req.method === 'POST') {
+            if (!llmConfig) { json(res, { ok: false, error: '还没配置 LLM' }, 400); return; }
+
+            const body = JSON.parse((await readBody(req)).toString('utf8')) as {
+                title?: string; tags?: string[]; appealText?: string; forumName?: string;
+            };
+            const title = (body.title ?? '').trim();
+            const appealText = (body.appealText ?? '').trim().slice(0, APPEAL_MAX_LENGTH);
+            if (!title || !appealText) {
+                json(res, { ok: false, error: '标题和申诉理由都要填' }, 400);
+                return;
+            }
+
+            const tagNames = body.tags ?? [];
+            const before = analyze(title, tagNames);
+            const tags = toAppliedTags(tagNames);
+            const detectResult = detect({ title, tags, config }, compiled);
+
+            // 第一步：安检。没过就到此为止——真机上这段话不会进复核提示词
+            const t0 = Date.now();
+            const screening = await screenAppealText(appealText, { config: llmConfig });
+            if (!screening.safe) {
+                json(res, {
+                    ok: true, elapsedMs: Date.now() - t0,
+                    screening,
+                    review: null,
+                    outcome: '安检没过 → 不提交复核，直接转人工',
+                });
+                return;
+            }
+
+            // 第二步：复核
+            const outcome = await reviewAppeal({
+                title,
+                forumName: body.forumName ?? '（未指定论坛）',
+                tags: tags.map(t => ({ name: t.tagName, group: t.group })),
+                hits: detectResult.matches
+                    .filter(m => m.entry.group)
+                    .map(m => ({
+                        word: m.entry.word,
+                        group: m.entry.group!,
+                        where: m.segmentKind === 'marker' ? '标签区' as const : '正文' as const,
+                    })),
+                violationMessages: detectResult.violations.map(v => v.message),
+                plan: before.plan
+                    ? {
+                        titleChanged: before.plan.newTitle !== title,
+                        newTitle: before.plan.newTitle,
+                        removeTagNames: before.plan.removeTags,
+                        addTagNames: before.plan.addTags,
+                    }
+                    : null,
+                priorReason: null,
+                rules: buildJudgeRules(config),
+                appealText,
+            }, { config: llmConfig });
+
+            json(res, {
+                ok: outcome.ok,
+                elapsedMs: Date.now() - t0,
+                screening,
+                ...(outcome.ok
+                    ? {
+                        review: outcome.review,
+                        outcome: outcome.review.upheld
+                            ? '维持原判 → 恢复倒计时，作者可再升人工'
+                            : '申诉成立 → 直接放行，本帖不整改',
+                    }
+                    : { kind: outcome.kind, error: outcome.error, review: null }),
             });
             return;
         }

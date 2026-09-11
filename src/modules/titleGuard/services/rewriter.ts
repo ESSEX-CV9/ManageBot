@@ -1,26 +1,61 @@
 // src/modules/titleGuard/services/rewriter.ts
 //
-// ⑥ 整改方案生成。输入检测结果，输出「标题改成什么、TAG 摘掉哪些」。
+// ⑥ 整改方案生成。输入检测结果，输出「标题改成什么、TAG 摘哪些补哪些」。
 //
-// 最重要的一条是 §5.5 的安全阀：**LLM 给的新标题只能是原标题删字的结果**。
-// 用子序列校验硬卡死，模型再怎么发挥失常，最坏也只能把标题删短，不可能凭空编出新标题。
-// 唯一允许「加字」的路径是黑名单词的替换目标（纯爱牛 → NTR），那是词典里预先定义好的，可控。
+// ============================================================
+// 分两段，边界就是「归谁管」那条线
+// ============================================================
+//
+// 【第一段·程序】处理 arbiter === '程序' 的违规。
+//   全都是作者明写在标签区里的声明，或者纯粹 TAG 之间打架，按保留顺序直接改。
+//   **这一段绝不碰标题主体里的一个字。**
+//
+// 【第二段·模型】第一段做完还剩 arbiter === 'LLM' 的违规才走。
+//   模型拿到的是：标题、切分、还在场的命中清单（标明词档和位置）、
+//   原 TAG、第一段改完之后的 TAG、以及首楼节选。
+//   它按三步走——先给帖子定性，再核 TAG，最后逐处决定删/换/留。
+//
+// 两段的编辑用的是**同一套坐标**（原标题归一化后的下标），最后一次性拼出新标题。
+// 不做「改完再检测一遍接着改」的串联，那样第二段看到的标题和它被问的时候不是同一个，
+// 编号会错位，错位的后果是删错词。
+//
+// 第二段交回来的答卷要过校验（validateModelPlan）。没过就打回重写，
+// 并且告诉它**具体还剩哪条没解决**，而不是笼统一句「不合规」。
 
-import { normalize, toSourceRange } from './normalizer';
-import { tokenizeMarker } from './segmenter';
-import { detect, pickByPriority, type CompiledConfig } from './ruleEngine';
-import type { AppliedTag, DetectResult, ForumTag, GroupId, Match, Violation } from './types';
+import { detect, pickByPriority, declarationOf, classifyingGroup, tierOf,
+    type CompiledConfig } from './ruleEngine';
+import {
+    applyDecisions,
+    applySpanEdits,
+    enclosingToken,
+    isDeletionOnly,
+    tidyTitle,
+    tokenizeMarker,
+    type SpanEdit,
+} from './titleEdit';
+import { normalize } from './normalizer';
+import type {
+    AppliedTag,
+    DetectResult,
+    ForumTag,
+    GroupId,
+    GuardConfig,
+    Match,
+    Violation,
+} from './types';
 import type { Judgement } from './llmJudge';
+
+export { tidyTitle, isDeletionOnly, tokenizeMarker };
 
 /** 保留哪个分类组是怎么定下来的——通知里要写清楚，作者才服 */
 export type KeepSource = 'author' | 'tag' | 'priority' | 'rule' | 'llm' | 'none';
 
 export const KEEP_SOURCE_LABEL: Record<KeepSource, string> = {
-    author: '作者自己选的',
+    author: '按作者自己在标签区里的声明',
     tag: '按帖子挂的 TAG 推断',
-    priority: '按社区既定的分类优先级',
-    rule: '按交叉互斥规则本身的规定',
-    llm: '按语义判定结果',
+    priority: '按社区既定的分类保留顺序',
+    rule: '按互斥规则本身的规定',
+    llm: '按模型对作品的定性',
     none: '未能确定',
 };
 
@@ -31,7 +66,7 @@ export interface RewritePlan {
     newTitle: string;
     /** 要摘掉的 TAG id */
     removeTagIds: string[];
-    /** 要补上的 TAG id（目前只有「多路线」） */
+    /** 要补上的 TAG id */
     addTagIds: string[];
     /** 决定保留的分类组 */
     keepGroup: GroupId | null;
@@ -42,162 +77,587 @@ export interface RewritePlan {
     blockedReason: string | null;
     /** 给人看的改动说明 */
     notes: string[];
-}
-
-// ============================================================
-// 决定保留哪个分类组
-// ============================================================
-
-export interface KeepDecisionInput {
-    violations: Violation[];
-    tags: AppliedTag[];
-    compiled: CompiledConfig;
-    /** 交叉互斥判出来的赢家。它们已经被规则钦定，排在所有推断之前 */
-    crossWinners?: { group: GroupId; byPriority: boolean }[];
-    /** 交叉互斥判输、即将被摘掉的分类。不管在哪一侧，都不能再当保留组 */
-    crossLosers?: Set<GroupId>;
-    /** 作者通过自助面板明确选择的 */
-    authorChoice?: GroupId | null;
-    judgement?: Judgement | null;
+    /**
+     * 还在等模型表态。
+     * 这不是「转人工」——调用方该做的是去调模型，而不是叫管理组来。
+     */
+    awaitingModel: boolean;
+    /**
+     * 模型的答卷没过校验。
+     * 有值就说明「还能再抢救一下」：带着这里的理由让它重写一次，
+     * 比直接转人工强，模型上一次多半只是没意识到整改后 TAG 也跟着变了。
+     */
+    modelRejection: ModelRejection | null;
 }
 
 /**
- * 按顺序取第一个能定的：
- *   作者选择 → 交叉互斥的赢家 → TAG 唯一 → TAG 冲突按优先级
- *   → LLM 建议 → 标题冲突按优先级（保底） → 定不了。
- *
- * 交叉互斥的赢家排得靠前，是因为那已经是规则算出来的结论，不是推断。
- * 判输的一方则一律排除——不然「标题写 NTR、TAG 挂纯爱」会因为
- * 「纯爱是唯一的 TAG」而被判成保留纯爱，可纯爱正是要摘掉的那个。
- *
- * 注意「标题里声明了什么」不在这条链上。标题和 TAG 谁说了算，
- * 不是靠位置决定的，而是靠分类优先级——那件事在 decideCrossLoser 里办。
- *
- * 「按优先级」是社区既定规则（NTR > NTL > 纯爱）。它出现在两处：
- *   1. 帖子挂了多个互斥 TAG 时，留优先级最高的；
- *   2. 连 TAG 都没有、只有标题在打架时，也照优先级留一个——**这是保底**。
- *
- * 有了保底这一档，「作者到期不改就按权重自动整」才真正兑现，
- * 而不是一遇到没 TAG 的帖子就卡在人工队列里。
+ * 模型的答卷被打回了。
+ * remaining 是用人话写的「还剩哪条没解决」，直接贴进重写提示词里。
  */
-export function decideKeepGroup(input: KeepDecisionInput): { group: GroupId | null; source: KeepSource } {
-    if (input.authorChoice) return { group: input.authorChoice, source: 'author' };
+export interface ModelRejection {
+    /** 模型这一版改出来的标题 */
+    titleTried: string;
+    /** 一句话说明为什么不能用 */
+    reason: string;
+    /** 改完仍然存在的问题，原话 */
+    remaining: string[];
+    /** 按模型的方案执行后，帖子会挂的 TAG */
+    tagsAfter: string[];
+}
 
-    const losers = input.crossLosers ?? new Set<GroupId>();
+// ============================================================
+// TAG 小工具
+// ============================================================
 
-    // 交叉互斥已经判出赢家，且几条判下来是同一个 → 就是它
-    const winners = new Set((input.crossWinners ?? []).map(w => w.group));
-    if (winners.size === 1) {
-        const group = [...winners][0];
-        const byPriority = (input.crossWinners ?? []).every(w => w.byPriority);
-        return { group, source: byPriority ? 'priority' : 'rule' };
+function tagOfGroup(forumTags: ForumTag[], group: GroupId): ForumTag | null {
+    return forumTags.find(t => t.group === group) ?? null;
+}
+
+/** 两个分类组在 TAG 维度上是不是互斥（挂了一个就不能挂另一个） */
+function tagGroupsClash(a: GroupId, b: GroupId, compiled: CompiledConfig): boolean {
+    if (a === b) return false;
+    const setsOfA = compiled.tagGroupToSet.get(a) ?? [];
+    const setsOfB = compiled.tagGroupToSet.get(b) ?? [];
+    return setsOfA.some(i => setsOfB.includes(i));
+}
+
+function applyTagChanges(
+    tags: AppliedTag[],
+    removeTagIds: Iterable<string>,
+    addTagIds: Iterable<string>,
+    forumTags: ForumTag[],
+): AppliedTag[] {
+    const removed = new Set(removeTagIds);
+    const out = tags.filter(t => !removed.has(t.tagId));
+    for (const id of addTagIds) {
+        if (out.some(t => t.tagId === id)) continue;
+        const found = forumTags.find(t => t.tagId === id);
+        if (found) out.push(found);
     }
+    return out;
+}
 
-    // TAG 指向的分类组（只看参与 TAG 互斥判定的，且没在交叉互斥里判输）
-    const tagGroups = new Set<GroupId>();
-    for (const t of input.tags) {
-        if (!t.group || losers.has(t.group)) continue;
-        if (input.compiled.tagGroupToSet.has(t.group)) tagGroups.add(t.group);
-    }
-    if (tagGroups.size === 1) return { group: [...tagGroups][0], source: 'tag' };
+// ============================================================
+// 第一段：程序裁决
+// ============================================================
 
-    if (tagGroups.size > 1) {
-        const picked = pickByPriority([...tagGroups], input.compiled.raw);
-        if (picked) return { group: picked, source: 'priority' };
-    }
+export interface ProgramStage {
+    /** 这一段产生的标题编辑，坐标是原标题归一化后的下标 */
+    edits: SpanEdit[];
+    /** 这一段动过的命中。第二段不用再管它们 */
+    handled: Set<Match>;
+    removeTagIds: Set<string>;
+    addTagIds: Set<string>;
+    /** 执行完这一段之后帖子会挂的 TAG */
+    tagsAfter: AppliedTag[];
+    keepGroup: GroupId | null;
+    keepSource: KeepSource;
+    notes: string[];
+    /** 程序本该判、却判不了的（比如涉事分类没配保留顺序）。有内容就得转人工 */
+    blocked: string[];
+}
 
-    if (input.judgement?.suggestedKeep && input.judgement.confidence !== 'low') {
-        return { group: input.judgement.suggestedKeep, source: 'llm' };
-    }
+/**
+ * 跑第一段。
+ *
+ * 也被 previewTagPlan 拿去算「自动整改后 TAG 长什么样」——
+ * 问模型的时候必须把这个结果告诉它，否则它是在对着一份过期的 TAG 做判断。
+ * 两处共用同一个函数，不会各算各的然后对不上。
+ */
+export function planProgramStage(input: {
+    detectResult: DetectResult;
+    tags: AppliedTag[];
+    forumTags: ForumTag[];
+    compiled: CompiledConfig;
+    /**
+     * 作者在自助面板上亲手选的「我这篇是哪一类」。
+     * 只要他选的那一类确实在冲突里，就压过社区保留顺序——
+     * 保留顺序是没人表态时的兜底，作者本人开口了就该听他的。
+     */
+    authorChoice?: GroupId | null;
+}): ProgramStage {
+    const { detectResult, tags, forumTags, compiled, authorChoice } = input;
+    const config = compiled.raw;
+    const segments = detectResult.segments;
+    const declared = (m: Match) => declarationOf(m, segments) === '声明';
 
-    // 保底：TAG 帮不上忙时，就按标题里打架的那几个分类比优先级
-    const titleGroups = new Set<GroupId>();
-    for (const v of input.violations) {
-        if (v.rule !== 'T2' && v.rule !== 'T3') continue;
-        for (const g of v.groups) {
-            if (losers.has(g)) continue;
-            if (input.compiled.wordGroupToSet.has(g)) titleGroups.add(g);
+    const edits: SpanEdit[] = [];
+    const handled = new Set<Match>();
+    const removeTagIds = new Set<string>();
+    const addTagIds = new Set<string>();
+    const notes: string[] = [];
+    const blocked: string[] = [];
+    let keepGroup: GroupId | null = null;
+    let keepSource: KeepSource = 'none';
+
+    const setKeep = (g: GroupId, source: KeepSource) => {
+        if (!keepGroup) { keepGroup = g; keepSource = source; }
+    };
+
+    /**
+     * 这组冲突里该留哪一个。
+     * 作者自己选过就听他的，否则按社区既定的保留顺序。
+     */
+    const survivorOf = (groups: GroupId[]): { group: GroupId | null; source: KeepSource } => {
+        if (authorChoice && groups.includes(authorChoice)) {
+            return { group: authorChoice, source: 'author' };
+        }
+        return { group: pickByPriority(groups, config), source: 'priority' };
+    };
+
+    const dropToken = (m: Match) => {
+        const span = enclosingToken(detectResult, m) ?? { start: m.start, end: m.end };
+        edits.push({ start: span.start, end: span.end, replacement: '' });
+        handled.add(m);
+    };
+
+    const program = detectResult.violations.filter(v => v.arbiter === '程序');
+
+    // ---------- B 污染词（只处理明写在标签区里的）----------
+    for (const v of program) {
+        if (v.rule !== 'B') continue;
+        for (const m of v.hits) {
+            if (!declared(m)) continue;
+            if (m.entry.replaceTo) {
+                edits.push({ start: m.start, end: m.end, replacement: m.entry.replaceTo });
+                handled.add(m);
+                notes.push(`标签区的「${m.entry.word}」换成「${m.entry.replaceTo}」`
+                    + `——这个词里带着别人的分类名，会污染那个词的搜索结果`);
+            } else {
+                dropToken(m);
+                notes.push(`删掉标签区的「${m.entry.word}」`);
+            }
+            if (m.entry.group) setKeep(m.entry.group, 'rule');
         }
     }
-    if (titleGroups.size > 0) {
-        const picked = pickByPriority([...titleGroups], input.compiled.raw);
-        if (picked) return { group: picked, source: 'priority' };
+
+    // ---------- W 标签区里自己打架 ----------
+    //
+    // 只删**标签区里**输掉那一方的词。同一个组要是在正文里也有，一律留着不动——
+    // 正文归模型管。留下来的那处会在下一轮检测里跟幸存组撞上，自然被路由去问模型。
+    for (const v of program) {
+        if (v.rule !== 'W') continue;
+
+        const settled = v.groups.filter(
+            g => v.hits.some(h => classifyingGroup(h) === g && declared(h)));
+        const { group: survivor, source } = survivorOf(settled);
+        if (!survivor) {
+            blocked.push(`标签区里同时声明了 ${settled.join(' / ')}，`
+                + '这几类没配保留顺序，程序不替作者做主');
+            continue;
+        }
+        setKeep(survivor, source);
+
+        for (const m of v.hits) {
+            if (!declared(m)) continue;
+            if (classifyingGroup(m) === survivor) continue;
+            dropToken(m);
+        }
+        notes.push(`标签区里 ${settled.join(' / ')} 互斥，按保留顺序留下「${survivor}」`);
     }
 
-    return { group: null, source: 'none' };
-}
+    // ---------- G TAG × TAG ----------
+    const byGroupTag = new Map<GroupId, AppliedTag[]>();
+    for (const t of tags) {
+        if (!t.group) continue;
+        const list = byGroupTag.get(t.group);
+        if (list) list.push(t);
+        else byGroupTag.set(t.group, [t]);
+    }
 
-// ============================================================
-// 交叉互斥：该摘 TAG 还是该删标题里的词
-// ============================================================
+    for (const v of program) {
+        if (v.rule !== 'G') continue;
 
-/** 交叉互斥判下来输的是哪一边 */
-export type CrossLoser = 'tag' | 'word';
+        const { group: survivor, source } = survivorOf(v.groups);
+        if (!survivor) {
+            blocked.push(`帖子同时挂了 ${v.groups.join(' / ')} 这几个互斥 TAG，`
+                + '它们没配保留顺序，程序不替作者做主');
+            continue;
+        }
+        setKeep(survivor, source);
 
-/**
- * 一条交叉互斥违规，输的是 TAG 那边还是关键字那边。
- *
- * 规矩很简单：**比分类优先级，低的那边输**，不管它站在哪一侧。
- *   挂纯爱 TAG、标题写 NTR，NTR 优先级高 → 纯爱输 → 摘掉纯爱 TAG；
- *   挂 NTR TAG、标题写纯爱，还是纯爱输 → 这回纯爱在关键字侧 → 删掉标题里的纯爱。
- *
- * 优先级没配、或者两边一样高时，按规矩本身的写法办——
- * 交叉互斥这条规矩是写在 TAG 头上的（「不得挂 X TAG」），所以摘 TAG。
- * 何况改 TAG 成本低也好回退，拿不准时动 TAG 比动作者的标题稳妥。
- */
-export function decideCrossLoser(
-    violation: Violation,
-    compiled: CompiledConfig,
-): { loser: CrossLoser; winner: GroupId; wordGroup: GroupId; tagGroup: GroupId; byPriority: boolean } {
-    // detect() 里固定按 [关键字侧, TAG 侧] 的顺序塞进去
-    const [wordGroup, tagGroup] = violation.groups;
-    const priority = compiled.raw.groupPriority ?? {};
-    const wordScore = priority[wordGroup] ?? 0;
-    const tagScore = priority[tagGroup] ?? 0;
+        for (const g of v.groups) {
+            if (g === survivor) continue;
+            for (const t of byGroupTag.get(g) ?? []) removeTagIds.add(t.tagId);
+        }
+        notes.push(`TAG ${v.groups.join(' / ')} 互斥，按保留顺序留下「${survivor}」`);
 
-    const loser: CrossLoser = wordScore < tagScore ? 'word' : 'tag';
+        // 原本挂了好几个互斥分类，作者的意思通常是「有多条线」，补上这个中性 TAG
+        if (config.multiRouteGroup) {
+            const mr = tagOfGroup(forumTags, config.multiRouteGroup);
+            if (mr && !tags.some(t => t.tagId === mr.tagId)) {
+                addTagIds.add(mr.tagId);
+                notes.push(`补上「${mr.tagName}」TAG`);
+            }
+        }
+    }
+
+    // ---------- X TAG × 标签区里的关键字 ----------
+    //
+    // 方向是定死的：**标题赢，改 TAG。**
+    // 标题是作者一个字一个字敲的，TAG 是发帖时随手点的，点错太常见。
+    for (const v of program) {
+        if (v.rule !== 'X') continue;
+        const [wordGroup, tagGroup] = v.groups;
+
+        for (const id of v.tagIds) removeTagIds.add(id);
+        setKeep(wordGroup, 'author');
+
+        const replacement = tagOfGroup(forumTags, wordGroup);
+        if (replacement && !tags.some(t => t.tagId === replacement.tagId)) {
+            addTagIds.add(replacement.tagId);
+            notes.push(`标签区声明的是「${wordGroup}」，把「${tagGroup}」TAG 换成「${replacement.tagName}」`);
+        } else {
+            notes.push(`标签区声明的是「${wordGroup}」，摘掉冲突的「${tagGroup}」TAG`
+                + (replacement ? '' : `（本论坛没有「${wordGroup}」TAG，只摘不补）`));
+        }
+    }
+
+    // ---------- 补 TAG 前先看看会不会又撞上 ----------
+    //
+    // 摘一个补一个的时候很容易自己给自己造一条新的 TAG 冲突：
+    // 比如 X 规则要补 NTR TAG，而 G 规则刚决定留下 NTL TAG，两者在 TAG 维度互斥。
+    const keptGroups = tags
+        .filter(t => t.group && !removeTagIds.has(t.tagId))
+        .map(t => t.group!) as GroupId[];
+
+    for (const id of [...addTagIds]) {
+        const candidate = forumTags.find(t => t.tagId === id);
+        if (!candidate?.group) continue;
+        const clash = keptGroups.find(g => tagGroupsClash(candidate.group!, g, compiled));
+        if (clash) {
+            addTagIds.delete(id);
+            notes.push(`本来想补「${candidate.tagName}」TAG，但它和保留下来的「${clash}」互斥，作罢`);
+        }
+    }
+
     return {
-        loser,
-        winner: loser === 'word' ? tagGroup : wordGroup,
-        wordGroup,
-        tagGroup,
-        // 两边分数一样（含都没配）时不是优先级定的，是按规矩本身的默认方向定的
-        byPriority: wordScore !== tagScore,
+        edits,
+        handled,
+        removeTagIds,
+        addTagIds,
+        tagsAfter: applyTagChanges(tags, removeTagIds, addTagIds, forumTags),
+        keepGroup,
+        keepSource,
+        notes,
+        blocked,
     };
 }
 
+/**
+ * 「自动整改之后 TAG 会变成什么样」，问模型之前必须先算出来告诉它。
+ * 直接复用第一段，不另写一份。
+ */
+export function previewTagPlan(input: {
+    detectResult: DetectResult;
+    tags: AppliedTag[];
+    forumTags: ForumTag[];
+    compiled: CompiledConfig;
+}): { after: string[]; changes: string[] } {
+    const stage = planProgramStage(input);
+    const after = stage.tagsAfter.map(t => t.tagName);
+    const changes: string[] = [];
+
+    for (const id of stage.removeTagIds) {
+        const t = input.tags.find(x => x.tagId === id);
+        if (t) changes.push(`摘掉「${t.tagName}」`);
+    }
+    for (const id of stage.addTagIds) {
+        const t = input.forumTags.find(x => x.tagId === id);
+        if (t) changes.push(`补上「${t.tagName}」`);
+    }
+
+    return { after, changes };
+}
+
 // ============================================================
-// 安全阀：只能删字，不能加字
+// 第二段要问模型的是哪几处
 // ============================================================
 
 /**
- * candidate 是否是 original 删去若干字符的结果（子序列关系）。
- * 大小写和全半角按归一化后比较，避免模型顺手把全角括号敲成半角就被判违规。
+ * 还在场、需要模型表态的命中，**编号顺序的唯一来源**。
+ *
+ * 只包含「参与了某条 LLM 裁决违规」且「第一段没动过」的命中。
+ * 拼提示词的地方和解析回答的地方都从这儿取，各写各的迟早错位。
  */
-export function isDeletionOnly(original: string, candidate: string): boolean {
-    const a = normalize(original).text;
-    const b = normalize(candidate).text;
-    if (b.length > a.length) return false;
-
-    let i = 0;
-    for (const ch of b) {
-        const found = a.indexOf(ch, i);
-        if (found < 0) return false;
-        i = found + 1;
+export function pendingHits(detectResult: DetectResult, stage: ProgramStage): Match[] {
+    const inPlay = new Set<Match>();
+    for (const v of detectResult.violations) {
+        if (v.arbiter !== 'LLM') continue;
+        for (const h of v.hits) {
+            if (!stage.handled.has(h)) inPlay.add(h);
+        }
     }
-    return true;
+    // 按在标题里的先后排，编号才符合阅读顺序
+    return detectResult.matches.filter(m => inPlay.has(m));
 }
+
+// ============================================================
+// 第三段：校验模型的答卷
+// ============================================================
+
+/**
+ * 模型交回来的方案能不能用。
+ *
+ * 放行的口子只有一个，而且卡得很死：
+ * **正文里的关联词**，模型明确判了「保留」并说明它是在描述人物或情节，
+ * 这条冲突才可以留着不管。理由是这类词没污染任何一个受保护关键字
+ *（绿帽、黄毛这些词面里既没有「NTR」也没有「纯爱」），搜索不会串行。
+ *
+ * 其余一律打回：
+ *   - 本体词在正文里被判保留 → 不行。「纯爱」两个字只要留在标题里，
+ *     搜「纯爱」就一定命中，这跟它在句子里当什么成分毫无关系。
+ *   - 标签区里还剩冲突 → 不行，那本来就轮不到模型定夺。
+ *   - 模型定的 TAG 自己就互斥 → 不行。
+ */
+function validateModelPlan(input: {
+    finalTitle: string;
+    finalTags: AppliedTag[];
+    keptWords: Set<string>;
+    compiled: CompiledConfig;
+    problems: string[];
+}): { ok: true } | { ok: false; reason: string; remaining: string[] } {
+    const { finalTitle, finalTags, keptWords, compiled, problems } = input;
+
+    if (problems.length > 0) {
+        return { ok: false, reason: '处理指令本身有问题', remaining: problems };
+    }
+    if (!finalTitle.trim()) {
+        return { ok: false, reason: '改出来的标题是空的', remaining: ['标题不能删成空的'] };
+    }
+    if (finalTitle.length > 100) {
+        return {
+            ok: false,
+            reason: `改出来的标题超长（${finalTitle.length} > 100）`,
+            remaining: [`Discord 帖子标题最多 100 个字符，现在是 ${finalTitle.length} 个`],
+        };
+    }
+
+    const recheck = detect(
+        { title: finalTitle, tags: finalTags, config: compiled.raw },
+        compiled,
+    );
+
+    const remaining: string[] = [];
+    for (const v of recheck.violations) {
+        if (v.arbiter === '程序') {
+            remaining.push(`${v.message}——这条在标签区里，本来就该处理掉`);
+            continue;
+        }
+
+        // 逐处看这条冲突还剩哪些命中，够不够格被放过
+        const offenders: string[] = [];
+        for (const h of v.hits) {
+            const declaredHere = declarationOf(h, recheck.segments) === '声明';
+            if (declaredHere) {
+                offenders.push(`标签区里还留着「${h.entry.word}」`);
+                continue;
+            }
+            if (tierOf(h) === '本体') {
+                offenders.push(`正文里还留着本体词「${h.entry.word}」`
+                    + '——这几个字只要在标题里，别人搜它就一定搜得到，'
+                    + '不管它在句子里是什么成分，所以不能用「只是描述」放过');
+                continue;
+            }
+            if (!keptWords.has(h.entry.word)) {
+                offenders.push(`正文里的「${h.entry.word}」你一句话都没说，得表个态`);
+            }
+            // 关联词 + 明确判了保留 → 放行
+        }
+
+        if (offenders.length > 0) remaining.push(`${v.message}：${offenders.join('；')}`);
+    }
+
+    // 模型自己定的 TAG 别打架
+    const groups = finalTags.map(t => t.group).filter(Boolean) as GroupId[];
+    for (let i = 0; i < groups.length; i++) {
+        for (let j = i + 1; j < groups.length; j++) {
+            if (tagGroupsClash(groups[i], groups[j], compiled)) {
+                remaining.push(`你定的 TAG 里「${groups[i]}」和「${groups[j]}」本身就互斥，只能留一个`);
+            }
+        }
+    }
+
+    if (remaining.length > 0) {
+        return { ok: false, reason: '按你的方案改完之后还是不合规', remaining };
+    }
+    return { ok: true };
+}
+
+// ============================================================
+// 组装
+// ============================================================
+
+export interface BuildPlanInput {
+    detectResult: DetectResult;
+    tags: AppliedTag[];
+    forumTags: ForumTag[];
+    compiled: CompiledConfig;
+    /** 作者在自助面板上亲手选的分类，压过社区保留顺序 */
+    authorChoice?: GroupId | null;
+    /** 模型的答卷。没有就先只跑第一段 */
+    judgement?: Judgement | null;
+}
+
+export function buildPlan(input: BuildPlanInput): RewritePlan {
+    const { detectResult, tags, forumTags, compiled, authorChoice, judgement } = input;
+    const originalTitle = detectResult.normalized.original;
+
+    const stage = planProgramStage({ detectResult, tags, forumTags, compiled, authorChoice });
+    const pending = pendingHits(detectResult, stage);
+
+    const base = {
+        originalTitle,
+        keepGroup: stage.keepGroup,
+        keepSource: stage.keepSource,
+        notes: [...stage.notes],
+    };
+
+    // ---------- 只有第一段 ----------
+    if (pending.length === 0) {
+        const newTitle = tidyTitle(applySpanEdits(detectResult, stage.edits));
+        const blocked = stage.blocked.length > 0 ? stage.blocked.join('；') : null;
+        return {
+            ...base,
+            newTitle,
+            removeTagIds: [...stage.removeTagIds],
+            addTagIds: [...stage.addTagIds],
+            autoFixable: !blocked,
+            blockedReason: blocked,
+            awaitingModel: false,
+            modelRejection: null,
+        };
+    }
+
+    // ---------- 还等着模型 ----------
+    if (!judgement) {
+        return {
+            ...base,
+            newTitle: originalTitle,
+            removeTagIds: [],
+            addTagIds: [],
+            autoFixable: false,
+            blockedReason: null,
+            awaitingModel: true,
+            modelRejection: null,
+        };
+    }
+
+    // ---------- 第二段：落实模型的处理 ----------
+    const applied = applyDecisions(detectResult, pending, judgement.decisions, compiled.raw);
+
+    // 两段的编辑坐标是同一套，合起来一次拼出来
+    const allEdits = [...stage.edits, ...applied.edits];
+    const finalTitle = tidyTitle(applySpanEdits(detectResult, allEdits));
+
+    // 模型可以推翻第一段定的 TAG，所以 TAG 以它给的最终清单为准
+    const wanted = resolveModelTags(judgement.finalTagGroups, tags, forumTags);
+    const removeTagIds = tags.filter(t => !wanted.some(w => w.tagId === t.tagId)).map(t => t.tagId);
+    const addTagIds = wanted.filter(w => !tags.some(t => t.tagId === w.tagId)).map(w => w.tagId);
+
+    const problems = [...applied.problems];
+    const missing = judgement.finalTagGroups.filter(g => !tagOfGroup(forumTags, g));
+    if (missing.length > 0) {
+        problems.push(`本论坛没有 ${missing.join(' / ')} 这些 TAG，换一个能挂的`);
+    }
+
+    const verdict = validateModelPlan({
+        finalTitle,
+        finalTags: wanted,
+        keptWords: new Set(applied.kept.map(m => m.entry.word)),
+        compiled,
+        problems,
+    });
+
+    if (!verdict.ok) {
+        return {
+            ...base,
+            newTitle: originalTitle,
+            removeTagIds: [],
+            addTagIds: [],
+            autoFixable: false,
+            blockedReason: null,
+            awaitingModel: false,
+            modelRejection: {
+                titleTried: finalTitle,
+                reason: verdict.reason,
+                remaining: verdict.remaining,
+                tagsAfter: wanted.map(t => t.tagName),
+            },
+        };
+    }
+
+    const notes = [...base.notes];
+    notes.push(`模型把这篇定性为「${judgement.verdict}」：${judgement.verdictReason}`);
+    for (const d of judgement.decisions) {
+        const m = pending[d.hit - 1];
+        if (!m) continue;
+        if (d.action === '保留') {
+            notes.push(`正文里的「${m.entry.word}」不算分类声明，留着：${d.why}`);
+        } else if (d.action === '替换') {
+            notes.push(`「${m.entry.word}」换成「${d.replaceWith}」：${d.why}`);
+        } else {
+            notes.push(`删掉「${m.entry.word}」所在的那一小块：${d.why}`);
+        }
+    }
+
+    const blocked = stage.blocked.length > 0 ? stage.blocked.join('；') : null;
+    return {
+        ...base,
+        newTitle: finalTitle,
+        removeTagIds,
+        addTagIds,
+        keepGroup: judgement.verdict || stage.keepGroup,
+        keepSource: judgement.verdict ? 'llm' : stage.keepSource,
+        autoFixable: !blocked,
+        blockedReason: blocked,
+        notes,
+        awaitingModel: false,
+        modelRejection: null,
+    };
+}
+
+/** 模型给的是分类组名，翻成本论坛真实存在的 TAG */
+function resolveModelTags(
+    groups: GroupId[],
+    current: AppliedTag[],
+    forumTags: ForumTag[],
+): AppliedTag[] {
+    const out: AppliedTag[] = [];
+
+    // 不参与分类的 TAG（画风、平台之类）原样留着，模型管不着
+    for (const t of current) {
+        if (!t.group) out.push(t);
+    }
+    for (const g of groups) {
+        const found = tagOfGroup(forumTags, g);
+        if (found && !out.some(t => t.tagId === found.tagId)) out.push(found);
+    }
+    return out;
+}
+
+// ============================================================
+// 人工路径：作者自己敲了一个新标题
+// ============================================================
 
 export interface TitleValidation {
     ok: boolean;
     reason: string | null;
+    /** 改完之后仍然存在的违规，用人话写的那一版 */
+    remaining?: string[];
 }
 
 /**
- * 校验一个候选新标题能不能用。三条全过才算数（设计文档 §5.5）：
- *   1. 只能是原标题删字的结果
+ * 校验一个**人手敲进来**的候选标题能不能用。
+ *
+ * 跟模型路径不是一回事：模型交的是删/换指令，标题由程序拼，天然安全；
+ * 人是直接把一串字打进来的，所以这儿要卡三条——
+ *   1. 只能是原标题删字的结果（不许越改越长，也不许夹带私货）
  *   2. 重跑检测不得仍然违规
  *   3. 长度合规（Discord 帖子标题上限 100）
+ *
+ * 第 2 条里「正文里待模型定性」的违规**照样算数**。作者自助改标题是没有模型参与的，
+ * 放过它们等于给了一条「把词挪进正文就没事」的后门。
  */
 export function validateNewTitle(
     originalTitle: string,
@@ -209,503 +669,32 @@ export function validateNewTitle(
     const trimmed = candidate.trim();
 
     if (!trimmed) return { ok: false, reason: '新标题为空' };
-    if (trimmed.length > 100) return { ok: false, reason: `新标题超长（${trimmed.length} > 100）` };
-
+    if (trimmed.length > 100) {
+        return { ok: false, reason: `新标题超长（${trimmed.length} > 100）` };
+    }
     if (!options.allowAddition && !isDeletionOnly(originalTitle, trimmed)) {
         return { ok: false, reason: '新标题包含原标题里没有的内容（只允许删字）' };
     }
 
     const recheck = detect({ title: trimmed, tags, config: compiled.raw }, compiled);
-    const remaining = recheck.violations.filter(v => !v.needsLlm);
-    if (remaining.length > 0) {
-        return { ok: false, reason: `改后仍然违规：${remaining.map(v => v.rule).join(' / ')}` };
-    }
-
-    return { ok: true, reason: null };
-}
-
-// ============================================================
-// 标题改写
-// ============================================================
-
-interface Edit {
-    /** 归一化坐标 */
-    start: number;
-    end: number;
-    /** 替换成什么；空串表示删除 */
-    replacement: string;
-}
-
-/** 把一组编辑应用到原文（编辑坐标是归一化坐标，先映射回原文） */
-function applyEdits(detectResult: DetectResult, edits: Edit[]): string {
-    if (edits.length === 0) return detectResult.normalized.original;
-
-    const mapped = edits
-        .map(e => ({ ...toSourceRange(detectResult.normalized, e.start, e.end), replacement: e.replacement }))
-        .sort((a, b) => a.start - b.start);
-
-    const src = detectResult.normalized.original;
-    let out = '';
-    let cursor = 0;
-    for (const e of mapped) {
-        if (e.start < cursor) continue; // 重叠编辑，跳过后来的
-        out += src.slice(cursor, e.start) + e.replacement;
-        cursor = e.end;
-    }
-    out += src.slice(cursor);
-    return out;
-}
-
-/**
- * 收尾清理：合并连续分隔符、去空括号、压空格。
- *
- * 必须**循环到稳定**：删掉 token 后括号里可能剩下 `【//】`，
- * 得先把分隔符清掉才会露出「空括号」这个形态，单趟顺序执行清不干净。
- */
-export function tidyTitle(title: string): string {
-    let current = title;
-
-    for (let round = 0; round < 6; round++) {
-        const next = current
-            // 空括号：【】 [] （） () 〖〗 〔〕
-            .replace(/【\s*】|\[\s*\]|（\s*）|\(\s*\)|〖\s*〗|〔\s*〕/g, '')
-            // 括号内首尾多余的分隔符
-            .replace(/([【\[（(〖〔])\s*[+、,，/|·&~；;]+\s*/g, '$1')
-            .replace(/\s*[+、,，/|·&~；;]+\s*([】\]）)〗〕])/g, '$1')
-            // 连续分隔符压成一个
-            .replace(/([+、,，/|·&~；;])\s*(?:[+、,，/|·&~；;]\s*)+/g, '$1')
-            // 括号内侧的残留空白（删掉一个 token 后常见：【 NTR】、【NTL 】）
-            .replace(/([【\[（(〖〔])\s+/g, '$1')
-            .replace(/\s+([】\]）)〗〕])/g, '$1')
-            .replace(/\s{2,}/g, ' ')
-            .trim();
-
-        if (next === current) break;
-        current = next;
-    }
-
-    return current;
-}
-
-/** 小句的边界。删主体段里的分类词时，删到这些符号为止 */
-const CLAUSE_BREAKS = new Set([
-    '，', ',', '。', '！', '!', '？', '?', '；', ';', '：', ':', '…', '、',
-    '~', '～', '—', '-', '/', '|', '·',
-]);
-
-/**
- * 找出**包着这个命中的那一整块**，删的时候连它一起删。
- *
- * 标记段里，这一块就是 token：「可纯爱」「NTL？」「有纯爱版」「怪味纯爱」这类，
- * 作者是把修饰词和分类词写成一个整体，只抠掉关键词会剩下没意义的残渣。
- *
- * 主体段里没有 token，就取**小句**——从命中往两边扩，扩到标点或段落边界为止。
- * 「纯爱版已第四次更新」这种句尾的更新说明，整句删掉才干净；
- * 只删「纯爱」两个字会剩个「版已第四次更新」，比不删还难看。
- */
-function enclosingToken(result: DetectResult, m: Match): { start: number; end: number } | null {
-    const seg = result.segments[m.segmentIndex];
-    if (!seg) return null;
-
-    if (m.segmentKind === 'marker') {
-        const token = tokenizeMarker(seg).find(t => t.start <= m.start && t.end >= m.end);
-        return token ? { start: token.start, end: token.end } : null;
-    }
-
-    const text = result.normalized.text;
-    let start = m.start;
-    while (start > seg.start && !CLAUSE_BREAKS.has(text[start - 1])) start--;
-    let end = m.end;
-    while (end < seg.end && !CLAUSE_BREAKS.has(text[end])) end++;
-
-    // 掐掉两头的空白，别把相邻小句之间的空格也吃进来
-    while (start < m.start && text[start] === ' ') start++;
-    while (end > m.end && text[end - 1] === ' ') end--;
-
-    return { start, end };
-}
-
-/**
- * 生成标题改写编辑。
- *
- * T1 黑名单词  → 整词替换为词典里的 replaceTo；没配就删除
- * T2 关键字互斥 → 删掉非保留组的 token（连同其前面的分隔符由 tidyTitle 收拾）
- * T4 交叉互斥   → 只处理「输在关键字那边」的，同样删 token
- * T3 及沾了正文的 → 不在这里处理，走 LLM 的 suggestedTitle + 三条校验
- */
-function buildRuleEdits(
-    result: DetectResult,
-    violations: Violation[],
-    keepGroup: GroupId | null,
-    compiled: CompiledConfig,
-): { edits: Edit[]; notes: string[] } {
-    const edits: Edit[] = [];
-    const notes: string[] = [];
-    const seen = new Set<string>();
-
-    const pushSpan = (span: { start: number; end: number }, note: string, replacement = '') => {
-        const key = `${span.start}-${span.end}`;
-        if (seen.has(key)) return;
-        seen.add(key);
-        edits.push({ start: span.start, end: span.end, replacement });
-        notes.push(note);
-    };
-
-    const push = (m: Match, replacement: string, note: string) => {
-        pushSpan({ start: m.start, end: m.end }, note, replacement);
-    };
-
-    /**
-     * 删掉一个命中所在的**整个 token**，不是关键词本身。
-     * 否则「可纯爱」只删掉「纯爱」会剩个孤零零的「可」，
-     *「NTL？」只删「NTL」会剩个「？」，「有纯爱版」会剩「有版」。
-     */
-    const deleteToken = (m: Match, why: string) => {
-        const span = enclosingToken(result, m) ?? { start: m.start, end: m.end };
-        const where = m.segmentKind === 'marker' ? '标签区里的' : '标题里的';
-        pushSpan(span, `删除${where}「${result.normalized.text.slice(span.start, span.end)}」${why}`);
-    };
-
-    for (const v of violations) {
-        if (v.rule === 'T1') {
-            for (const m of v.hits) {
-                const to = m.entry.replaceTo ?? '';
-                push(m, to, to
-                    ? `黑名单词「${m.entry.word}」→「${to}」`
-                    : `删除黑名单词「${m.entry.word}」`);
-            }
-            continue;
-        }
-
-        if (v.rule === 'T2') {
-            for (const m of v.hits) {
-                const group = m.entry.group;
-                if (!group || group === keepGroup) continue;
-                deleteToken(m, `（保留「${keepGroup ?? '?'}」）`);
-            }
-            continue;
-        }
-
-        // 交叉互斥输在关键字这边 → 删标题里的词。
-        // 输在 TAG 那边的不走这里，由 buildPlan 去摘 TAG。
-        if (v.rule === 'T4') {
-            const { loser, wordGroup, tagGroup } = decideCrossLoser(v, compiled);
-            if (loser !== 'word') continue;
-            for (const m of v.hits) {
-                if (m.entry.group !== wordGroup) continue;
-                deleteToken(m, `（与「${tagGroup}」TAG 冲突，且优先级更低）`);
-            }
-        }
-    }
-
-    return { edits, notes };
-}
-
-// ============================================================
-// 组装完整方案
-// ============================================================
-
-export interface BuildPlanInput {
-    detectResult: DetectResult;
-    tags: AppliedTag[];
-    /** 论坛可用的全部 TAG。补「多路线」TAG 时要从这里找它的 id */
-    availableTags?: ForumTag[];
-    compiled: CompiledConfig;
-    authorChoice?: GroupId | null;
-    judgement?: Judgement | null;
-    /** LLM 判定「不是分类标记」时，所有待定性的违规全部作废 */
-    llmCleared?: boolean;
-}
-
-export function buildPlan(input: BuildPlanInput): RewritePlan {
-    const { detectResult, tags, compiled } = input;
-    const originalTitle = detectResult.normalized.original;
-
-    // LLM 判定这些词不是分类标记 → 需要 LLM 定性的违规全部作废
-    const effective = input.llmCleared
-        ? detectResult.violations.filter(v => !v.needsLlm)
-        : detectResult.violations;
-
-    if (effective.length === 0) {
+    if (recheck.violations.length > 0) {
         return {
-            originalTitle,
-            newTitle: originalTitle,
-            removeTagIds: [],
-            addTagIds: [],
-            keepGroup: null,
-            keepSource: 'none',
-            autoFixable: true,
-            blockedReason: null,
-            notes: ['无需整改'],
+            ok: false,
+            reason: `改后仍然违规：${recheck.violations.map(v => v.rule).join(' / ')}`,
+            remaining: recheck.violations.map(v => v.message),
         };
     }
 
-    // 标题的标签区里明写出来的分类组。只认「确信是标签区」的那些段——
-    // 靠排版推断出来的、括号没闭合的都不算数，那些得先过 LLM。
-    // 这里不筛互斥集合：百破这种不参与关键字互斥的组，一样是作者的分类声明。
-    const titleDeclared = detectResult.matches
-        .filter(m => m.segmentKind === 'marker'
-            && detectResult.segments[m.segmentIndex]?.confident
-            && m.entry.kind !== '白名单' && m.entry.kind !== '中性标记'
-            && m.entry.group)
-        .map(m => m.entry.group as GroupId);
-
-    // 交叉互斥的输赢。只看优先级，不依赖保留组，所以可以先算出来。
-    // crossWordLosers 是其中「输在关键字这边」的，它们要从标题里删掉。
-    const crossWordLosers = new Set<GroupId>();
-    const crossLosers = new Set<GroupId>();
-    const crossWinners: { group: GroupId; byPriority: boolean }[] = [];
-    for (const v of effective) {
-        if (v.rule !== 'T4') continue;
-        const r = decideCrossLoser(v, compiled);
-        crossLosers.add(r.loser === 'word' ? r.wordGroup : r.tagGroup);
-        if (r.loser === 'word') crossWordLosers.add(r.wordGroup);
-        crossWinners.push({ group: r.winner, byPriority: r.byPriority });
-    }
-
-    const { group: keepGroup, source: keepSource } = decideKeepGroup({
-        violations: effective,
-        tags,
-        compiled,
-        crossWinners,
-        crossLosers,
-        authorChoice: input.authorChoice,
-        judgement: input.judgement,
-    });
-
-    const notes: string[] = [];
-
-    // 还有违规等着 LLM 定性、而判定结果又还没回来 → 什么都别做。
-    // 反例：《真正的橘子味世界不允许百合破坏的存在！》挂百合 TAG，
-    // 「百合破坏」是句子的一部分而不是分类标记，没等定性就把 TAG 摘了是误伤。
-    // 真机上由 enforcer 保证先调 LLM，但这道闸不能只靠调用方记得。
-    if (!input.judgement && effective.some(v => v.needsLlm)) {
-        return {
-            originalTitle,
-            newTitle: originalTitle,
-            removeTagIds: [],
-            addTagIds: [],
-            keepGroup: null,
-            keepSource: 'none',
-            autoFixable: false,
-            blockedReason: '标题里的分类词还没定性，要等语义判定结果',
-            notes,
-        };
-    }
-
-    // ---------- TAG 改写 ----------
-    const removeTagIds = new Set<string>();
-    for (const v of effective) {
-        if (v.rule === 'G1') {
-            // 摘掉非保留组的 TAG
-            for (const t of tags) {
-                if (!t.group || t.group === keepGroup) continue;
-                if (!v.groups.includes(t.group)) continue;
-                removeTagIds.add(t.tagId);
-                notes.push(`摘掉互斥 TAG「${t.tagName}」`);
-            }
-            continue;
-        }
-        if (v.rule === 'T4') {
-            const { loser, wordGroup } = decideCrossLoser(v, compiled);
-            // 输在关键字那边的由标题改写去处理，这里只管摘 TAG
-            if (loser !== 'tag') continue;
-            for (const tagId of v.tagIds) {
-                removeTagIds.add(tagId);
-                const t = tags.find(x => x.tagId === tagId);
-                notes.push(`摘掉与标题里「${wordGroup}」冲突的 TAG「${t?.tagName ?? tagId}」`);
-            }
-        }
-    }
-
-    // G1 多个互斥 TAG 时，decideKeepGroup 已按社区优先级（NTR > NTL > 纯爱）选好了保留组。
-    // 走到这里还定不了，说明优先级压根没配，那才是真的不敢动。
-    const hasG1 = effective.some(v => v.rule === 'G1');
-    if (hasG1 && !keepGroup) {
-        return {
-            originalTitle,
-            newTitle: originalTitle,
-            removeTagIds: [],
-            addTagIds: [],
-            keepGroup: null,
-            keepSource,
-            autoFixable: false,
-            blockedReason: 'TAG 互相冲突，且没有配置分类优先级，无法判断该保留哪个',
-            notes,
-        };
-    }
-
-    // 摘掉了互斥 TAG 就补上「多路线」——原来挂多个互斥 TAG 的帖子，作者的意思
-    // 通常就是「有多条线」，规范写法是「主分类 + 多路线」。
-    // 注意这只作用于 TAG；标题里的「多路线」三个字机器人不会替作者加。
-    const addTagIds = new Set<string>();
-
-    // 摘掉交叉冲突的 TAG 之后，帖子可能就没有分类 TAG 了。
-    // 标题声明的分类如果论坛里正好有对应 TAG，就补上去。
-    // 有几个前提：
-    //   · 这个 TAG 自己不能又撞上标题里别的关键字（不然摘了又补回一个违规）；
-    //   · 论坛里没有对应 TAG 的（比如百破就没有），只摘不补，那只是少个标签，不算改坏。
-    if (effective.some(v => v.rule === 'T4')) {
-        // 标题里即将被删掉的那些分类，不能再拿来补 TAG——
-        // 否则「标题写 NTL、TAG 挂 NTR」会一边删掉标题里的 NTL、一边补上 NTL 的 TAG。
-        const dropped = new Set<GroupId>(crossWordLosers);
-        for (const v of effective) {
-            if (v.rule !== 'T2') continue;
-            for (const g of v.groups) if (g !== keepGroup) dropped.add(g);
-        }
-
-        const stillDeclared = new Set(titleDeclared.filter(g => !dropped.has(g)));
-        const candidates = [...stillDeclared].filter(g => {
-            const banned = compiled.crossByTag.get(g);
-            if (banned && [...stillDeclared].some(w => banned.has(w))) return false;
-            return (input.availableTags ?? []).some(t => t.group === g);
-        });
-
-        if (candidates.length === 1) {
-            const group = candidates[0];
-            const already = tags.some(t => t.group === group && !removeTagIds.has(t.tagId));
-            const available = (input.availableTags ?? []).find(t => t.group === group);
-            if (!already && available) {
-                addTagIds.add(available.tagId);
-                notes.push(`补上和标题一致的「${available.tagName}」TAG`);
-            }
-        }
-    }
-
-    const multiRouteGroup = compiled.raw.multiRouteGroup;
-    if (hasG1 && multiRouteGroup) {
-        const already = tags.some(t => t.group === multiRouteGroup);
-        const available = (input.availableTags ?? []).find(t => t.group === multiRouteGroup);
-        if (!already && available) {
-            addTagIds.add(available.tagId);
-            notes.push(`补上「${available.tagName}」TAG`);
-        }
-    }
-
-    // ---------- 标题改写 ----------
-    //
-    // 复核新标题时必须用**方案执行后的 TAG**，不能用原始 TAG。
-    // 否则只要 TAG 也冲突（G1），复核就会一直看到 G1 没解决而判定「改后仍然违规」，
-    // 标题改写就永远被回退——TAG 冲突 + 标题冲突的帖子会全部卡死。
-    const addedTags = (input.availableTags ?? []).filter(t => addTagIds.has(t.tagId));
-    const tagsAfterPlan: AppliedTag[] = [
-        ...tags.filter(t => !removeTagIds.has(t.tagId)),
-        ...addedTags.filter(t => !tags.some(x => x.tagId === t.tagId)),
-    ];
-
-    // T4 只有「输在关键字那边」时才要动标题，输在 TAG 那边就只是摘 TAG
-    const crossNeedsTitleFix = effective.some(v =>
-        v.rule === 'T4' && decideCrossLoser(v, compiled).loser === 'word');
-    const needTitleFix = crossNeedsTitleFix
-        || effective.some(v => v.rule === 'T1' || v.rule === 'T2' || v.rule === 'T3');
-    let newTitle = originalTitle;
-
-    if (needTitleFix) {
-        // 交叉互斥判输在关键字这边 → 该删哪个词已经明确，程序自己动手：
-        // 标记段里删整个 token，主体段里删整个小句。走到这一步时
-        // 「这些词算不算分类标记」要么本来就没疑问，要么模型已经确认过了。
-        //
-        // T3 不一样：正文里两个分类打架，删哪一整句都可能把标题掏空
-        // （反例：纯爱牛头人日记），那才真的需要模型给改写方案。
-        // 但有个前提：正文里不能有两个互斥分类在打架。
-        // 有 T3 就说明打起来了，这时候删哪一小句都可能把标题整个掏空
-        // （反例：「纯爱牛头人日记」整条标题就是一小句），只能让模型给方案。
-        const proseIsContested = effective.some(v => v.rule === 'T3');
-        const crossTitleFixes = proseIsContested ? [] : effective.filter(v =>
-            v.rule === 'T4' && decideCrossLoser(v, compiled).loser === 'word');
-
-        const ruleViolations = [
-            ...effective.filter(v => v.rule === 'T1' || v.rule === 'T2'),
-            ...crossTitleFixes,
-        ];
-        const llmViolations = effective.filter(v => v.rule === 'T3');
-
-        if (ruleViolations.length > 0) {
-            if (!keepGroup && ruleViolations.some(v => v.rule === 'T2')) {
-                return {
-                    originalTitle,
-                    newTitle: originalTitle,
-                    removeTagIds: [...removeTagIds],
-            addTagIds: [...addTagIds],
-                    keepGroup: null,
-                    keepSource,
-                    autoFixable: false,
-                    blockedReason: '标记段里有互斥分类，但 TAG 也定不了该保留哪个，需要人工确认',
-                    notes,
-                };
-            }
-            const built = buildRuleEdits(detectResult, ruleViolations, keepGroup, compiled);
-            newTitle = tidyTitle(applyEdits(detectResult, built.edits));
-            notes.push(...built.notes);
-        }
-
-        if (llmViolations.length > 0) {
-            const suggested = input.judgement?.suggestedTitle;
-            if (!suggested) {
-                return {
-                    originalTitle,
-                    newTitle,
-                    removeTagIds: [...removeTagIds],
-            addTagIds: [...addTagIds],
-                    keepGroup,
-                    keepSource,
-                    autoFixable: false,
-                    blockedReason: '标题正文里的分类词需要人工判断如何改写',
-                    notes,
-                };
-            }
-            // 关键：LLM 的建议必须只能是原标题删字的结果
-            const check = validateNewTitle(newTitle, suggested, tagsAfterPlan, compiled);
-            if (!check.ok) {
-                return {
-                    originalTitle,
-                    newTitle,
-                    removeTagIds: [...removeTagIds],
-            addTagIds: [...addTagIds],
-                    keepGroup,
-                    keepSource,
-                    autoFixable: false,
-                    blockedReason: `模型给的改写方案没通过校验：${check.reason}`,
-                    notes,
-                };
-            }
-            newTitle = tidyTitle(suggested);
-            notes.push(`按判定结果改写标题（理由：${input.judgement?.reason ?? '—'}）`);
-        }
-    }
-
-    // ---------- 最终复核 ----------
-    if (newTitle !== originalTitle) {
-        // 黑名单替换是允许「加字」的唯一路径（替换目标来自词典，可控）
-        const allowAddition = effective.some(v => v.rule === 'T1' && v.hits.some(h => h.entry.replaceTo));
-        const check = validateNewTitle(originalTitle, newTitle, tagsAfterPlan, compiled, { allowAddition });
-        if (!check.ok) {
-            return {
-                originalTitle,
-                newTitle: originalTitle,
-                removeTagIds: [...removeTagIds],
-            addTagIds: [...addTagIds],
-                keepGroup,
-                keepSource,
-                autoFixable: false,
-                blockedReason: `自动改写结果没通过复核：${check.reason}`,
-                notes,
-            };
-        }
-    }
-
-    return {
-        originalTitle,
-        newTitle,
-        removeTagIds: [...removeTagIds],
-            addTagIds: [...addTagIds],
-        keepGroup,
-        keepSource,
-        autoFixable: true,
-        blockedReason: null,
-        notes,
-    };
+    return { ok: true, reason: null, remaining: [] };
 }
 
-/** 标记段 token 化的再导出，供面板展示用 */
-export { tokenizeMarker };
+/** 给通知文案用：这条违规涉及的分类组，人话版 */
+export function violationGroups(v: Violation): string {
+    return v.groups.join(' / ');
+}
+
+/** 词表里有没有这个词，归一化后比。配置面板校验用 */
+export function dictHasWord(config: GuardConfig, word: string): boolean {
+    const want = normalize(word).text;
+    return config.dict.some(e => normalize(e.word).text === want);
+}

@@ -12,14 +12,36 @@ import { titleGuardThreadCreate, titleGuardThreadUpdate } from './events/threadE
 
 import type { ModalSubmitInteraction } from 'discord.js';
 
-import { MODAL_APPEAL, handleAppealModal } from './components/noticePanel';
-import { handleTitleGuardModal as handleAuthorFixModal } from './components/authorFixPanel';
+import type { AnySelectMenuInteraction, ButtonInteraction } from 'discord.js';
 
-export { handleTitleGuardButton } from './components/noticePanel';
-export {
-    handleTitleGuardSelect,
+import { MODAL_APPEAL, handleAppealModal, handleTitleGuardButton as handleNoticeButton } from './components/noticePanel';
+import {
     handleAuthorFixButton,
+    handleTitleGuardModal as handleAuthorFixModal,
+    handleTitleGuardSelect as handleAuthorFixSelect,
 } from './components/authorFixPanel';
+import {
+    handleConfigButton,
+    handleConfigModal,
+    handleConfigSelect,
+} from './components/configPanel';
+
+/**
+ * 模块里所有 tt_ 按钮从这儿分流。
+ *
+ * 顺序要紧：配置台的 customId 里没有案件编号，
+ * 让通知面板先接的话它会把 `tt_cfg:home` 解析成「案件 NaN」，回一句「记录不存在」。
+ */
+export async function handleTitleGuardButton(interaction: ButtonInteraction): Promise<void> {
+    if (await handleConfigButton(interaction)) return;
+    if (await handleAuthorFixButton(interaction)) return;
+    await handleNoticeButton(interaction);
+}
+
+export async function handleTitleGuardSelect(interaction: AnySelectMenuInteraction): Promise<void> {
+    if (await handleConfigSelect(interaction)) return;
+    await handleAuthorFixSelect(interaction);
+}
 
 /**
  * 模块里的模态框统一从这儿分流。
@@ -27,6 +49,7 @@ export {
  * 免得每加一个弹窗就得改一次核心。
  */
 export async function handleTitleGuardModal(interaction: ModalSubmitInteraction): Promise<void> {
+    if (await handleConfigModal(interaction)) return;
     if (interaction.customId.startsWith(MODAL_APPEAL)) {
         await handleAppealModal(interaction);
         return;

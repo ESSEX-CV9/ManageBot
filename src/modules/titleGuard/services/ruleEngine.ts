@@ -2,38 +2,61 @@
 //
 // ④ 规则判定。纯函数：标题 + TAG + 配置 → 违规清单。
 //
-// 六条规则：
-//   T1 黑名单词      任意段命中黑名单词                       不需要 LLM
-//   T2 标记段冲突    同一标记段内出现同一互斥集合的 ≥2 个组   不需要 LLM
-//   T3 主体段冲突    主体段出现同一互斥集合的 ≥2 个组         需要 LLM 定性
-//   T4 标题与TAG矛盾 主体段的组与 TAG 的组同属一集合但不同    需要 LLM 定性
-//   G1 TAG 互斥      同一互斥集合内挂了 ≥2 个 TAG             不需要 LLM
-//   G2 TAG 禁令      标题含某组的分类标记 → 禁挂指定 TAG      标记段不需要 / 主体段需要
+// ============================================================
+// 这一层只回答两个问题：撞了没有，以及归谁管。
+// ============================================================
 //
-// LLM 只回答一个问题：**主体段里的这些分类词，是在做分类标记，还是自然语言的一部分？**
-// 只有 T3/T4（以及由主体段触发的 G2）会走它，绝大多数帖子根本不会调。
+// 四种互斥关系（RuleCode）：
+//   W  关键字 × 关键字    标题里同时出现互斥分类组的词
+//   G  TAG × TAG          帖子同时挂了互斥的 TAG
+//   X  TAG × 关键字       挂着某个 TAG，标题里却出现它不兼容的关键字（有方向）
+//   B  污染词             词面含别组受保护关键字的词，如「纯爱牛」含「纯爱」
+//
+// 归谁管（Arbiter），只看一件事：**这个冲突靠哪些命中才成立。**
+//
+//   全靠明写标签区里的词就能成立  → 程序。作者亲手把词放进方括号，那就是在盖章，
+//                                    没什么可问的，按保留顺序直接改。
+//   非得搭上标题主体里的词才成立  → LLM。**程序在主体里一概不下结论。**
+//
+// 第二条是硬规矩，没有例外。一句话里的「绿帽」到底是在给作品归类，
+// 还是在描述主角的癖好，光看标题的字面切不开——
+//   明明是绿帽癖的我，怎么会被辣妹逆推，这辈子好像只能搞纯爱了
+// 这是一部纯爱作品。程序要是在这儿抢答，就会把它改成 NTR，
+// 既冤枉了作者，又污染了 NTR 的搜索结果。
+//
+// 词档（本体 / 关联）**不参与路由**，它只在送进模型之后起作用：
+// 本体词在主体里从严（写了「纯爱」两个字，搜索就一定命中，没得辩），
+// 关联词在主体里结合上下文（它没污染任何一个受保护关键字）。
+// 见 llmJudge 里的提示词。
 
 import { normalize } from './normalizer';
 import { segment } from './segmenter';
 import { compileDict, makeIsWholeDictWord, match, type CompiledDict } from './matcher';
 import type {
     AppliedTag,
+    Arbiter,
+    Declaration,
     DetectInput,
     DetectResult,
     GroupId,
     GuardConfig,
     Match,
+    Segment,
     Violation,
+    WordTier,
 } from './types';
 
 /** 预编译一次配置，反复检测同一批帖子时复用 */
 export interface CompiledConfig {
     dict: CompiledDict;
     isWholeDictWord: (text: string) => boolean;
-    /** TAG 维度：分类组 → 所属互斥集合下标 */
-    tagGroupToSet: Map<GroupId, number>;
-    /** 关键字维度：分类组 → 所属互斥集合下标 */
-    wordGroupToSet: Map<GroupId, number>;
+    /**
+     * TAG 维度：分类组 → 它所属的**每一个**互斥集合的下标。
+     * 一个组可以同时属于好几个集合，见 compileConfig 里的说明。
+     */
+    tagGroupToSet: Map<GroupId, number[]>;
+    /** 关键字维度：同上 */
+    wordGroupToSet: Map<GroupId, number[]>;
     /** 交叉互斥：TAG 分类组 → 这个 TAG 在场时标题里不许出现的关键字分类组 */
     crossByTag: Map<GroupId, Set<GroupId>>;
     raw: GuardConfig;
@@ -41,14 +64,21 @@ export interface CompiledConfig {
 
 export function compileConfig(config: GuardConfig): CompiledConfig {
     const dict = compileDict(config.dict, config.segmenterWords ?? []);
-    const tagGroupToSet = new Map<GroupId, number>();
-    const wordGroupToSet = new Map<GroupId, number>();
+    const tagGroupToSet = new Map<GroupId, number[]>();
+    const wordGroupToSet = new Map<GroupId, number[]>();
 
+    // 一个分类组**可以同时属于好几个互斥集合**，这不是配错了，是必须支持的配法。
+    //
+    // 现行规则就是这样：关键字维度配的是「纯爱/NTR」和「纯爱/NTL」两组，
+    // 而不是「纯爱/NTR/NTL」一组——因为 NTR 和 NTL 在关键字层面是兼容的
+    //（一部作品可以两样都有，标题里两个词并排写没问题），
+    // 只有纯爱分别和它们互斥。这两种配法完全不是一回事。
     config.exclusiveSets.forEach((set, index) => {
         const target = set.dimension === 'tag' ? tagGroupToSet : wordGroupToSet;
         for (const group of set.groups) {
-            // 同一维度里一个组只该属于一个集合；重复配置时以先出现的为准
-            if (!target.has(group)) target.set(group, index);
+            const list = target.get(group);
+            if (list) { if (!list.includes(index)) list.push(index); }
+            else target.set(group, [index]);
         }
     });
 
@@ -91,38 +121,48 @@ export function pickByPriority(groups: GroupId[], config: GuardConfig): GroupId 
     return tied && bestScore === 0 ? null : best;
 }
 
-/** 参与互斥判定的命中：分类词或黑名单词，且映射到了分类组 */
-function classifyingGroup(m: Match): GroupId | null {
+// ============================================================
+// 命中的两个属性：声明力 和 词档
+// ============================================================
+
+/**
+ * 这处命中算不算「作者在盖章」。
+ *
+ *   声明 —— 写在明写的标签区里（规规矩矩的方括号、竖线夹住的区块）。
+ *   待定 —— 落在标题主体里，或落在靠排版猜出来的区块里。程序不下结论。
+ *
+ * 注意后缀和前缀一视同仁：`某某某[纯爱/救赎]` 和 `【纯爱】某某某`
+ * 都是作者在贴标签，没理由区别对待。
+ */
+export function declarationOf(m: Match, segments: Segment[]): Declaration {
+    const seg = segments[m.segmentIndex];
+    return m.segmentKind === 'marker' && seg?.confident ? '声明' : '待定';
+}
+
+/** 词档。词典里没标的一律按「关联」算——本体词是明确列举的那六个 */
+export function tierOf(m: Match): WordTier {
+    return m.entry.tier === '本体' ? '本体' : '关联';
+}
+
+/** 参与互斥判定的命中：分类词或污染词，且映射到了分类组 */
+export function classifyingGroup(m: Match): GroupId | null {
     if (m.entry.kind === '白名单' || m.entry.kind === '中性标记') return null;
     return m.entry.group;
 }
 
 /**
- * 把标题命中按「所属的**关键字**互斥集合」分桶，返回集合下标 → 该集合内出现的不同组。
- * 只看关键字维度——TAG 之间互不互斥是另一回事，跟标题里写了什么无关。
+ * 要拿去问模型的那些命中，**编号顺序的唯一来源**。
+ *
+ * 模型是按编号回答「这处怎么处理」的，所以拼提示词的地方和解析回答的地方
+ * 必须用同一份列表。各写各的迟早错位——错位的后果是删错词。
  */
-function groupsBySet(
-    matches: Match[],
-    compiled: CompiledConfig,
-): Map<number, Map<GroupId, Match[]>> {
-    const result = new Map<number, Map<GroupId, Match[]>>();
-
-    for (const m of matches) {
-        const group = classifyingGroup(m);
-        if (!group) continue;
-        const setIndex = compiled.wordGroupToSet.get(group);
-        if (setIndex === undefined) continue;
-
-        let bucket = result.get(setIndex);
-        if (!bucket) { bucket = new Map(); result.set(setIndex, bucket); }
-
-        const list = bucket.get(group);
-        if (list) list.push(m);
-        else bucket.set(group, [m]);
-    }
-
-    return result;
+export function judgeHitsOf(result: DetectResult): Match[] {
+    return result.matches.filter(m => classifyingGroup(m));
 }
+
+// ============================================================
+// 检测
+// ============================================================
 
 function tagGroups(tags: AppliedTag[]): Map<GroupId, AppliedTag[]> {
     const result = new Map<GroupId, AppliedTag[]>();
@@ -132,6 +172,42 @@ function tagGroups(tags: AppliedTag[]): Map<GroupId, AppliedTag[]> {
         if (list) list.push(t);
         else result.set(t.group, [t]);
     }
+    return result;
+}
+
+/** 一句话说清某个组的词都出现在哪儿，管理组一眼能看出是不是跨段撞的 */
+function whereOf(hits: Match[], segments: Segment[]): string {
+    const kinds = new Set(hits.map(
+        h => declarationOf(h, segments) === '声明' ? '标签区' : '正文'));
+    return [...kinds].join('和');
+}
+
+/**
+ * 把标题命中按「所属的**关键字**互斥集合」分桶，返回集合下标 → 该集合内出现的不同组。
+ * 只看关键字维度——TAG 之间互不互斥是另一回事，跟标题里写了什么无关。
+ */
+function wordConflicts(
+    matches: Match[],
+    compiled: CompiledConfig,
+): Map<number, Map<GroupId, Match[]>> {
+    const result = new Map<number, Map<GroupId, Match[]>>();
+
+    for (const m of matches) {
+        const group = classifyingGroup(m);
+        if (!group) continue;
+
+        // 一个组可能同属好几个集合，每个都要进——
+        // 「纯爱」既和 NTR 互斥又和 NTL 互斥，两边的冲突都得报出来
+        for (const setIndex of compiled.wordGroupToSet.get(group) ?? []) {
+            let bucket = result.get(setIndex);
+            if (!bucket) { bucket = new Map(); result.set(setIndex, bucket); }
+
+            const list = bucket.get(group);
+            if (list) list.push(m);
+            else bucket.set(group, [m]);
+        }
+    }
+
     return result;
 }
 
@@ -146,128 +222,122 @@ export function detect(input: DetectInput, precompiled?: CompiledConfig): Detect
     const matches = match(segments, compiled.dict);
 
     const violations: Violation[] = [];
+    const declared = (m: Match) => declarationOf(m, segments) === '声明';
 
-    /**
-     * 在这条标题里已经坐实是分类词的组。
-     *
-     * 只要一个组在**明写的标签区**（规规矩矩的括号、竖线夹住的区块）里出现过，
-     * 作者就已经用行动回答了「这个词是不是分类标记」——是。
-     * 那么它在同一条标题别处的出现（正文里、靠排版推断的区块里）也不必再问 LLM 了。
-     *
-     * 反例说明为什么要有这条：
-     *   8月21日更新（NTL/后宫/有纯爱版）……（ntl和纯爱两个改版）纯爱版已第四次更新
-     * 纯爱 明明白白写在两个括号里，可就因为句尾那一处落在正文段，
-     * 整条帖子都要去问一遍模型「纯爱算不算分类词」——问了个早有答案的问题。
-     */
-    const established = new Set<GroupId>();
-    for (const m of matches) {
-        if (m.segmentKind !== 'marker') continue;
-        if (!segments[m.segmentIndex]?.confident) continue;
-        const group = classifyingGroup(m);
-        if (group) established.add(group);
-    }
-    /** 涉事的组是不是都已经坐实了。都坐实就不用麻烦 LLM */
-    const allEstablished = (groups: GroupId[]) => groups.every(g => established.has(g));
-
-    // ---------- T1 黑名单词 ----------
+    // ---------- B 污染词 ----------
     //
-    // 黑名单词写在明写的标签区里，是不是在做分类标记没有疑问，直接判。
-    // 但落在正文里就得先定性——黑名单是按字面匹配的，很容易咬进一句大白话：
-    //   「……状态栏/我说纯爱牛逼！」里的「纯爱牛」其实是「纯爱」+「牛逼」，
-    //   照黑名单换成 NTR 就成了「我说NTR逼！」，比不改还糟。
-    const blacklisted = matches.filter(m => m.entry.kind === '黑名单');
-    for (const m of blacklisted) {
-        const inMarker = m.segmentKind === 'marker' && segments[m.segmentIndex]?.confident;
+    // 「纯爱牛」这种词的特殊之处不是它的意思，而是它的**字面**：
+    // 它含着「纯爱」两个字，所以搜「纯爱」的人会搜到一部 NTR 作品——直接污染。
+    //
+    // 但它照样按位置分流，没有例外：
+    //   写在标签区里 → 作者自己盖的章，程序直接判，强制换成 NTR。
+    //   落在主体里   → 送模型，因为字面匹配很容易咬错。作者写的可能是
+    //                  「纯爱牛娘」这种被切断的词，也可能是「纯爱牛逼」这种大白话，
+    //                  照污染词表硬换会把好好一句话改成病句。这两种都得读过首楼才分得清。
+    for (const m of matches) {
+        if (m.entry.kind !== '黑名单') continue;
         violations.push({
-            rule: 'T1',
-            message: `标题含黑名单词「${m.entry.word}」` +
-                (m.entry.replaceTo ? `，应改为「${m.entry.replaceTo}」` : '，应删除'),
+            rule: 'B',
+            message: `标题含污染词「${m.entry.word}」`
+                + (m.entry.replaceTo ? `，应改为「${m.entry.replaceTo}」` : '，应删除')
+                + (declared(m) ? '' : '（在正文里，待定性）'),
             hits: [m],
             groups: m.entry.group ? [m.entry.group] : [],
             tagIds: [],
-            needsLlm: !inMarker,
+            arbiter: declared(m) ? '程序' : 'LLM',
         });
     }
 
-    // ---------- T2 标记段冲突 ----------
-    // 标记段是作者明写标签的地方，所以**跨标记段**也算冲突。
-    // 反例：8.31补全所有立绘/纯爱人设阶段已加入【二创/古风/武侠/NTL/母猪】作为三流武者的你……
-    // 纯爱和 NTL 分处两个标签区，只在单段内比对的话这条会被判成合规，等于漏放。
-    const markerMatches = matches.filter(m => m.segmentKind === 'marker');
-    for (const [, byGroup] of groupsBySet(markerMatches, compiled)) {
+    // ---------- W 关键字 × 关键字 ----------
+    //
+    // **算的是整条标题，不分段。** 搜索污染不看那两个字分别待在哪儿：
+    //   在这个充满NTR的黄游世界里由她来守护你[纯爱/救赎/手枪卡]
+    // NTR 在正文、纯爱在后缀标签区，搜「纯爱」照样会搜到这部 NTR 作品。
+    //
+    // 位置只决定归谁管，判据是「这个冲突靠哪些命中才成立」：
+    //   光看标签区里的词，两个互斥组就已经都齐了 → 程序。
+    //   标签区里只齐了一个组，另一个组只在主体里出现 → LLM。
+    //     跨段冲突走的就是这一支。
+    //   两个组都只在主体里 → 也是 LLM。
+    //
+    // 为什么不能像以前那样「这个组在别处标签区坐实过，主体里的就不用问了」：
+    // 坐实的是**这个组**，不是**这一处命中**。
+    //   【NTR】…这辈子只能搞纯爱了
+    // NTR 在标签区坐实了没错，但主体里那个「纯爱」是不是在归类，仍然没有答案。
+    for (const [, byGroup] of wordConflicts(matches, compiled)) {
         if (byGroup.size < 2) continue;
+
         const groups = [...byGroup.keys()];
         const hits = groups.flatMap(g => byGroup.get(g)!);
-        const segIndexes = [...new Set(hits.map(h => h.segmentIndex))].sort((a, b) => a - b);
-        const zones = segIndexes.map(i => segments[i].text);
-        // 只要有一个标签区是「推出来的」而不是括号明写的，就先让 LLM 定性再动手。
-        // 「纯爱人设阶段已加入」形状上像标签，但也可能只是一句更新说明，删错了作者会很不高兴。
-        // 不过要是这些组在别处的明写标签区里已经坐实了，那就没什么可问的了。
-        const inferred = segIndexes.some(i => !segments[i].confident) && !allEstablished(groups);
+
+        // 光凭标签区里的词，能不能凑齐两个互斥组
+        const settledGroups = groups.filter(g => byGroup.get(g)!.some(declared));
+        const arbiter: Arbiter = settledGroups.length >= 2 ? '程序' : 'LLM';
+
+        if (arbiter === '程序') {
+            const zones = [...new Set(
+                hits.filter(declared).map(h => segments[h.segmentIndex].text))];
+            violations.push({
+                rule: 'W',
+                message: zones.length > 1
+                    ? `标题的标签区里同时声明了互斥分类：${settledGroups.join(' / ')}`
+                        + `（分别位于「${zones.join('」和「')}」）`
+                    : `标记段「${zones[0]}」里同时声明了互斥分类：${settledGroups.join(' / ')}`,
+                hits,
+                groups,
+                tagIds: [],
+                arbiter,
+            });
+            continue;
+        }
+
         violations.push({
-            rule: 'T2',
-            message: zones.length > 1
-                ? `标题的标签区里同时出现互斥分类：${groups.join(' / ')}`
-                    + `（分别位于「${zones.join('」和「')}」）`
-                : `标记段「${zones[0]}」里同时出现互斥分类：${groups.join(' / ')}`,
+            rule: 'W',
+            message: '标题里同时出现互斥分类：'
+                + groups.map(g => `${g}（${whereOf(byGroup.get(g)!, segments)}）`).join(' / '),
             hits,
             groups,
             tagIds: [],
-            needsLlm: inferred,
+            arbiter,
         });
     }
 
-    // ---------- T3 主体段冲突 ----------
-    const bodyMatches = matches.filter(m => m.segmentKind === 'body');
-    const bodyBySet = groupsBySet(bodyMatches, compiled);
-    for (const [, byGroup] of bodyBySet) {
-        if (byGroup.size < 2) continue;
-        const groups = [...byGroup.keys()];
-        violations.push({
-            rule: 'T3',
-            message: `标题正文里同时出现互斥分类：${groups.join(' / ')}`,
-            hits: groups.flatMap(g => byGroup.get(g)!),
-            groups,
-            tagIds: [],
-            // T3 恒为 true。「这些词算不算分类词」也许早有答案，
-            // 但正文里两个分类打架时该怎么改写，仍然只有模型能给方案——
-            // 这里要是标成 false，enforcer 就不会去问模型，而改写又给不出，帖子会永远卡住。
-            needsLlm: true,
-        });
-    }
-
-    // ---------- G1 TAG 互斥 ----------
+    // ---------- G TAG × TAG ----------
+    //
+    // 跟标题里写了什么无关，纯粹是 TAG 之间打架，永远由程序按保留顺序裁决。
     const byTagGroup = tagGroups(input.tags);
     const tagSetBuckets = new Map<number, GroupId[]>();
     for (const group of byTagGroup.keys()) {
-        const setIndex = compiled.tagGroupToSet.get(group);
-        if (setIndex === undefined) continue;
-        const list = tagSetBuckets.get(setIndex);
-        if (list) list.push(group);
-        else tagSetBuckets.set(setIndex, [group]);
+        for (const setIndex of compiled.tagGroupToSet.get(group) ?? []) {
+            const list = tagSetBuckets.get(setIndex);
+            if (list) { if (!list.includes(group)) list.push(group); }
+            else tagSetBuckets.set(setIndex, [group]);
+        }
     }
     for (const [, groups] of tagSetBuckets) {
         if (groups.length < 2) continue;
         violations.push({
-            rule: 'G1',
+            rule: 'G',
             message: `帖子同时挂了互斥的 TAG：${groups.join(' / ')}`,
             hits: [],
             groups,
             tagIds: groups.flatMap(g => byTagGroup.get(g)!.map(t => t.tagId)),
-            needsLlm: false,
+            arbiter: '程序',
         });
     }
 
-    // ---------- T4 交叉互斥（TAG × 标题关键字）----------
+    // ---------- X TAG × 关键字 ----------
     //
-    // 这是横跨两个维度的第三种互斥：挂了某个 TAG，标题里就不许出现某类关键字。
-    // 有方向——「TAG 纯爱 × 关键字 NTR」和「TAG NTR × 关键字 纯爱」是两条独立的规矩。
+    // 挂了某个 TAG，标题里就不许出现某类关键字。有方向：
+    //「TAG 纯爱 × 关键字 NTR」和「TAG NTR × 关键字 纯爱」是两条独立的规矩。
     //
-    // 判定只负责报「撞上了」，至于该摘 TAG 还是该删标题里的词，
-    // 由 rewriter 按分类优先级裁决：优先级低的那一边输，不管它在哪一侧。
-    //
-    // 标签区里明写的关键字，是不是分类标记没有疑问，直接判；
-    // 正文里提到的、以及靠排版推断出来的标签区，先让 LLM 定性。
+    // 归谁管还是看那些关键字落在哪儿：
+    //   明写在标签区里 → 程序。而且裁决方向是定死的：**标题赢，改 TAG。**
+    //     理由是标题是作者一个字一个字敲进去的，他知道自己在写什么；
+    //     TAG 是发帖时随手点的，点错太常见了。
+    //     标题那边的分类要是有对应的 TAG 就换上去，没有就直接摘掉——
+    //     百合TAG × 百破词就属于后者：百破没有自己的 TAG，摘掉百合即可，标题一个字不动。
+    //   落在主体里 → LLM，由它先给帖子定性再决定动哪边。
     for (const [tagGroup, tagsOfGroup] of byTagGroup) {
         const banned = compiled.crossByTag.get(tagGroup);
         if (!banned) continue;
@@ -276,22 +346,17 @@ export function detect(input: DetectInput, precompiled?: CompiledConfig): Detect
             const hits = matches.filter(m => classifyingGroup(m) === wordGroup);
             if (hits.length === 0) continue;
 
-            const inMarker = hits.every(h => h.segmentKind === 'marker');
-            // 全落在明写的标签区里，或者这个组在标题别处已经坐实过 —— 两种都算板上钉钉
-            const declared = (inMarker && hits.every(h => segments[h.segmentIndex].confident))
-                || established.has(wordGroup);
-
+            const anyDeclared = hits.some(declared);
             violations.push({
-                rule: 'T4',
-                message: (inMarker
-                    ? `标题的标签区写了「${wordGroup}」，帖子却挂着「${tagGroup}」TAG`
-                    : `标题正文提到「${wordGroup}」，帖子却挂着「${tagGroup}」TAG`)
-                    + (declared ? '' : '（待定性）'),
+                rule: 'X',
+                message: anyDeclared
+                    ? `标题的标签区声明了「${wordGroup}」，帖子却挂着「${tagGroup}」TAG`
+                    : `标题正文提到「${wordGroup}」，帖子却挂着「${tagGroup}」TAG（待定性）`,
                 hits,
-                // 顺序固定为 [关键字侧, TAG 侧]，改写器靠它分辨哪一边是哪一边
+                // 顺序固定为 [关键字侧, TAG 侧]，下游靠它分辨哪一边是哪一边
                 groups: [wordGroup, tagGroup],
                 tagIds: tagsOfGroup.map(t => t.tagId),
-                needsLlm: !declared,
+                arbiter: anyDeclared ? '程序' : 'LLM',
             });
         }
     }
@@ -301,6 +366,6 @@ export function detect(input: DetectInput, precompiled?: CompiledConfig): Detect
         segments,
         matches,
         violations,
-        needsLlm: violations.some(v => v.needsLlm),
+        needsLlm: violations.some(v => v.arbiter === 'LLM'),
     };
 }

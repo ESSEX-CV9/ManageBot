@@ -11,3 +11,6 @@ temp/
 docs/
 # 调试台保存词表前自动留的上一版
 src/modules/titleGuard/tools/seed-dict.json.bak
+
+# 提示词导出（随时可重新生成）
+src/modules/titleGuard/tools/_prompts.txt

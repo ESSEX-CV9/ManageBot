@@ -70,6 +70,16 @@ export interface NoticeInput {
     } | null;
     /** 申诉已升到人工，等管理组处理 */
     awaitingHuman?: boolean;
+    /**
+     * 案子已经有结果了。给了它，整条通知就改口——
+     * 不能一边写着「申诉成立、不作整改」，一边还挂着「请按下列说明处理」和处理期限。
+     */
+    resolution?: {
+        /** released = 判定被推翻/被放行，帖子不动；resolved = 已整改或已合规 */
+        kind: 'released' | 'resolved';
+        /** 一句话说明为什么结束 */
+        note: string;
+    } | null;
 }
 
 /** AI 理由的显示上限。再长就淹没正文了，完整内容管理组能在案件详情里看 */
@@ -124,7 +134,7 @@ function describeViolations(input: NoticeInput): string[] {
 
     for (const v of input.violations) {
         switch (v.rule) {
-            case 'T1':
+            case 'B':
                 for (const h of v.hits) {
                     const word = sourceWords([h], input.normalized)[0];
                     add(h.entry.replaceTo
@@ -133,21 +143,14 @@ function describeViolations(input: NoticeInput): string[] {
                 }
                 break;
 
-            case 'T2':
+            case 'W':
                 add(withWording(
-                    `标题中同时使用互斥分类 ${quoteList(v.groups)}`,
+                    `标题中同时出现互斥分类 ${quoteList(v.groups)}`,
                     v.hits, v.groups,
                 ));
                 break;
 
-            case 'T3':
-                add(withWording(
-                    `标题正文中同时提及互斥分类 ${quoteList(v.groups)}`,
-                    v.hits, v.groups,
-                ));
-                break;
-
-            case 'T4':
+            case 'X':
                 // groups 固定是 [关键字侧, TAG 侧]
                 add(withWording(
                     `标题所示分类「${v.groups[0]}」与所挂 TAG「${v.groups[1]}」不得并存`,
@@ -155,7 +158,7 @@ function describeViolations(input: NoticeInput): string[] {
                 ));
                 break;
 
-            case 'G1':
+            case 'G':
                 add(`帖子同时挂载互斥 TAG ${quoteList(v.groups)}`);
                 break;
         }
@@ -173,7 +176,57 @@ const KEEP_BASIS: Record<KeepSource, string> = {
     none: '',
 };
 
+/**
+ * 这条案子有没有经过 AI 判定。
+ *
+ * **只说「经过了」，绝不把 AI 的原话摆在公开消息里。**
+ * 那些话里带着它读到的规则、它的推理路数、甚至提示词里的措辞，
+ * 谁都能看的话，等于把提示词的轮廓一点点喂给想做注入的人。
+ * 完整理由走通知上那颗按钮，只有管理组点得开。
+ */
+function aiTouched(input: NoticeInput): boolean {
+    return Boolean(input.llmReason || input.review);
+}
+
+/** 告诉作者「这次经过了 AI 判定」，以及去哪儿看依据 */
+function aiFooterLine(input: NoticeInput): string {
+    if (!aiTouched(input)) return '';
+    return input.review
+        ? '本帖的整改方案经过 AI 语义判定，并已复核过一次。'
+        : '本帖的整改方案经过 AI 语义判定。';
+}
+
+/**
+ * 已结案的通知长什么样。
+ *
+ * 关键是**不留任何要求整改的措辞**：不列违规、不写处理方式、不写期限。
+ * 案子都结了还挂着这些，作者只会更糊涂。
+ */
+function buildClosedContent(
+    input: NoticeInput, resolution: NonNullable<NoticeInput['resolution']>,
+): NoticeContent {
+    const released = resolution.kind === 'released';
+    const line = aiFooterLine(input);
+
+    return {
+        mention: null,
+        title: released ? '帖子分类规范 · 已撤销' : '帖子分类规范 · 已结束',
+        description: released
+            ? '本帖经复核后**不作整改**，先前的整改通知作废。'
+            : '本帖分类信息已符合规范，本次检查结束。',
+        fields: [{ name: '结论', value: resolution.note || '—' }],
+        footer: line ? line + '\n如有疑问，请联系管理组。' : '如有疑问，请联系管理组。',
+        // 结案之后仍然留一颗查依据的按钮，管理组事后复盘要用
+        buttons: aiTouched(input)
+            ? [{ label: 'AI 判定依据', style: 'secondary', who: '有「接警」权限的身份组' }]
+            : [],
+    };
+}
+
 export function buildNoticeContent(input: NoticeInput): NoticeContent {
+    // 有结果了就走另一套文案，下面那些「请在期限前修改」一句都不能留
+    if (input.resolution) return buildClosedContent(input, input.resolution);
+
     const fields: NoticeField[] = [];
 
     // ---------- 1. 不符合规范之处 ----------
@@ -240,14 +293,14 @@ export function buildNoticeContent(input: NoticeInput): NoticeContent {
     const has = (...rules: string[]) => input.violations.some(v => rules.includes(v.rule));
     const basisLines: string[] = [];
 
-    if (has('T2', 'T3', 'G1')) {
+    if (has('W', 'G')) {
         basisLines.push('同一作品不得声明互斥分类：标题内不可，TAG 内亦不可。');
         basisLines.push('作品确有多条互斥路线的，应择主要路线作为主分类，另行加挂「多路线」。');
     }
-    if (has('T4')) {
+    if (has('X')) {
         basisLines.push('部分分类与特定 TAG 不得并存。二者相遇时，按社区既定顺序保留其一。');
     }
-    if (has('T1')) {
+    if (has('B')) {
         basisLines.push('部分写法已有规范的替代表述，应统一使用规范写法。');
     }
     if (basisLines.length === 0) {
@@ -255,30 +308,23 @@ export function buildNoticeContent(input: NoticeInput): NoticeContent {
     }
     fields.push({ name: '四、规范依据', value: basisLines.join('\n') });
 
-    // AI 说过的话挂在最下面，小字，不抢正文
-    const notes: string[] = [];
-    if (input.llmReason) notes.push(subtext('🤖 AI 判定：' + input.llmReason));
-    if (input.review) {
-        notes.push(subtext(
-            (input.review.upheld ? '🤖 AI 复核：维持原判。' : '🤖 AI 复核：申诉成立。')
-            + input.review.reason,
-        ));
-    }
-
     const description = '本帖分类信息不符合社区规范，请按下列说明处理。'
-        + (input.isOldPost ? '\n本帖为旧帖，已相应延长处理期限。' : '')
-        + (notes.length > 0 ? '\n\n' + notes.join('\n') : '');
+        + (input.isOldPost ? '\n本帖为旧帖，已相应延长处理期限。' : '');
 
     return {
         mention: input.authorId ? `<@${input.authorId}>` : null,
         title: '帖子分类规范 · 整改通知',
         description,
         fields,
-        footer: input.awaitingHuman
-            ? '本帖已提请人工复核，倒计时保持暂停，请等待管理组处理。'
-            : input.review
-                ? '如仍有异议，可点击下方按钮提请人工复核。'
-                : '如对判定有异议，请点击下方按钮提请复核，倒计时将即时暂停。',
+        // AI 那行放在最后一行小字**上面**，让作者知道这次有语义判定参与
+        footer: [
+            aiFooterLine(input),
+            input.awaitingHuman
+                ? '本帖已提请人工复核，倒计时保持暂停，请等待管理组处理。'
+                : input.review
+                    ? '如仍有异议，可点击下方按钮提请人工复核。'
+                    : '如对判定有异议，请点击下方按钮提请复核，倒计时将即时暂停。',
+        ].filter(Boolean).join('\n'),
         buttons: buildButtonList(input),
     };
 }
@@ -301,6 +347,12 @@ function buildButtonList(input: NoticeInput): NoticeButton[] {
             style: 'secondary',
             who: '帖主 / 管理组',
         });
+    }
+
+    // AI 参与过才给这颗按钮。理由只对管理组可见——
+    // 摆在公开消息里等于把提示词的轮廓喂给想做注入的人
+    if (aiTouched(input)) {
+        buttons.push({ label: 'AI 判定依据', style: 'secondary', who: '有「接警」权限的身份组' });
     }
 
     buttons.push({ label: '人工覆盖', style: 'danger', who: '有「覆盖」权限的身份组' });

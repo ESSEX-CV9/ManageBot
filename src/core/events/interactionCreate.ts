@@ -19,7 +19,6 @@ import {
     handleTitleGuardButton,
     handleTitleGuardSelect,
     handleTitleGuardModal,
-    handleAuthorFixButton,
 } from '../../modules/titleGuard';
 
 const INTERACTION_DEBUG_LOG = String(process.env.INTERACTION_DEBUG_LOG || '').toLowerCase() === 'true';
@@ -93,10 +92,9 @@ export async function interactionCreateHandler(interaction: Interaction): Promis
             } else if (interaction.customId.startsWith('elect_')) {
                 await handleElectionButton(interaction);
             } else if (interaction.customId.startsWith('tt_')) {
-                // 作者自助面板里的按钮先接，剩下的交给通知面板
-                if (!(await handleAuthorFixButton(interaction))) {
-                    await handleTitleGuardButton(interaction);
-                }
+                // 模块内部自己再分流（配置台 / 自助面板 / 通知面板），
+                // 核心不用知道它有几种面板
+                await handleTitleGuardButton(interaction);
             }
             // 新模块：在此追加 else if (customId.startsWith('yourprefix_')) { ... }
             return;

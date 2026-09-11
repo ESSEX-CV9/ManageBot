@@ -17,7 +17,8 @@ import {
     fetchThread,
     inspectThread,
 } from './enforcer';
-import { disableNoticeButtons, sendNotice } from '../components/noticePanel';
+import { summarizeJudgement } from './llmJudge';
+import { refreshNotice, sendNotice } from '../components/noticePanel';
 import { buildDoneMessage, buildResolvedMessage } from './noticeContent';
 import { runBackfillTick } from './backfillQueue';
 
@@ -79,18 +80,21 @@ async function processUnnotified(client: Client): Promise<void> {
                 deadline: Date.now(),
                 violations,
                 plan: inspection.plan,
-                llmReason: inspection.judgement?.reason ?? null,
+                llmReason: summarizeJudgement(inspection.judgement),
             });
             continue;
         }
 
-        // 到这里方案已经定了，通知里写的是确定的处理方式
-        db.updateCase(guardCase.id, {
+        // 到这里方案已经定了，通知里写的是确定的处理方式。
+        // 注意要拿 updateCase **返回的**那个对象去发通知：llmReason 是这次才写进去的，
+        // 用旧对象的话，AI 理由那行小字在第一条通知上永远不会出现。
+        const fresh = db.updateCase(guardCase.id, {
             violations,
             plan: inspection.plan,
-            llmReason: inspection.judgement?.reason ?? null,
-        });
-        await sendNotice(thread, guardCase, violations, inspection.plan,
+            llmReason: summarizeJudgement(inspection.judgement),
+        }) ?? guardCase;
+
+        await sendNotice(thread, fresh, violations, inspection.plan,
             inspection.detectResult?.normalized);
     }
 }
@@ -117,7 +121,8 @@ async function processDue(client: Client): Promise<void> {
 
         if (inspection.skipped || violations.length === 0) {
             db.closeCase(guardCase.id, 'resolved');
-            await disableNoticeButtons(guardCase, thread);
+            // 重画而不是只撤按钮——不然通知正文还挂着「请在期限前修改」
+            await refreshNotice(client, guardCase.id);
             await thread.send({ content: buildResolvedMessage() }).catch(() => { /* 忽略 */ });
             continue;
         }
@@ -131,20 +136,20 @@ async function processDue(client: Client): Promise<void> {
                 deadline: null,
                 violations,
                 plan,
-                llmReason: inspection.judgement?.reason ?? null,
+                llmReason: summarizeJudgement(inspection.judgement),
             });
             continue;
         }
 
         // LLM 判出来的违规是否需要管理组先确认
-        const llmDriven = violations.some(v => v.needsLlm);
+        const llmDriven = violations.some(v => v.arbiter === 'LLM');
         if (llmDriven && settings.llmNeedsConfirm) {
             db.updateCase(guardCase.id, {
                 state: 'pending_admin',
                 deadline: null,
                 violations,
                 plan,
-                llmReason: inspection.judgement?.reason ?? null,
+                llmReason: summarizeJudgement(inspection.judgement),
             });
             await notifyAdminPending(client, guardCase, '需要管理组确认后才会执行');
             continue;
@@ -156,7 +161,7 @@ async function processDue(client: Client): Promise<void> {
                 deadline: null,
                 violations,
                 plan,
-                llmReason: inspection.judgement?.reason ?? null,
+                llmReason: summarizeJudgement(inspection.judgement),
             });
             await notifyAdminPending(client, guardCase, plan?.blockedReason ?? '无法自动判断');
             continue;
@@ -176,7 +181,7 @@ async function processDue(client: Client): Promise<void> {
         }
 
         db.closeCase(guardCase.id, 'resolved');
-        await disableNoticeButtons(guardCase, thread);
+        await refreshNotice(client, guardCase.id);
 
         const tagName = (id: string) =>
             (thread.parent && 'availableTags' in thread.parent

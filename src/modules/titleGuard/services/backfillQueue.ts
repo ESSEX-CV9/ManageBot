@@ -137,10 +137,10 @@ export async function scanForum(
             title: thread.name,
             tags: inspection.tags.map(t => t.tagName).join(' | '),
             authorId: thread.ownerId ?? '',
-            isOldPost: isOldPost(thread, settings.oldPostDays),
+            isOldPost: isOldPost(thread, settings.oldPostInactiveHours),
             rules: [...new Set(violations.map(v => v.rule))].join(' '),
             detail: violations.map(v => v.message).join('；'),
-            needsLlm: violations.some(v => v.needsLlm),
+            needsLlm: violations.some(v => v.arbiter === 'LLM'),
             suggestedTitle: plan && plan.newTitle !== plan.originalTitle ? plan.newTitle : '',
             removeTags: plan
                 ? inspection.tags.filter(t => plan.removeTagIds.includes(t.tagId)).map(t => t.tagName).join(' | ')
@@ -152,7 +152,7 @@ export async function scanForum(
         if (dryRun) continue;
 
         // 真扫：老帖进慢速队列，新帖直接建案
-        if (isOldPost(thread, settings.oldPostDays)) {
+        if (isOldPost(thread, settings.oldPostInactiveHours)) {
             db.enqueueBackfill(guildId, forum.id, thread.id);
         } else {
             const { openCaseFor } = await import('./enforcer');

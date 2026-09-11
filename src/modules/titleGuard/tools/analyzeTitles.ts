@@ -30,6 +30,7 @@ import type {
     DictScope,
     GuardConfig,
     RuleCode,
+    WordTier,
 } from '../services/types';
 
 // ============================================================
@@ -74,6 +75,8 @@ interface SeedEntry {
     word: string;
     kind: DictKind;
     group: string | null;
+    /** 词档。种子文件里可以不写，不写就按「关联」算 */
+    tier?: WordTier;
     scope?: DictScope;
     replaceTo?: string | null;
     note?: string;
@@ -101,6 +104,9 @@ function loadSeed(file: string, markerOnly: boolean): { config: GuardConfig; tag
             word,
             kind: e.kind,
             group: e.kind === '白名单' ? null : e.group,
+            // 离线分析工具读的是种子文件，那里没有词档这一列。
+            // 统一按「关联」算，跟线上新词的默认一致。
+            tier: e.tier === '本体' ? '本体' : '关联',
             scope: markerOnly && e.kind !== '白名单' ? '仅标记段' : (e.scope ?? '全标题'),
             replaceTo: e.replaceTo ?? null,
             asciiBoundary: shouldForceAsciiBoundary(word),
@@ -262,7 +268,7 @@ async function main(): Promise<void> {
         const availableTags = config.multiRouteGroup
             ? [{ tagId: 'multi-route', tagName: '多路线', group: config.multiRouteGroup }]
             : [];
-        const plan = buildPlan({ detectResult: result, tags, availableTags, compiled });
+        const plan = buildPlan({ detectResult: result, tags, forumTags: availableTags, compiled });
         const rules = [...new Set(result.violations.map(v => v.rule))];
         for (const r of rules) ruleCount.set(r, (ruleCount.get(r) ?? 0) + 1);
         forumFlagged.set(key, (forumFlagged.get(key) ?? 0) + 1);
@@ -271,7 +277,7 @@ async function main(): Promise<void> {
             row,
             rules,
             messages: result.violations.map(v => v.message),
-            needsLlm: result.violations.some(v => v.needsLlm),
+            needsLlm: result.violations.some(v => v.arbiter === 'LLM'),
             matchedWords: result.matches.filter(m => m.entry.kind !== '白名单').map(m => m.entry.word),
             suggestedTitle: plan.newTitle !== plan.originalTitle ? plan.newTitle : '',
             removeTags: tags.filter(t => plan.removeTagIds.includes(t.tagId)).map(t => t.tagName),
@@ -304,17 +310,15 @@ async function main(): Promise<void> {
     console.log('各条规则命中数（一个帖子可能命中多条）');
     console.log('─'.repeat(72));
     const RULE_DESC: Record<RuleCode, string> = {
-        T1: '标题含黑名单词',
-        T2: '标题关键字互斥',
-        T3: '标题正文关键字互斥',
-        T4: 'TAG 与关键字交叉互斥',
-        G1: 'TAG 之间互斥',
+        B: '污染词（词面含别组的关键字）',
+        W: '关键字 × 关键字互斥',
+        X: 'TAG × 关键字交叉互斥',
+        G: 'TAG × TAG 互斥',
     };
-    for (const rule of ['T1', 'T2', 'G1', 'T3', 'T4'] as RuleCode[]) {
+    // 归谁裁决不看规则编号，看冲突落在哪一段，所以这里不再按规则标注「需 LLM」
+    for (const rule of ['B', 'W', 'G', 'X'] as RuleCode[]) {
         const n = ruleCount.get(rule) ?? 0;
-        // T4 落在标签区里时不用问 LLM，只有沾了正文才要，所以这里不再一刀切标注
-        const llm = rule === 'T3' ? '  ← 需 LLM' : rule === 'T4' ? '  ← 落在正文时需 LLM' : '';
-        console.log(`  ${rule}  ${RULE_DESC[rule].padEnd(20)} ${String(n).padStart(6)}${llm}`);
+        console.log(`  ${rule}  ${RULE_DESC[rule].padEnd(20)} ${String(n).padStart(6)}`);
     }
 
     console.log('\n' + '─'.repeat(72));

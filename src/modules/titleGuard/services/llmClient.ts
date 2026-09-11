@@ -30,6 +30,13 @@ export const MODE_LABEL: Record<CallMode, string> = {
     json: 'JSON 输出',
 };
 
+/**
+ * 默认超时 4 分钟。
+ * 思考模式的模型光推理就能跑一两分钟，超时给短了的表现是一律报
+ * 「This operation was aborted」，看上去像接口坏了，其实只是没等够。
+ */
+const DEFAULT_TIMEOUT_MS = 240000;
+
 export interface LlmConfig {
     baseUrl: string;
     apiKey: string;
@@ -59,7 +66,7 @@ export function readLlmConfig(): LlmConfig | null {
         apiKey,
         model,
         protocol,
-        timeoutMs: Number.isFinite(timeout) && timeout > 0 ? timeout : 20000,
+        timeoutMs: Number.isFinite(timeout) && timeout > 0 ? timeout : DEFAULT_TIMEOUT_MS,
         toolMode,
     };
 }
@@ -161,7 +168,8 @@ async function postJson(
     config: LlmConfig, path: string, payload: unknown,
 ): Promise<{ status: number; text: string }> {
     const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), config.timeoutMs);
+    let timedOut = false;
+    const timer = setTimeout(() => { timedOut = true; controller.abort(); }, config.timeoutMs);
     try {
         const res = await fetch(`${config.baseUrl}${path}`, {
             method: 'POST',
@@ -173,6 +181,15 @@ async function postJson(
             signal: controller.signal,
         });
         return { status: res.status, text: await res.text() };
+    } catch (err) {
+        // 光把 AbortError 抛出去，上层只会看到「This operation was aborted」，
+        // 归类成 unknown，排查的人根本猜不到是超时
+        if (timedOut) {
+            throw new LlmError('network',
+                `请求超时（已等 ${Math.round(config.timeoutMs / 1000)} 秒）。`
+                + '模型太慢的话，把 TITLEGUARD_LLM_TIMEOUT_MS 调大。');
+        }
+        throw new LlmError('network', err instanceof Error ? err.message : String(err));
     } finally {
         clearTimeout(timer);
     }

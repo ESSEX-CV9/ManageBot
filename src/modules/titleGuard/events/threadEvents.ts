@@ -12,7 +12,7 @@ import type { ThreadChannel } from 'discord.js';
 
 import * as db from '../services/titleGuardDatabase';
 import { effectiveViolations, inspectThread, isForumThread, openCaseFor } from '../services/enforcer';
-import { disableNoticeButtons } from '../components/noticePanel';
+import { refreshNotice } from '../components/noticePanel';
 import { buildResolvedMessage } from '../services/noticeContent';
 
 /** 新帖发布后等一会儿再查，给作者补 TAG 的时间 */
@@ -42,11 +42,12 @@ async function checkThread(thread: ThreadChannel): Promise<void> {
     const violations = effectiveViolations(inspection);
     const openCase = db.getOpenCase(thread.id);
 
-    // 已经合规了：把未结案件关掉，撤掉通知上的按钮
+    // 已经合规了：关掉未结案件，并把原通知改口成「已结束」
+    // （只撤按钮不够，正文还写着「请在期限前修改」）
     if (violations.length === 0) {
         if (openCase) {
             db.closeCase(openCase.id, 'resolved');
-            await disableNoticeButtons(openCase, thread);
+            await refreshNotice(thread.client, openCase.id);
             await thread.send({ content: buildResolvedMessage() }).catch(() => { /* 忽略 */ });
         }
         return;

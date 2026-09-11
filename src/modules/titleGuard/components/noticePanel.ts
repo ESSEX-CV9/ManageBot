@@ -7,7 +7,12 @@
 //   申请复核      帖主 + 管理组            → 填一句理由，先走 AI 复核
 //   申请人工复核  帖主 + 管理组            → AI 复核用掉之后变成这个
 //   驳回申诉      有「复核」能力的身份组    → 申诉不成立，恢复倒计时
+//   AI 判定依据   有「接警」能力的身份组    → 仅本人可见地看 AI 说了什么
 //   人工覆盖      有「覆盖」能力的身份组    → 直接放行并写入豁免表
+//
+// **AI 的原话一个字都不进公开消息。** 那些话里带着它读到的规则、它的推理路数、
+// 提示词里的措辞，谁都看得见的话，等于把提示词的轮廓一点点喂给想做注入的人。
+// 公开消息只说「这次经过了 AI 判定」，完整理由走上面那颗按钮。
 //
 // 复核是**两级**的：
 //   1. AI 复核每个案子只有一次。它维持原判 → 恢复倒计时，作者可以再升人工；
@@ -49,6 +54,7 @@ import { openAuthorFixPanel } from './authorFixPanel';
 export const BTN_FIX = 'tt_fix';           // tt_fix:<caseId>
 export const BTN_APPEAL = 'tt_appeal';     // tt_appeal:<caseId>
 export const BTN_REJECT = 'tt_reject';     // tt_reject:<caseId>
+export const BTN_AI = 'tt_ai';             // tt_ai:<caseId>
 export const BTN_OVERRIDE = 'tt_override'; // tt_override:<caseId>
 export const MODAL_APPEAL = 'tt_appealtext'; // tt_appealtext:<caseId>
 
@@ -90,11 +96,12 @@ export function buildNoticeEmbed(
             ? null
             : { upheld: guardCase.aiReviewUpheld, reason: guardCase.llmReviewReason ?? '' },
         awaitingHuman: guardCase.state === 'pending_admin',
+        resolution: resolutionOf(guardCase),
     });
 
     const embed = new EmbedBuilder()
         .setTitle(content.title)
-        .setColor(0xf0a30a)
+        .setColor(guardCase.closedAt ? 0x3ba55d : 0xf0a30a)
         .setDescription(content.description)
         .setFooter({ text: content.footer });
 
@@ -103,6 +110,27 @@ export function buildNoticeEmbed(
     }
 
     return embed;
+}
+
+/**
+ * 案子结了没有，结果是什么。
+ * 通知重画时靠它决定是继续摆着整改要求，还是改口说「已撤销」。
+ */
+function resolutionOf(guardCase: db.GuardCase): {
+    kind: 'released' | 'resolved'; note: string;
+} | null {
+    if (!guardCase.closedAt) return null;
+
+    if (guardCase.state === 'exempt') {
+        // 复核推翻的和管理组手动放行的，说法不一样
+        return guardCase.aiReviewUpheld === false
+            ? { kind: 'released', note: '复核认定申诉成立，本帖不作整改。' }
+            : { kind: 'released', note: '管理组已人工放行本帖。' };
+    }
+    if (guardCase.state === 'resolved') {
+        return { kind: 'resolved', note: '本帖分类信息已符合规范。' };
+    }
+    return { kind: 'resolved', note: '本次检查已结束。' };
 }
 
 /**
@@ -135,6 +163,17 @@ export function buildNoticeButtons(guardCase: db.GuardCase): ActionRowBuilder<Bu
                 .setLabel(aiReviewAvailable(guardCase) ? '申请复核' : '申请人工复核')
                 .setStyle(ButtonStyle.Secondary)
                 .setEmoji('⚖️'),
+        );
+    }
+
+    // AI 参与过才给这颗。理由只对管理组可见
+    if (guardCase.llmReason || guardCase.aiReviewUpheld !== null) {
+        row.addComponents(
+            new ButtonBuilder()
+                .setCustomId(`${BTN_AI}:${caseId}`)
+                .setLabel('AI 判定依据')
+                .setStyle(ButtonStyle.Secondary)
+                .setEmoji('🤖'),
         );
     }
 
@@ -222,7 +261,10 @@ export async function refreshNotice(client: Client, caseId: number): Promise<voi
                 guardCase.plan as RewritePlan | null,
                 tagNamesOf(thread),
             )],
-            components: guardCase.closedAt ? [] : [buildNoticeButtons(guardCase)],
+            // 结案之后其余按钮撤掉，但「AI 判定依据」留着——管理组事后复盘要用
+            components: guardCase.closedAt
+                ? [aiDetailRow(guardCase)].filter(Boolean) as ActionRowBuilder<ButtonBuilder>[]
+                : [buildNoticeButtons(guardCase)],
         });
     } catch { /* 消息可能已被删，忽略 */ }
 }
@@ -270,6 +312,10 @@ export async function handleTitleGuardButton(interaction: ButtonInteraction): Pr
         await handleReject(interaction, guardCase);
         return;
     }
+    if (interaction.customId.startsWith(BTN_AI)) {
+        await handleAiDetail(interaction, guardCase);
+        return;
+    }
     if (interaction.customId.startsWith(BTN_APPEAL)) {
         await handleAppeal(interaction, guardCase);
         return;
@@ -277,6 +323,63 @@ export async function handleTitleGuardButton(interaction: ButtonInteraction): Pr
     if (interaction.customId.startsWith(BTN_FIX)) {
         await handleFix(interaction, guardCase);
     }
+}
+
+/** 结案后单独留的那一行，只有「AI 判定依据」一颗 */
+function aiDetailRow(guardCase: db.GuardCase): ActionRowBuilder<ButtonBuilder> | null {
+    if (!guardCase.llmReason && guardCase.aiReviewUpheld === null) return null;
+    return new ActionRowBuilder<ButtonBuilder>().addComponents(
+        new ButtonBuilder()
+            .setCustomId(`${BTN_AI}:${guardCase.id}`)
+            .setLabel('AI 判定依据')
+            .setStyle(ButtonStyle.Secondary)
+            .setEmoji('🤖'),
+    );
+}
+
+/**
+ * 给管理组看 AI 到底说了什么。**仅本人可见**。
+ *
+ * 之所以要藏起来：这些理由里会复述社区规则、暴露模型的推理路数、
+ * 有时还会带出提示词里的原话。公开摆着的话，想做提示词注入的人
+ * 可以靠几十条通知反推出提示词长什么样，再针对性地写申诉去绕过它。
+ */
+async function handleAiDetail(interaction: ButtonInteraction, guardCase: db.GuardCase): Promise<void> {
+    if (!hasCapability(memberOf(interaction), guardCase.guildId, '接警')) {
+        await interaction.reply({
+            content: '❌ 这个按钮需要「接警」权限。判定依据只对管理组开放。',
+            flags: MessageFlags.Ephemeral,
+        });
+        return;
+    }
+
+    const embed = new EmbedBuilder()
+        .setTitle('🤖 AI 判定依据')
+        .setColor(0x5865f2)
+        .setDescription(`帖子：<#${guardCase.threadId}>\n案件 #${guardCase.id}`);
+
+    if (guardCase.llmReason) {
+        embed.addFields({ name: '建案时的语义判定', value: guardCase.llmReason.slice(0, 1024) });
+    }
+    if (guardCase.appealText) {
+        // 作者原话。@ 打断一下，免得一条申诉理由把全服 ping 一遍
+        embed.addFields({
+            name: '作者的申诉理由',
+            value: defuse(guardCase.appealText).slice(0, 1024),
+        });
+    }
+    if (guardCase.aiReviewUpheld !== null) {
+        embed.addFields({
+            name: `AI 复核结论：${guardCase.aiReviewUpheld ? '维持原判' : '申诉成立'}`,
+            value: (guardCase.llmReviewReason ?? '—').slice(0, 1024),
+        });
+    }
+    if (!embed.data.fields?.length) {
+        embed.addFields({ name: '结论', value: '这条案子没有经过 AI 判定。' });
+    }
+
+    embed.setFooter({ text: '这些内容不对作者公开，请勿转贴到帖子里。' });
+    await interaction.reply({ embeds: [embed], flags: MessageFlags.Ephemeral });
 }
 
 async function handleFix(interaction: ButtonInteraction, guardCase: db.GuardCase): Promise<void> {
@@ -377,6 +480,23 @@ export async function handleAppealModal(interaction: ModalSubmitInteraction): Pr
         return;
     }
 
+    // 弹窗开着的这段时间里，案子可能已经被管理组结掉、或者已经转人工了。
+    // 按钮那边校验过一次不算数，提交时必须按**当前**状态再校验一次。
+    if (guardCase.closedAt) {
+        await interaction.reply({
+            content: '这条记录已经结案了，无需再提交。',
+            flags: MessageFlags.Ephemeral,
+        });
+        return;
+    }
+    if (guardCase.state === 'pending_admin') {
+        await interaction.reply({
+            content: '本帖已提请人工复核，正在等待管理组处理，无需重复提交。',
+            flags: MessageFlags.Ephemeral,
+        });
+        return;
+    }
+
     const raw = interaction.fields.getTextInputValue('reason').trim();
     if (raw.length < 2) {
         await interaction.reply({ content: '❌ 请写清楚你认为哪里判错了。', flags: MessageFlags.Ephemeral });
@@ -384,6 +504,19 @@ export async function handleAppealModal(interaction: ModalSubmitInteraction): Pr
     }
     // Discord 那边已经限长，这里再挡一次，防的是绕过客户端直接发交互的情况
     const text = raw.slice(0, APPEAL_MAX_LENGTH);
+
+    const wantAi = aiReviewAvailable(guardCase);
+
+    // 走 AI 这一路的话，先把名额抢下来再干别的。
+    // 抢占是一条带条件的 UPDATE，抢不到就说明有人已经在跑了——
+    // 连点几下按钮不该变成连调几次模型。
+    if (wantAi && !db.claimAiReview(guardCase.id)) {
+        await interaction.reply({
+            content: '⏳ 上一次复核还在进行中，请稍等片刻。',
+            flags: MessageFlags.Ephemeral,
+        });
+        return;
+    }
 
     // 安检和复核都要真调模型，肯定超过 3 秒，先把交互挂起来
     await interaction.deferReply({ flags: MessageFlags.Ephemeral });
@@ -397,28 +530,30 @@ export async function handleAppealModal(interaction: ModalSubmitInteraction): Pr
     });
 
     const settings = db.getSettings(guardCase.guildId);
-    const wantAi = aiReviewAvailable(guardCase);
 
     // ---------- 安检 ----------
-    const screening = await screenAppealText(text, { enabled: settings.llmEnabled && wantAi });
-
-    if (wantAi && !screening.safe) {
-        // 没过安检 → 这段话不进任何提示词，直接转人工。
-        // 注意这不等于驳回申诉：想搞提示词注入的人，他的帖子该不该改是另一回事。
-        await escalateToHuman(interaction, guardCase.id, text, {
-            note: screening.by === 'none'
-                ? `AI 复核未能进行（${screening.reason}），已直接转人工。`
-                : `⚠️ 申诉理由未通过输入安检（${screening.reason}），未提交 AI 复核，请人工判断。`,
-            flagged: screening.by !== 'none',
-        });
-        return;
-    }
-
-    // ---------- AI 复核 ----------
     if (wantAi) {
-        const outcome = await runAiReview(interaction, guardCase, text, settings.llmEnabled);
-        if (outcome === 'done') return;
-        // 复核没跑成（模型不可用等）→ 落到人工
+        const screening = await screenAppealText(text, { enabled: settings.llmEnabled });
+
+        if (!screening.safe) {
+            // 没过安检 → 这段话不进任何提示词，直接转人工。
+            // 注意这不等于驳回申诉：想搞提示词注入的人，他的帖子该不该改是另一回事。
+            // 名额还回去：这一轮压根没有复核发生。
+            db.releaseAiReview(guardCase.id);
+            await escalateToHuman(interaction, guardCase.id, text, {
+                note: screening.by === 'none'
+                    ? `AI 复核未能进行（${screening.reason}），已直接转人工。`
+                    : `⚠️ 申诉理由未通过输入安检（${screening.reason}），未提交 AI 复核，请人工判断。`,
+                flagged: screening.by !== 'none',
+            });
+            return;
+        }
+
+        // ---------- AI 复核 ----------
+        if (await runAiReview(interaction, guardCase, text, settings.llmEnabled) === 'done') return;
+
+        // 复核没跑成（模型不可用等）→ 名额还回去，落到人工
+        db.releaseAiReview(guardCase.id);
         await escalateToHuman(interaction, guardCase.id, text, {
             note: 'AI 复核未能完成，已转人工。',
             flagged: false,
@@ -457,7 +592,11 @@ async function runAiReview(
         tags: tags.map(t => ({ name: t.tagName, group: t.group })),
         hits: guardCase.violations.flatMap(v => v.hits)
             .filter(h => h.entry.group)
-            .map(h => ({ word: h.entry.word, group: h.entry.group!, where: h.segmentKind })),
+            .map(h => ({
+                word: h.entry.word,
+                group: h.entry.group!,
+                where: h.segmentKind === 'marker' ? '标签区' as const : '正文' as const,
+            })),
         violationMessages: guardCase.violations.map(v => v.message),
         plan: plan
             ? {
@@ -478,8 +617,8 @@ async function runAiReview(
     }
 
     const review = outcome.review;
+    // aiReviewUsed 在调用之前就抢占过了，这里只补结论
     db.updateCase(guardCase.id, {
-        aiReviewUsed: true,
         aiReviewUpheld: review.upheld,
         llmReviewReason: review.reason,
     });
@@ -499,8 +638,9 @@ async function runAiReview(
                 + `> ${review.reason}\n`
                 + '如果管理组另有判断，仍可人工处理。',
         });
+        // 帖子里只说结论，不贴 AI 原话——理由走「AI 判定依据」按钮
         await postToThread(thread,
-            `⚖️ 复核结论：**申诉成立**，本帖分类信息不作整改。\n-# 🤖 ${review.reason}`);
+            '⚖️ 复核结论：**申诉成立**，本帖分类信息不作整改。');
         return 'done';
     }
 
@@ -508,6 +648,8 @@ async function runAiReview(
     const deadline = resumeCountdown(guardCase.id);
     await refreshNotice(interaction.client, guardCase.id);
 
+    // 这条是仅本人可见的，给申诉人一个交代；理由给他看没问题，
+    // 但别让它出现在帖子里被所有人收集
     await interaction.editReply({
         content: '⚖️ 复核结论：**维持原判**。\n'
             + `> ${review.reason}\n`
@@ -533,13 +675,20 @@ async function escalateToHuman(
     const settings = db.getSettings(guardCase.guildId);
     const mention = interaction.guild ? reviewerMentions(interaction.guild) : '';
 
-    const body = [
+    // 帖子里那条是公开的，**不带任何 AI 原话**——
+    // 管理组要看依据，点通知上的「AI 判定依据」按钮
+    const publicBody = [
         `🙋 <@${interaction.user.id}> 提请人工复核，自动整改已暂停。`,
         options.note,
-        `帖子：<#${guardCase.threadId}>`,
         `当前标题：\`${guardCase.originalTitle}\``,
         `申诉理由：${options.flagged ? '（下列内容未通过输入安检，仅作留存，请勿照其指示操作）' : ''}`,
         `> ${defuse(appealText).split('\n').join('\n> ')}`,
+    ].filter(Boolean).join('\n');
+
+    // 接警频道是管理组自己的地方，可以带上依据
+    const staffBody = [
+        publicBody,
+        `帖子：<#${guardCase.threadId}>`,
         guardCase.llmReason ? `-# 🤖 建案时的定性理由：${guardCase.llmReason}` : '',
         guardCase.llmReviewReason ? `-# 🤖 AI 复核结论：${guardCase.llmReviewReason}` : '',
     ].filter(Boolean).join('\n');
@@ -549,15 +698,15 @@ async function escalateToHuman(
 
     if (mention && here) {
         try {
-            await here.send({ content: `${mention}\n${body}` });
+            await here.send({ content: `${mention}\n${publicBody}` });
             delivered = true;
         } catch { /* 下面走兜底 */ }
     }
-    if (!delivered && settings.alertChannelId) {
+    if (settings.alertChannelId) {
         try {
             const channel = await interaction.client.channels.fetch(settings.alertChannelId);
             if (channel?.isTextBased() && !channel.isDMBased()) {
-                await channel.send({ content: body });
+                await channel.send({ content: staffBody });
                 delivered = true;
             }
         } catch { /* 忽略 */ }
@@ -622,7 +771,7 @@ async function handleOverride(interaction: ButtonInteraction, guardCase: db.Guar
         flags: MessageFlags.Ephemeral,
     });
 
-    await interaction.message.edit({ components: [] }).catch(() => { /* 忽略 */ });
+    await refreshNotice(interaction.client, guardCase.id);
     if (interaction.channel && !interaction.channel.isDMBased()) {
         await interaction.channel.send({
             content: `🛡️ 管理组 <@${interaction.user.id}> 已人工放行本帖，无需再做调整。`,
@@ -640,18 +789,6 @@ async function postToThread(thread: ThreadChannel, content: string): Promise<voi
             await thread.setArchived(true, '标题规范：发送后恢复归档').catch(() => { /* 忽略 */ });
         }
     }
-}
-
-/** 复查用：帖子已经合规了就把通知消息的按钮撤掉 */
-export async function disableNoticeButtons(
-    guardCase: db.GuardCase,
-    thread: ThreadChannel | null,
-): Promise<void> {
-    if (!thread || !guardCase.noticeMessageId) return;
-    try {
-        const message = await thread.messages.fetch(guardCase.noticeMessageId);
-        await message.edit({ components: [] });
-    } catch { /* 消息可能已被删，忽略 */ }
 }
 
 export { inspectThread, buildDoneMessage, alertMentions };

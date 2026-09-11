@@ -2,9 +2,14 @@
 //
 // /标题规范 —— 管理命令。
 //
-// 权限一律走 core/utils/permissionManager 的 checkAdminPermission，模块内不另做一套。
-// 注意区分：**判定权限**用 permissionManager；**「呼叫管理组」@ 谁**是配置面板里单独设的
-// 「接警身份组」——有权限改和想被 ping 是两回事。
+// 权限按**能力**发，不按「是不是管理员」发（见 services/titleGuardPermissions.ts）：
+// 社区管理组是一堆身份组，风纪委员和执行管理管的事情不一样。
+//   词表 → 词典/分词/互斥/TAG 映射   设置 → 开关/论坛/队列
+//   复核 → 案件/豁免/还原            覆盖 → 通知上的放行按钮
+// 某项能力没配任何身份组时回退到管理员判定，也就是保持升级前的行为。
+//
+// 唯一的例外是 `权限` 这一组：发权限的权限**只有服主和 Discord 管理员**有，
+// 否则一个只有「复核」的身份组能给自己发「设置」，权限体系就形同虚设。
 
 import {
     AttachmentBuilder,
@@ -24,12 +29,21 @@ import {
     getAllowedRoles,
     getPermissionDeniedMessage,
 } from '../../../core/utils/permissionManager';
+import {
+    CAPABILITIES,
+    CAPABILITY_HINT,
+    hasCapability,
+    isCapability,
+    rolesWithCapability,
+    type GuardCapability,
+} from '../services/titleGuardPermissions';
 
 import * as db from '../services/titleGuardDatabase';
 import { getCompiledConfig, invalidateConfigCache, fetchThread, inspectThread, effectiveViolations, revertLast, applyPlan } from '../services/enforcer';
 import { autoMapTags, scanForum, type ScanRow } from '../services/backfillQueue';
-import { describeLlmConfig } from '../services/llmJudge';
+import { describeLlmConfig, summarizeJudgement } from '../services/llmJudge';
 import { cutForDebug } from '../services/wordBoundary';
+import { openConfigPanel } from '../components/configPanel';
 import { normalize } from '../services/normalizer';
 import type { DictKind, DictScope, ExclusiveDimension, SegmenterWord } from '../services/types';
 
@@ -37,23 +51,46 @@ import type { DictKind, DictScope, ExclusiveDimension, SegmenterWord } from '../
 // 权限
 // ============================================================
 
-async function requireAdmin(interaction: ChatInputCommandInteraction): Promise<boolean> {
+/** 交互里的 member 有时是残缺的（缺 roles），补一次真实成员 */
+async function resolveMember(interaction: ChatInputCommandInteraction): Promise<GuildMember | null> {
+    const member = interaction.member as GuildMember | null;
+    if (member && member.roles) return member;
+    try {
+        const guild = interaction.guild ?? await interaction.client.guilds.fetch(interaction.guildId!);
+        return await guild.members.fetch(interaction.user.id);
+    } catch {
+        return null;
+    }
+}
+
+/** 这条子命令需要哪项能力。任意一项满足即可 */
+async function requireCap(
+    interaction: ChatInputCommandInteraction, caps: GuardCapability[],
+): Promise<boolean> {
     if (!interaction.guildId) {
         await interaction.reply({ content: '❌ 这个指令只能在服务器里使用。', flags: MessageFlags.Ephemeral });
         return false;
     }
 
-    let member = interaction.member as GuildMember | null;
-    if (!member || !member.roles) {
-        try {
-            const guild = interaction.guild ?? await interaction.client.guilds.fetch(interaction.guildId);
-            member = await guild.members.fetch(interaction.user.id);
-        } catch {
-            member = null;
-        }
-    }
+    const member = await resolveMember(interaction);
+    if (caps.some(c => hasCapability(member, interaction.guildId!, c))) return true;
 
-    if (checkAdminPermission(member)) return true;
+    const names = caps.map(c => `「${c}」`).join('或');
+    await interaction.reply({
+        content: `❌ 这个操作需要${names}权限。\n`
+            + '（管理组可用 `/标题规范 权限 授予` 把它发给对应的身份组）',
+        flags: MessageFlags.Ephemeral,
+    });
+    return false;
+}
+
+/** 发权限这件事本身不走能力体系，只认服主和 Discord 管理员 */
+async function requireAdmin(interaction: ChatInputCommandInteraction): Promise<boolean> {
+    if (!interaction.guildId) {
+        await interaction.reply({ content: '❌ 这个指令只能在服务器里使用。', flags: MessageFlags.Ephemeral });
+        return false;
+    }
+    if (checkAdminPermission(await resolveMember(interaction))) return true;
     await interaction.reply({ content: getPermissionDeniedMessage(), flags: MessageFlags.Ephemeral });
     return false;
 }
@@ -66,17 +103,32 @@ const data = new SlashCommandBuilder()
     .setName('标题规范')
     .setDescription('管理论坛帖子的标题与 TAG 分类规范')
 
+    .addSubcommand(s => s.setName('面板').setDescription('打开配置台：批量改权限、论坛、时间与开关'))
+
     .addSubcommand(s => s.setName('配置').setDescription('查看/修改本服务器的规范设置')
         .addChannelOption(o => o.setName('接警频道').setDescription('无法 @ 到接警身份组时，通知发到这里').addChannelTypes(ChannelType.GuildText))
-        .addRoleOption(o => o.setName('接警身份组').setDescription('「呼叫管理组」按钮 @ 的身份组'))
+        .addRoleOption(o => o.setName('接警身份组').setDescription('出事 @ 谁（只增不减；要移除用 /标题规范 权限 收回）'))
         .addBooleanOption(o => o.setName('启用').setDescription('总开关'))
         .addBooleanOption(o => o.setName('自动整改').setDescription('到期后是否允许机器人动手改'))
         .addBooleanOption(o => o.setName('启用llm').setDescription('是否调用 LLM 判定标题正文'))
         .addBooleanOption(o => o.setName('llm需确认').setDescription('LLM 判出的违规是否要管理组先确认'))
         .addIntegerOption(o => o.setName('新帖宽限小时').setDescription('默认 24').setMinValue(1).setMaxValue(720))
         .addIntegerOption(o => o.setName('老帖宽限小时').setDescription('默认 168（7 天）').setMinValue(1).setMaxValue(2160))
-        .addIntegerOption(o => o.setName('老帖天数').setDescription('发帖超过多少天算老帖，默认 60').setMinValue(1))
+        .addIntegerOption(o => o.setName('老帖沉寂小时')
+            .setDescription('已归档且沉寂超过多少小时算老帖（看最近回复，不看发帖时间），默认 72')
+            .setMinValue(1))
         .addIntegerOption(o => o.setName('队列间隔分钟').setDescription('老帖队列多久处理一个，默认 20').setMinValue(1)))
+
+    .addSubcommandGroup(g => g.setName('权限').setDescription('哪些身份组能干哪些事')
+        .addSubcommand(s => s.setName('授予').setDescription('把一项能力发给一个身份组')
+            .addRoleOption(o => o.setName('身份组').setDescription('比如风纪委员').setRequired(true))
+            .addStringOption(o => o.setName('能力').setDescription('要发哪一项').setRequired(true)
+                .addChoices(...CAPABILITIES.map(c => ({ name: `${c} —— ${CAPABILITY_HINT[c]}`, value: c })))))
+        .addSubcommand(s => s.setName('收回').setDescription('收回一项能力（不填能力则全部收回）')
+            .addRoleOption(o => o.setName('身份组').setDescription('要收回的身份组').setRequired(true))
+            .addStringOption(o => o.setName('能力').setDescription('留空 = 收回这个身份组的全部能力')
+                .addChoices(...CAPABILITIES.map(c => ({ name: c, value: c })))))
+        .addSubcommand(s => s.setName('列表').setDescription('查看当前的权限分配')))
 
     .addSubcommandGroup(g => g.setName('论坛').setDescription('管哪些论坛')
         .addSubcommand(s => s.setName('添加').setDescription('把一个论坛纳入管理')
@@ -241,7 +293,7 @@ async function handleConfig(interaction: ChatInputCommandInteraction): Promise<v
     for (const [option, key] of [
         ['新帖宽限小时', 'graceNewHours'],
         ['老帖宽限小时', 'graceOldHours'],
-        ['老帖天数', 'oldPostDays'],
+        ['老帖沉寂小时', 'oldPostInactiveHours'],
         ['队列间隔分钟', 'queueIntervalMinutes'],
     ] as const) {
         const value = o.getInteger(option);
@@ -250,11 +302,13 @@ async function handleConfig(interaction: ChatInputCommandInteraction): Promise<v
 
     const settings = changed ? db.saveSettings(patch) : db.getSettings(guildId);
 
-    const alertRoles = settings.alertRoleIds.length > 0
-        ? settings.alertRoleIds.map(id => `<@&${id}>`).join(' ')
+    const alertList = rolesWithCapability(guildId, '接警');
+    const reviewList = rolesWithCapability(guildId, '复核');
+    const alertRoles = alertList.length > 0
+        ? alertList.map(id => `<@&${id}>`).join(' ')
         : (getAllowedRoles().length > 0
             ? `_未设置，将回退到权限管理器里的身份组：${getAllowedRoles().map(id => `<@&${id}>`).join(' ')}_`
-            : '⚠️ _未设置，且权限管理器里的 ALLOWED_ROLE_IDS 也是空的——「呼叫管理组」按钮 @ 不到任何人_');
+            : '⚠️ _未设置——申诉转人工时 @ 不到任何人_');
 
     const embed = new EmbedBuilder()
         .setTitle('⚙️ 标题规范设置')
@@ -266,13 +320,105 @@ async function handleConfig(interaction: ChatInputCommandInteraction): Promise<v
             { name: 'LLM 判定需管理组确认', value: settings.llmNeedsConfirm ? '是' : '否', inline: true },
             { name: '新帖宽限', value: `${settings.graceNewHours} 小时`, inline: true },
             { name: '老帖宽限', value: `${settings.graceOldHours} 小时`, inline: true },
-            { name: '老帖门槛', value: `发帖超过 ${settings.oldPostDays} 天`, inline: true },
+            {
+                name: '老帖门槛',
+                value: `已归档且沉寂超过 ${settings.oldPostInactiveHours} 小时`,
+                inline: true,
+            },
             { name: '队列速率', value: `${settings.queueIntervalMinutes} 分钟 / 帖`, inline: true },
             { name: '队列状态', value: settings.queuePaused ? '⏸️ 已暂停' : '▶️ 运行中', inline: true },
-            { name: '接警身份组', value: alertRoles },
+            {
+                name: '接警身份组',
+                value: alertRoles,
+            },
+            {
+                name: '负责人工复核',
+                value: reviewList.length > 0
+                    ? reviewList.map(id => `<@&${id}>`).join(' ')
+                    : '_未配置，申诉转人工时改 @ 接警身份组_',
+            },
             { name: '接警频道', value: settings.alertChannelId ? `<#${settings.alertChannelId}>` : '_未设置_' },
         )
-        .setFooter({ text: '管理命令的权限判定走 permissionManager；接警身份组只决定「呼叫管理组」@ 谁。' });
+        .setFooter({ text: '各项操作分别需要哪种权限，用 /标题规范 权限 列表 查看。' });
+
+    await interaction.reply({ embeds: [embed], flags: MessageFlags.Ephemeral });
+}
+
+/**
+ * 身份组能力。
+ *
+ * 「管理组」在这个社区是一堆身份组，各管一摊，所以权限按能力发。
+ * 三条兜底规矩在 services/titleGuardPermissions.ts 里，这里只负责增删查和把状态说清楚——
+ * 尤其是「没配任何身份组 = 当前仅管理员可用」这一条，不写在面板上没人猜得到。
+ */
+async function handlePerms(interaction: ChatInputCommandInteraction, sub: string): Promise<void> {
+    const guildId = interaction.guildId!;
+
+    if (sub === '授予' || sub === '收回') {
+        const role = interaction.options.getRole('身份组', true);
+        const capRaw = interaction.options.getString('能力');
+
+        /**
+         * 老的「接警身份组」是存在 settings 里的另一份列表，
+         * 而且那条命令只增不删。不在这儿一并清掉的话，
+         * 从老路径加进去的身份组就永远摘不掉了。
+         */
+        const dropLegacyAlert = (): boolean => {
+            const current = db.getSettings(guildId).alertRoleIds;
+            if (!current.includes(role.id)) return false;
+            db.saveSettings({ guildId, alertRoleIds: current.filter(id => id !== role.id) });
+            return true;
+        };
+
+        if (sub === '收回' && !capRaw) {
+            const n = db.revokeAllCapabilities(guildId, role.id);
+            const legacy = dropLegacyAlert();
+            await interaction.reply(ephemeral(n > 0 || legacy
+                ? `✅ 已收回 <@&${role.id}> 的全部能力${n > 0 ? `（${n} 项）` : ''}`
+                    + `${legacy ? '，并从接警身份组名单里移除' : ''}。`
+                : `⚠️ <@&${role.id}> 本来就没有任何能力。`));
+            return;
+        }
+
+        if (!capRaw || !isCapability(capRaw)) {
+            await interaction.reply(ephemeral('❌ 能力名认不出来。'));
+            return;
+        }
+
+        if (sub === '授予') {
+            const ok = db.grantCapability(guildId, role.id, capRaw, interaction.user.id);
+            await interaction.reply(ephemeral(ok
+                ? `✅ <@&${role.id}> 现在可以：**${capRaw}** —— ${CAPABILITY_HINT[capRaw]}`
+                : `⚠️ <@&${role.id}> 已经有「${capRaw}」了。`));
+        } else {
+            const ok = db.revokeCapability(guildId, role.id, capRaw);
+            // 收回「接警」要连老名单一起清，否则它还会继续被 @ 到
+            const legacy = capRaw === '接警' && dropLegacyAlert();
+            await interaction.reply(ephemeral(ok || legacy
+                ? `✅ 已收回 <@&${role.id}> 的「${capRaw}」。`
+                : `⚠️ <@&${role.id}> 本来就没有「${capRaw}」。`));
+        }
+        return;
+    }
+
+    // 列表
+    const embed = new EmbedBuilder()
+        .setTitle('🔑 标题规范 · 权限分配')
+        .setColor(0x5865f2)
+        .setDescription(
+            '服主和带 Discord 管理员权限的人始终拥有全部能力。\n'
+            + '某项能力**一个身份组都没配**时，它回退到管理员判定——也就是只有上面那些人能用。',
+        );
+
+    for (const cap of CAPABILITIES) {
+        const roles = rolesWithCapability(guildId, cap);
+        embed.addFields({
+            name: `${cap} —— ${CAPABILITY_HINT[cap]}`,
+            value: roles.length > 0
+                ? roles.map(id => `<@&${id}>`).join(' ')
+                : '_未配置，当前仅管理员可用_',
+        });
+    }
 
     await interaction.reply({ embeds: [embed], flags: MessageFlags.Ephemeral });
 }
@@ -899,7 +1045,7 @@ async function handleInspect(interaction: ChatInputCommandInteraction): Promise<
     if (violations.length > 0) {
         embed.addFields({
             name: '违规',
-            value: violations.map(v => `**${v.rule}** ${v.message}${v.needsLlm ? '（需 LLM 定性）' : ''}`)
+            value: violations.map(v => `**${v.rule}** ${v.message}（${v.arbiter}裁决）`)
                 .join('\n').slice(0, 1024),
         });
     } else {
@@ -909,8 +1055,7 @@ async function handleInspect(interaction: ChatInputCommandInteraction): Promise<
     if (inspection.judgement) {
         embed.addFields({
             name: 'LLM 判定',
-            value: `是否分类标记：${inspection.judgement.isClassification ? '是' : '否'}　`
-                + `把握：${inspection.judgement.confidence}\n理由：${inspection.judgement.reason}`.slice(0, 1024),
+            value: (summarizeJudgement(inspection.judgement) ?? '—').slice(0, 1024),
         });
     }
 
@@ -999,7 +1144,13 @@ async function handleCases(interaction: ChatInputCommandInteraction, sub: string
         }
         const lines = cases.map(c =>
             `**#${c.id}** \`${c.state}\` <#${c.threadId}>\n　${c.originalTitle.slice(0, 60)}\n　${c.violations.map(v => v.rule).join(' ')}`
-            + (c.llmReason ? `\n　LLM：${c.llmReason.slice(0, 80)}` : ''),
+            + (c.llmReason ? `\n　🤖 定性：${c.llmReason.slice(0, 70)}` : '')
+            + (c.appealText
+                ? `\n　🙋 申诉：${c.appealText.split('\n').pop()!.slice(0, 70)}`
+                : '')
+            + (c.aiReviewUpheld === null
+                ? ''
+                : `\n　⚖️ 复核：${c.aiReviewUpheld ? '维持原判' : '申诉成立'}——${(c.llmReviewReason ?? '').slice(0, 60)}`),
         );
         await interaction.reply(ephemeral(`**未结案件（${cases.length}）**\n\n${lines.join('\n\n').slice(0, 1900)}`));
         return;
@@ -1130,16 +1281,48 @@ async function handleQueue(interaction: ChatInputCommandInteraction, sub: string
 // 入口
 // ============================================================
 
+/**
+ * 每组子命令需要哪项能力。列表里任意一项满足即可。
+ * 键是子命令组名；没有组的（配置/检查/扫描/还原）用子命令名。
+ */
+const CAPS_FOR: Record<string, GuardCapability[]> = {
+    词典: ['词表'],
+    分词: ['词表'],
+    互斥组: ['词表'],
+    tag映射: ['词表'],
+    论坛: ['设置'],
+    队列: ['设置'],
+    配置: ['设置'],
+    案件: ['复核'],
+    豁免: ['复核', '覆盖'],
+    还原: ['复核', '覆盖'],
+    // 只读的诊断，管词表和管设置的都该能看
+    检查: ['词表', '设置', '复核'],
+    扫描: ['词表', '设置', '复核'],
+};
+
 const command: Command = {
     data,
     async execute(interaction: ChatInputCommandInteraction) {
-        if (!await requireAdmin(interaction)) return;
-
         const group = interaction.options.getSubcommandGroup(false);
         const sub = interaction.options.getSubcommand();
 
+        // 发权限的权限不下放，其余按能力判。
+        // 面板例外：它自己会按页判权限，外层一刀切会把只有「词表」的人挡在门外
+        if (group === '权限') {
+            if (!await requireAdmin(interaction)) return;
+        } else if (group === null && sub === '面板') {
+            if (!interaction.guildId) {
+                await interaction.reply(ephemeral('❌ 这个指令只能在服务器里使用。'));
+                return;
+            }
+        } else if (!await requireCap(interaction, CAPS_FOR[group ?? sub] ?? ['设置'])) {
+            return;
+        }
+
         try {
             switch (group) {
+                case '权限': return await handlePerms(interaction, sub);
                 case '论坛': return await handleForum(interaction, sub);
                 case '词典': return await handleDict(interaction, sub);
                 case '分词': return await handleSegmenter(interaction, sub);
@@ -1152,6 +1335,7 @@ const command: Command = {
             }
 
             switch (sub) {
+                case '面板': return await openConfigPanel(interaction);
                 case '配置': return await handleConfig(interaction);
                 case '检查': return await handleInspect(interaction);
                 case '扫描': return await handleScan(interaction);

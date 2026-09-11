@@ -16,6 +16,7 @@
 
 import {
     ChannelType,
+    SnowflakeUtil,
     type Client,
     type ForumChannel,
     type Guild,
@@ -23,9 +24,14 @@ import {
 } from 'discord.js';
 
 import { compileConfig, detect, type CompiledConfig } from './ruleEngine';
-import { buildPlan, type RewritePlan } from './rewriter';
-import { judge, type Judgement, type JudgementCache, buildJudgeRules } from './llmJudge';
-import type { AppliedTag, DetectResult, ForumTag, GroupId } from './types';
+import {
+    pendingHits, planProgramStage, previewTagPlan, type RewritePlan,
+} from './rewriter';
+import { planWithModel } from './planner';
+import {
+    buildJudgeHits, buildJudgeRules, judge, type Judgement, type JudgementCache,
+} from './llmJudge';
+import type { AppliedTag, DetectResult, ForumTag, GroupId, Violation } from './types';
 import * as db from './titleGuardDatabase';
 
 // ============================================================
@@ -97,11 +103,34 @@ export function readAppliedTags(thread: ThreadChannel): AppliedTag[] {
     }));
 }
 
-/** 发帖是否已超过「老帖」门槛 */
-export function isOldPost(thread: ThreadChannel, oldPostDays: number): boolean {
-    const created = thread.createdTimestamp;
-    if (!created) return false;
-    return Date.now() - created > oldPostDays * 24 * 60 * 60 * 1000;
+/**
+ * 帖子最后一次有动静是什么时候。
+ *
+ * 用 lastMessageId 直接算——它是雪花，自带时间戳，不用再拉一次消息列表。
+ * 一条消息都没有的帖子（只有首楼被删之类）退回建帖时间。
+ */
+export function lastActivityAt(thread: ThreadChannel): number {
+    if (thread.lastMessageId) {
+        return Number(SnowflakeUtil.timestampFrom(thread.lastMessageId));
+    }
+    return thread.archiveTimestamp ?? thread.createdTimestamp ?? Date.now();
+}
+
+/**
+ * 这个帖子该按「老帖」处理吗。
+ *
+ * 看的是**最近活跃时间**，不是发帖时间：
+ *   - 还没归档的，不管发了多久，都是活帖 → 24 小时整改通知
+ *   - 已归档但最近还有动静（默认 72 小时内）→ 同样按活帖处理
+ *   - 已归档且沉寂超过门槛 → 老帖，走长处理期限
+ *
+ * 为什么这么分：给老帖发通知**一定会顶帖**。一个沉了半年的帖子被顶上来，
+ * 对论坛首页是打扰，所以要给足时间、并走慢速队列摊平。
+ * 而一个还在被回复的帖子，顶不顶都在那儿，24 小时完全够用。
+ */
+export function isOldPost(thread: ThreadChannel, inactiveHours: number): boolean {
+    if (!thread.archived) return false;
+    return Date.now() - lastActivityAt(thread) > inactiveHours * 60 * 60 * 1000;
 }
 
 // ============================================================
@@ -115,8 +144,13 @@ export interface InspectResult {
     availableTags: ForumTag[];
     plan: RewritePlan | null;
     judgement: Judgement | null;
-    /** LLM 判定这些词不是分类标记 */
+    /** 模型把每一处命中都判成了误判——整条标题都不用动 */
     llmCleared: boolean;
+    /**
+     * 这次调模型是**兜底**触发的：规则本身判得清清楚楚，
+     * 但改写方案出不来或没过校验，与其直接转人工，不如先问模型要个方案。
+     */
+    llmFallback: boolean;
     /**
      * 存在需要 LLM 定性的违规，但还没拿到判定结论
      * （dryRun、LLM 没配、调用失败）。这种状态**不该给作者发通知**——
@@ -145,6 +179,7 @@ export async function inspectThread(
         plan: null,
         judgement: null,
         llmCleared: false,
+        llmFallback: false,
         llmPending: false,
     };
 
@@ -167,49 +202,107 @@ export async function inspectThread(
     }
 
     let llmError: string | null = null;
-
-    // 需要 LLM 定性的部分
     let judgement: Judgement | null = null;
     let llmCleared = false;
+    let llmFallback = false;
 
-    if (detectResult.needsLlm && !options.dryRun) {
-        const settings = db.getSettings(guildId);
-        const bodyExcerpt = forumConfig.sendBodyToLlm ? await readFirstPostExcerpt(thread) : undefined;
+    const settings = db.getSettings(guildId);
+
+    // 程序那一段先跑出来：它决定了「还剩哪几处要问模型」，
+    // 也决定了「整改后 TAG 长什么样」。两件事都得在提问之前算好。
+    const stage = planProgramStage({ detectResult, tags, forumTags: availableTags, compiled });
+    const pending = pendingHits(detectResult, stage);
+
+    /** 真调一次模型。retryFeedback 非空时是「打回重写」那一轮 */
+    const callModel = async (retryFeedback?: string): Promise<Judgement | null> => {
+        // 定性这一步主要靠首楼。「纯爱牛娘」被分词切成「纯爱牛」这种误伤，
+        // 不看首楼根本分不出来，所以默认就要带上。
+        const bodyExcerpt = forumConfig.sendBodyToLlm
+            ? await readFirstPostExcerpt(thread) : undefined;
 
         const outcome = await judge(
             {
                 title: thread.name,
                 forumName: forum.name,
-                hits: detectResult.matches
-                    .filter(m => m.entry.group)
-                    .map(m => ({ word: m.entry.word, group: m.entry.group!, where: m.segmentKind })),
+                segments: detectResult.segments.map(seg => ({
+                    kind: seg.kind === 'marker' && seg.confident
+                        ? '标签区' as const : '正文' as const,
+                    text: seg.text,
+                })),
+                hits: buildJudgeHits(detectResult, pending, compiled.raw),
                 tags: tags.map(t => ({ name: t.tagName, group: t.group })),
-                // 把社区既定的互斥关系和优先级一起给它，否则遇到 TAG 冲突
-                // 它只会说「无法唯一确定应保留哪一组」——而程序这边其实有确定答案
+                // 程序那一段判出来的冲突直接摊给它
+                violations: detectResult.violations.map(v => v.message),
+                // 以及整改后 TAG 会变成什么样——它得按这个判，而且有权推翻
+                tagPlan: previewTagPlan({
+                    detectResult, tags, forumTags: availableTags, compiled,
+                }),
+                // 把社区既定的互斥关系、保留顺序、本体词清单一起给它。
+                // 少给一样它就会自己脑补，而现行规则里恰恰有「TAG 互斥但关键字兼容」
+                // 这种不脑补就想不到的配法
                 rules: buildJudgeRules(compiled.raw),
+                retryFeedback,
             },
             { bodyExcerpt, enabled: settings.llmEnabled, cache: llmCache },
         );
 
-        if (outcome.ok) {
-            judgement = outcome.judgement;
-            llmCleared = !outcome.judgement.isClassification;
-        } else {
-            // LLM 不可用：需要它定性的违规全部挂起，规则类违规不受影响照常跑
-            llmError = `${outcome.kind}: ${outcome.error}`;
-            console.warn(`[TitleGuard] LLM 判定失败（${outcome.kind}）：${outcome.error}`);
-        }
-    }
+        if (outcome.ok) return outcome.judgement;
 
-    const plan = buildPlan({
+        // LLM 不可用：需要它定性的违规全部挂起，规则类违规不受影响照常跑
+        llmError = `${outcome.kind}: ${outcome.error}`;
+        console.warn(`[TitleGuard] LLM 判定失败（${outcome.kind}）：${outcome.error}`);
+        return null;
+    };
+
+    /** 问一次模型。已经问过就不再问——同样的输入只会拿回同样的答案 */
+    const askModel = async (): Promise<void> => {
+        if (judgement !== null) return;
+        const result = await callModel();
+        if (result) judgement = result;
+    };
+
+    const planBase = () => ({
         detectResult,
         tags,
-        availableTags,
+        forumTags: availableTags,
         compiled,
         authorChoice: options.authorChoice,
         judgement,
-        llmCleared,
     });
+
+    // 触发点一：判定阶段就说了「这些词得先定性」
+    if (detectResult.needsLlm && !options.dryRun) await askModel();
+
+    // 模型给的标题不合规时，把「哪儿还不合规」告诉它，让它重写一次再出方案
+    const canRewrite = !options.dryRun && settings.llmEnabled;
+    const rewrite = async (feedback: string): Promise<Judgement | null> => {
+        if (!canRewrite) return null;
+        const result = await callModel(feedback);
+        if (result) judgement = result;
+        return result;
+    };
+
+    let { plan } = await planWithModel(planBase(), rewrite);
+
+    // 触发点二：规则判得清清楚楚，可是方案出不来（比如涉事分类没配保留顺序）。
+    //
+    // 别急着转人工——模型至少能指一个该留的分类。
+    // 转人工应该是**最后一档**，不是某个分支的默认出口。
+    if (!plan.autoFixable && judgement === null && canRewrite) {
+        await askModel();
+        if (judgement !== null) {
+            llmFallback = true;
+            plan = (await planWithModel(planBase(), rewrite)).plan;
+        }
+    }
+
+    // 模型看过之后结论是「这帖子不用动」。绿帽癖那种就落在这儿：
+    // 正文里的关联词判成描述，标题一个字不改，TAG 也不动。
+    llmCleared = judgement !== null
+        && plan.autoFixable
+        && plan.newTitle === plan.originalTitle
+        && plan.removeTagIds.length === 0
+        && plan.addTagIds.length === 0;
 
     const llmPending = detectResult.needsLlm && judgement === null;
     if (llmPending && llmError) {
@@ -218,18 +311,23 @@ export async function inspectThread(
 
     return {
         ...base,
-        detectResult, tags, availableTags, plan, judgement, llmCleared, llmPending,
+        detectResult, tags, availableTags, plan, judgement, llmCleared, llmFallback, llmPending,
         skipped: null,
     };
 }
 
-/** 读首楼开头一小段。只在论坛开了开关时才会被调用 */
+/**
+ * 读首楼开头一段，给模型定性用。
+ *
+ * 以前只截 200 字，因为那会儿首楼只是「把握低时补一刀」的可选料。
+ * 现在定性是第一步，光看标题做不了，所以给足一点。
+ */
 async function readFirstPostExcerpt(thread: ThreadChannel): Promise<string | undefined> {
     try {
         const starter = await thread.fetchStarterMessage();
         const content = starter?.content?.trim();
         if (!content) return undefined;
-        return content.slice(0, 200);
+        return content.slice(0, 600);
     } catch {
         return undefined;
     }
@@ -239,12 +337,27 @@ async function readFirstPostExcerpt(thread: ThreadChannel): Promise<string | und
 // 建案
 // ============================================================
 
-/** 有效违规：LLM 判定不是分类标记时，需要它定性的那些作废 */
-export function effectiveViolations(result: InspectResult) {
+/**
+ * 有效违规：这个帖子到底还需不需要处理。
+ *
+ * 模型没看过之前，检测出什么就是什么。
+ * 模型看过之后以**方案**为准——方案说「标题不用改、TAG 不用动」，
+ * 那就是真的没事，不建案、不打扰作者。
+ *
+ * 绿帽癖那种帖子走的就是这条：正文里的关联词被判成描述人设，
+ * 于是方案是空的，这里返回空数组，作者根本不会收到通知。
+ */
+export function effectiveViolations(result: InspectResult): Violation[] {
     if (!result.detectResult) return [];
-    return result.llmCleared
-        ? result.detectResult.violations.filter(v => !v.needsLlm)
-        : result.detectResult.violations;
+
+    const plan = result.plan;
+    if (!result.judgement || !plan) return result.detectResult.violations;
+
+    const noChange = plan.newTitle === plan.originalTitle
+        && plan.removeTagIds.length === 0
+        && plan.addTagIds.length === 0;
+
+    return noChange && plan.autoFixable ? [] : result.detectResult.violations;
 }
 
 /**
@@ -264,7 +377,7 @@ export function openCaseFor(result: InspectResult): db.GuardCase | null {
     const existing = db.getOpenCase(thread.id);
     if (existing) return existing;
 
-    const old = isOldPost(thread, settings.oldPostDays);
+    const old = isOldPost(thread, settings.oldPostInactiveHours);
     const graceHours = old ? settings.graceOldHours : settings.graceNewHours;
 
     return db.createCase({

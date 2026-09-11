@@ -23,6 +23,7 @@ import type {
     ExclusiveDimension,
     SegmenterWord,
     Violation,
+    WordTier,
 } from './types';
 
 const DB_FILE = path.join(DATA_DIR, 'title-guard.sqlite');
@@ -101,6 +102,7 @@ db.exec(`
         raw_word       TEXT NOT NULL,
         kind           TEXT NOT NULL,
         group_id       TEXT,
+        tier           TEXT NOT NULL DEFAULT '关联',
         scope          TEXT NOT NULL DEFAULT '全标题',
         replace_to     TEXT,
         ascii_boundary INTEGER NOT NULL DEFAULT 0,
@@ -231,6 +233,32 @@ function ensureColumn(table: string, column: string, definition: string): void {
 }
 
 /**
+ * 词条新增「词档」这一列：本体词 / 关联词。
+ *
+ * 这一列决定的是**词落在标题主体里时判定尺度有多严**：
+ *   本体词就是大家打进搜索框的那几个字，留在标题里就一定被搜到，从严；
+ *   关联词本身不是任何人会搜的词，写在句子里多半只是描述，结合上下文判。
+ *
+ * 新列默认「关联」，但这么一来已经在用的服务器会突然整体放宽。
+ * 所以**只在这一列刚被建出来的那一次**，按社区 2026-09-11 定下的清单
+ * 把六个本体词标出来，之后管理组随便改，这段代码再也不会动词表。
+ * 其余任何词的档位都不在代码里写死。
+ */
+const CORE_WORDS_AT_MIGRATION = ['纯爱', 'ntr', 'ntl', '百合', '百破', '百合破坏'];
+
+function seedWordTier(): void {
+    const cols = db.prepare('PRAGMA table_info(tt_dict)').all() as { name: string }[];
+    if (cols.length === 0) return;
+    if (cols.some(c => c.name === 'tier')) return;
+
+    db.exec("ALTER TABLE tt_dict ADD COLUMN tier TEXT NOT NULL DEFAULT '关联'");
+    const mark = db.prepare("UPDATE tt_dict SET tier = '本体' WHERE word = ?");
+    let n = 0;
+    for (const w of CORE_WORDS_AT_MIGRATION) n += mark.run(w).changes;
+    console.log(`[TitleGuard] 数据库迁移：tt_dict 新增列 tier，已标出 ${n} 个本体词`);
+}
+
+/**
  * tt_exclusive 从「一个维度」变成「TAG / 关键字两个维度」。
  * 老表没有 dimension 列，主键也不含它，ALTER 补不出正确的主键，
  * 只能整表重建：老数据里的互斥集合当年是两个维度共用的，所以两边各抄一份。
@@ -283,6 +311,9 @@ migrateExclusiveDimension();
 migrateTagBanToCross();
 
 ensureColumn('tt_settings', 'multi_route_group', "TEXT NOT NULL DEFAULT ''");
+// 老帖门槛从「发帖至今多少天」改成「最近活跃至今多少小时」。
+// 老的 old_post_days 列留着不删（sqlite 删列麻烦，留着也不碍事），只是不再读了。
+ensureColumn('tt_settings', 'old_post_inactive_hours', 'INTEGER NOT NULL DEFAULT 72');
 
 // 申诉复核（两级：先 AI 一次，再人工）
 ensureColumn('tt_cases', 'appeal_text', 'TEXT');
@@ -296,6 +327,7 @@ ensureColumn('tt_cases', 'llm_review_reason', 'TEXT');
 // 免得点一下按钮就白赚一整个宽限期
 ensureColumn('tt_cases', 'paused_remaining_ms', 'INTEGER');
 ensureColumn('tt_groups', 'priority', 'INTEGER NOT NULL DEFAULT 0');
+seedWordTier();
 
 // ============================================================
 // 身份组能力
@@ -357,8 +389,14 @@ export interface GuardSettings {
     alertChannelId: string | null;
     graceNewHours: number;
     graceOldHours: number;
-    /** 发帖超过多少天算「老帖」 */
-    oldPostDays: number;
+    /**
+     * 沉寂多少小时算「老帖」。
+     *
+     * 看的是**最近活跃时间**（最后一条消息），不是发帖时间：
+     * 三年前发的帖只要还有人在回就是活的；上周发的帖沉了就是沉了。
+     * 只有「已归档 + 沉寂超过这个小时数」才走长处理期限。
+     */
+    oldPostInactiveHours: number;
     /** 总闸：关掉就只检测不动手 */
     autoFixEnabled: boolean;
     llmEnabled: boolean;
@@ -376,7 +414,7 @@ const DEFAULT_SETTINGS: Omit<GuardSettings, 'guildId'> = {
     alertChannelId: null,
     graceNewHours: 24,
     graceOldHours: 168,
-    oldPostDays: 60,
+    oldPostInactiveHours: 72,
     autoFixEnabled: false,
     llmEnabled: true,
     llmNeedsConfirm: true,
@@ -392,7 +430,7 @@ interface SettingsRow {
     alert_channel_id: string | null;
     grace_new_hours: number;
     grace_old_hours: number;
-    old_post_days: number;
+    old_post_inactive_hours: number;
     auto_fix_enabled: number;
     llm_enabled: number;
     llm_needs_confirm: number;
@@ -413,7 +451,7 @@ export function getSettings(guildId: string): GuardSettings {
         alertChannelId: row.alert_channel_id,
         graceNewHours: row.grace_new_hours,
         graceOldHours: row.grace_old_hours,
-        oldPostDays: row.old_post_days,
+        oldPostInactiveHours: row.old_post_inactive_hours,
         autoFixEnabled: Boolean(row.auto_fix_enabled),
         llmEnabled: Boolean(row.llm_enabled),
         llmNeedsConfirm: Boolean(row.llm_needs_confirm),
@@ -426,12 +464,12 @@ export function getSettings(guildId: string): GuardSettings {
 const upsertSettingsStmt = db.prepare(`
     INSERT INTO tt_settings (
         guild_id, enabled, alert_role_ids, alert_channel_id,
-        grace_new_hours, grace_old_hours, old_post_days,
+        grace_new_hours, grace_old_hours, old_post_inactive_hours,
         auto_fix_enabled, llm_enabled, llm_needs_confirm,
         queue_interval_minutes, queue_paused, multi_route_group, updated_at
     ) VALUES (
         @guild_id, @enabled, @alert_role_ids, @alert_channel_id,
-        @grace_new_hours, @grace_old_hours, @old_post_days,
+        @grace_new_hours, @grace_old_hours, @old_post_inactive_hours,
         @auto_fix_enabled, @llm_enabled, @llm_needs_confirm,
         @queue_interval_minutes, @queue_paused, @multi_route_group, @updated_at
     )
@@ -441,7 +479,7 @@ const upsertSettingsStmt = db.prepare(`
         alert_channel_id = excluded.alert_channel_id,
         grace_new_hours = excluded.grace_new_hours,
         grace_old_hours = excluded.grace_old_hours,
-        old_post_days = excluded.old_post_days,
+        old_post_inactive_hours = excluded.old_post_inactive_hours,
         auto_fix_enabled = excluded.auto_fix_enabled,
         llm_enabled = excluded.llm_enabled,
         llm_needs_confirm = excluded.llm_needs_confirm,
@@ -460,7 +498,7 @@ export function saveSettings(patch: Partial<GuardSettings> & { guildId: string }
         alert_channel_id: merged.alertChannelId,
         grace_new_hours: merged.graceNewHours,
         grace_old_hours: merged.graceOldHours,
-        old_post_days: merged.oldPostDays,
+        old_post_inactive_hours: merged.oldPostInactiveHours,
         auto_fix_enabled: merged.autoFixEnabled ? 1 : 0,
         llm_enabled: merged.llmEnabled ? 1 : 0,
         llm_needs_confirm: merged.llmNeedsConfirm ? 1 : 0,
@@ -713,16 +751,17 @@ const listDictStmt = db.prepare('SELECT * FROM tt_dict WHERE guild_id = ? ORDER 
 const listEnabledDictStmt = db.prepare('SELECT * FROM tt_dict WHERE guild_id = ? AND enabled = 1');
 const upsertDictStmt = db.prepare(`
     INSERT INTO tt_dict (
-        guild_id, word, raw_word, kind, group_id, scope,
+        guild_id, word, raw_word, kind, group_id, tier, scope,
         replace_to, ascii_boundary, enabled, note, updated_at
     ) VALUES (
-        @guild_id, @word, @raw_word, @kind, @group_id, @scope,
+        @guild_id, @word, @raw_word, @kind, @group_id, @tier, @scope,
         @replace_to, @ascii_boundary, @enabled, @note, @updated_at
     )
     ON CONFLICT(guild_id, word) DO UPDATE SET
         raw_word = excluded.raw_word,
         kind = excluded.kind,
         group_id = excluded.group_id,
+        tier = excluded.tier,
         scope = excluded.scope,
         replace_to = excluded.replace_to,
         ascii_boundary = excluded.ascii_boundary,
@@ -737,6 +776,7 @@ interface DictRow {
     raw_word: string;
     kind: string;
     group_id: string | null;
+    tier: string | null;
     scope: string;
     replace_to: string | null;
     ascii_boundary: number;
@@ -750,6 +790,8 @@ function toDict(row: DictRow): DictRecord {
         rawWord: row.raw_word,
         kind: row.kind as DictKind,
         group: row.group_id,
+        // 老库里这一列可能是 null，一律按「关联」算——本体词是明确列举的那几个
+        tier: row.tier === '本体' ? '本体' : '关联',
         scope: row.scope as DictScope,
         replaceTo: row.replace_to,
         asciiBoundary: Boolean(row.ascii_boundary),
@@ -768,6 +810,8 @@ export interface UpsertDictInput {
     rawWord: string;
     kind: DictKind;
     group?: string | null;
+    /** 词档。不传则沿用已有的；新词默认「关联」 */
+    tier?: WordTier;
     scope?: DictScope;
     replaceTo?: string | null;
     asciiBoundary?: boolean;
@@ -779,12 +823,17 @@ export function upsertDict(guildId: string, input: UpsertDictInput): DictRecord 
     const word = normalize(input.rawWord).text.trim();
     if (!word) throw new Error('词条不能为空');
 
+    // 改一条已有词条时没指定档位，就保持原样，别把管理组标好的本体词悄悄降回关联
+    const existing = db.prepare('SELECT tier FROM tt_dict WHERE guild_id = ? AND word = ?')
+        .get(guildId, word) as { tier: string | null } | undefined;
+
     const record = {
         guild_id: guildId,
         word,
         raw_word: input.rawWord.trim(),
         kind: input.kind,
         group_id: input.kind === '白名单' ? null : (input.group ?? null),
+        tier: input.tier ?? (existing?.tier === '本体' ? '本体' : '关联'),
         scope: input.scope ?? '全标题',
         replace_to: input.replaceTo ?? null,
         ascii_boundary: (input.asciiBoundary ?? shouldForceAsciiBoundary(word)) ? 1 : 0,
@@ -1114,6 +1163,32 @@ export function updateCase(id: number, patch: Partial<Omit<GuardCase, 'id'>>): G
         closed_at: merged.closedAt,
     });
     return getCase(id);
+}
+
+const claimAiReviewStmt = db.prepare(`
+    UPDATE tt_cases SET ai_review_used = 1, updated_at = ?
+    WHERE id = ? AND ai_review_used = 0 AND closed_at IS NULL
+`);
+const releaseAiReviewStmt = db.prepare(
+    'UPDATE tt_cases SET ai_review_used = 0, updated_at = ? WHERE id = ? AND ai_review_upheld IS NULL');
+
+/**
+ * 抢占这个案子的 AI 复核名额，抢到才准往下走。
+ *
+ * 必须在**调用模型之前**抢。写成「调用完成后再标记已用」的话，
+ * 中间那几十秒里连点几次按钮就是几次调用，「每案一次」形同虚设。
+ * 返回 false = 已经有人在跑了，或者案子已结案。
+ */
+export function claimAiReview(caseId: number): boolean {
+    return claimAiReviewStmt.run(Date.now(), caseId).changes > 0;
+}
+
+/**
+ * 把名额还回去。只在**复核没真正完成**时调用（安检没过、模型调不通、案子中途结了）。
+ * 有 ai_review_upheld 就说明复核出过结论，那个名额不退。
+ */
+export function releaseAiReview(caseId: number): void {
+    releaseAiReviewStmt.run(Date.now(), caseId);
 }
 
 export function closeCase(id: number, state: CaseState): GuardCase | null {

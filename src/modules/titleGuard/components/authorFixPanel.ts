@@ -23,7 +23,7 @@ import {
     type ModalSubmitInteraction,
 } from 'discord.js';
 
-import { checkAdminPermission } from '../../../core/utils/permissionManager';
+import { hasCapability, type GuardCapability } from '../services/titleGuardPermissions';
 import * as db from '../services/titleGuardDatabase';
 import {
     applyPlan,
@@ -50,19 +50,29 @@ function caseIdOf(customId: string): number | null {
     return Number.isFinite(id) ? id : null;
 }
 
+/**
+ * 谁能用这个面板：帖主本人，或者管理组里任意一种带操作能力的身份组。
+ *
+ * 必须和通知上「我要修改」那颗按钮用同一套判定。以前这里写的是
+ * checkAdminPermission，而按钮那边已经认新的能力体系了——
+ * 结果风纪委员能点开面板，面板里每一步都被拒。
+ */
+const PANEL_CAPS: GuardCapability[] = ['复核', '覆盖', '词表', '设置'];
+
 function canUse(
     interaction: ButtonInteraction | AnySelectMenuInteraction | ModalSubmitInteraction,
     guardCase: db.GuardCase,
 ): boolean {
     if (guardCase.authorId && interaction.user.id === guardCase.authorId) return true;
-    return checkAdminPermission(interaction.member as GuildMember | null);
+    const member = interaction.member as GuildMember | null;
+    return PANEL_CAPS.some(c => hasCapability(member, guardCase.guildId, c));
 }
 
 /** 冲突涉及的候选分类组，供作者二选一 */
 function candidateGroups(guardCase: db.GuardCase): GroupId[] {
     const groups = new Set<GroupId>();
     for (const v of guardCase.violations) {
-        if (v.rule === 'T2' || v.rule === 'T3' || v.rule === 'G1' || v.rule === 'T4') {
+        if (v.rule === 'W' || v.rule === 'G' || v.rule === 'X') {
             for (const g of v.groups) groups.add(g);
         }
     }
@@ -324,7 +334,13 @@ async function applyAuthorPlan(interaction: ButtonInteraction): Promise<void> {
         }
         plan = plan
             ? { ...plan, newTitle: manualTitle, autoFixable: true, blockedReason: null }
-            : buildPlan({ detectResult: inspection.detectResult, tags: inspection.tags, compiled, authorChoice: choice });
+            : buildPlan({
+                detectResult: inspection.detectResult,
+                tags: inspection.tags,
+                forumTags: inspection.availableTags,
+                compiled,
+                authorChoice: choice,
+            });
         plan.newTitle = manualTitle;
     }
 

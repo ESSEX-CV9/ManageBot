@@ -7,7 +7,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 
-import { compileConfig, detect } from './ruleEngine';
+import { compileConfig, detect, judgeHitsOf } from './ruleEngine';
 import { buildPlan, isDeletionOnly, tidyTitle, validateNewTitle } from './rewriter';
 import type { AppliedTag, DictEntry, GuardConfig } from './types';
 import type { Judgement } from './llmJudge';
@@ -76,9 +76,9 @@ const AVAILABLE: AppliedTag[] = [
     { tagId: 'tag_多路线', tagName: '多路线', group: '多路线' },
 ];
 
-function plan(title: string, tags: AppliedTag[], judgement?: Judgement | null, llmCleared = false) {
+function plan(title: string, tags: AppliedTag[], judgement?: Judgement | null) {
     const detectResult = detect({ title, tags, config: CONFIG }, compiled);
-    return buildPlan({ detectResult, tags, availableTags: AVAILABLE, compiled, judgement, llmCleared });
+    return buildPlan({ detectResult, tags, availableTags: AVAILABLE, compiled, judgement });
 }
 
 // ---------- 标记段改写 ----------
@@ -300,7 +300,7 @@ test('子序列校验：顺序变了也拦下', () => {
 
 test('LLM 给了会加字的标题 → 放弃自动改，转人工', () => {
     const bad: Judgement = {
-        isClassification: true,
+        falseMatches: [],
         conflictingGroups: ['纯爱', 'NTR'],
         suggestedKeep: 'NTR',
         suggestedTitle: '【NTR】牛头人日记', // 凭空加了「【NTR】」
@@ -314,7 +314,7 @@ test('LLM 给了会加字的标题 → 放弃自动改，转人工', () => {
 
 test('LLM 给了合法的删字标题 → 采纳', () => {
     const good: Judgement = {
-        isClassification: true,
+        falseMatches: [],
         conflictingGroups: ['纯爱', 'NTR'],
         suggestedKeep: 'NTR',
         suggestedTitle: '牛头人日记',
@@ -328,7 +328,7 @@ test('LLM 给了合法的删字标题 → 采纳', () => {
 
 test('LLM 把握低时不采纳它的保留建议，改走优先级保底', () => {
     const unsure: Judgement = {
-        isClassification: true,
+        falseMatches: [],
         conflictingGroups: ['纯爱', 'NTR'],
         suggestedKeep: 'NTR',
         suggestedTitle: '牛头人日记',
@@ -341,28 +341,71 @@ test('LLM 把握低时不采纳它的保留建议，改走优先级保底', () =
     assert.equal(p.keepGroup, 'NTR');
 });
 
-// ---------- LLM 判定「不是分类标记」 ----------
+// ---------- 模型只能否掉「误判的那几个字」 ----------
 
-test('例 A：LLM 判定不是分类标记 → 整个方案变成无需整改', () => {
-    const cleared: Judgement = {
-        isClassification: false,
+test('模型说「是句子成分」不算数：百合破坏 + 百合 TAG 照样摘 TAG', () => {
+    // 关键字层面百合和百破并不互斥（「百合破坏」四个字里天然含百合），
+    // 唯一的冲突是「百合 TAG × 百破 关键字」的交叉互斥，
+    // 常规处置就是摘掉百合 TAG、标题一个字不动。
+    //
+    // 模型没有「因为整条读起来像句子所以放过」这种权力——
+    // 它只能指出某几个字在这儿不是那个意思，而这里「百合破坏」就是那个词。
+    const noFalseMatch: Judgement = {
+        falseMatches: [],
+        conflictingGroups: ['百破'],
+        suggestedKeep: null,
+        suggestedTitle: null,
+        confidence: 'high',
+        reason: '百合破坏在这儿就是那个分类词',
+    };
+    const p = plan('《真正的橘子味世界不允许百合破坏的存在！》', [tag('百合', '百合')], noFalseMatch);
+    assert.equal(p.newTitle, '《真正的橘子味世界不允许百合破坏的存在！》', '标题不该动');
+    assert.deepEqual(p.removeTagIds, ['tag_百合'], '该摘掉百合 TAG');
+    assert.equal(p.autoFixable, true);
+});
+
+test('对照组：标记段里的百合破坏 + 百合 TAG → 同样是摘 TAG', () => {
+    const p = plan('【百合破坏】某某', [tag('百合', '百合')]);
+    assert.equal(p.autoFixable, true);
+    assert.deepEqual(p.removeTagIds, ['tag_百合']);
+});
+
+test('模型标出误判命中 → 只有被标的那一处不算数，冲突跟着消失', () => {
+    // 模型是**按编号**指认误判的，编号来自 judgeHitsOf()。
+    // 这条测的是机制：标了第几处，第几处就不参与判定。
+    // 「这一处到底算不算误判」是模型的判断，不归这里管。
+    const title = '纯爱战士也逃不过NTR的结局';
+    const detectResult = detect({ title, tags: [], config: CONFIG }, compiled);
+    const hits = judgeHitsOf(detectResult);
+    const nth = hits.findIndex(h => h.entry.word === '纯爱') + 1;
+    assert.ok(nth > 0, '这条标题应该命中「纯爱」');
+    assert.ok(detectResult.violations.some(v => v.rule === 'T3'), '没标误判之前应该有关键字冲突');
+
+    const p = plan(title, [], {
+        falseMatches: [nth],
         conflictingGroups: [],
         suggestedKeep: null,
         suggestedTitle: null,
         confidence: 'high',
-        reason: '完整句子，百合破坏是句中成分',
-    };
-    const p = plan('《真正的橘子味世界不允许百合破坏的存在！》', [tag('百合', '百合')], cleared, true);
-    assert.equal(p.newTitle, '《真正的橘子味世界不允许百合破坏的存在！》');
+        reason: '「纯爱战士」是个梗，这两个字在这儿不是分类',
+    });
+    // 只剩 NTR 一个分类，冲突不成立 → 什么都不用改
+    assert.equal(p.newTitle, title);
     assert.deepEqual(p.removeTagIds, []);
     assert.equal(p.autoFixable, true);
-    assert.deepEqual(p.notes, ['无需整改']);
 });
 
-test('对照组：标记段里的百合破坏 + 百合 TAG → 直接摘 TAG', () => {
-    const p = plan('【百合破坏】某某', [tag('百合', '百合')]);
-    assert.equal(p.autoFixable, true);
-    assert.deepEqual(p.removeTagIds, ['tag_百合']);
+test('模型没标误判 → 冲突照旧成立，该改还得改', () => {
+    const title = '纯爱战士也逃不过NTR的结局';
+    const p = plan(title, [], {
+        falseMatches: [],
+        conflictingGroups: ['纯爱', 'NTR'],
+        suggestedKeep: 'NTR',
+        suggestedTitle: 'NTR的结局',
+        confidence: 'high',
+        reason: '两个都是真的分类词',
+    });
+    assert.notEqual(p.newTitle, title, '标题该被改');
 });
 
 // ---------- 收尾清理 ----------
