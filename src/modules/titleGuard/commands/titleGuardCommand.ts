@@ -40,7 +40,7 @@ import {
 
 import * as db from '../services/titleGuardDatabase';
 import { getCompiledConfig, invalidateConfigCache, fetchThread, inspectThread, effectiveViolations, revertLast, applyPlan } from '../services/enforcer';
-import { autoMapTags, scanForum, type ScanRow } from '../services/backfillQueue';
+import { autoMapTags, scanForums, type ScanRow } from '../services/backfillQueue';
 import { describeLlmConfig, summarizeJudgement } from '../services/llmJudge';
 import { cutForDebug } from '../services/wordBoundary';
 import { openConfigPanel } from '../components/configPanel';
@@ -232,9 +232,12 @@ const data = new SlashCommandBuilder()
     .addSubcommand(s => s.setName('检查').setDescription('手动检查单个帖子，显示完整判定过程')
         .addStringOption(o => o.setName('帖子').setDescription('帖子链接或 ID').setRequired(true)))
 
-    .addSubcommand(s => s.setName('扫描').setDescription('批量扫描一个论坛')
-        .addChannelOption(o => o.setName('论坛').setDescription('论坛频道').addChannelTypes(ChannelType.GuildForum).setRequired(true))
-        .addBooleanOption(o => o.setName('静默').setDescription('true=只出报表不动手（默认 true）')))
+    .addSubcommand(s => s.setName('扫描').setDescription('快速全量扫描：拉全部帖子标题判一遍，出 Excel')
+        .addChannelOption(o => o.setName('论坛')
+            .setDescription('留空 = 已纳管的全部论坛一起扫')
+            .addChannelTypes(ChannelType.GuildForum))
+        .addBooleanOption(o => o.setName('静默')
+            .setDescription('true=只出报表不动手（默认 true）；false=合格的记账、违规的入队')))
 
     .addSubcommandGroup(g => g.setName('案件').setDescription('查看待处理的案件')
         .addSubcommand(s => s.setName('列表').setDescription('列出未结案件'))
@@ -254,7 +257,7 @@ const data = new SlashCommandBuilder()
             .addStringOption(o => o.setName('帖子').setDescription('帖子链接或 ID').setRequired(true)))
         .addSubcommand(s => s.setName('列表').setDescription('查看豁免名单')))
 
-    .addSubcommandGroup(g => g.setName('队列').setDescription('老帖慢速整改队列')
+    .addSubcommandGroup(g => g.setName('队列').setDescription('整改队列（活跃帖 / 老帖两条）')
         .addSubcommand(s => s.setName('状态').setDescription('查看进度'))
         .addSubcommand(s => s.setName('暂停').setDescription('暂停队列'))
         .addSubcommand(s => s.setName('继续').setDescription('继续队列'))
@@ -1256,13 +1259,24 @@ async function handleInspect(interaction: ChatInputCommandInteraction): Promise<
 async function handleScan(interaction: ChatInputCommandInteraction): Promise<void> {
     await interaction.deferReply({ flags: MessageFlags.Ephemeral });
 
-    const forum = interaction.options.getChannel('论坛', true) as ForumChannel;
+    const guildId = interaction.guildId!;
+    const picked = interaction.options.getChannel('论坛') as ForumChannel | null;
     const dryRun = interaction.options.getBoolean('静默') ?? true;
 
-    await interaction.editReply(`🔎 开始扫描 <#${forum.id}>${dryRun ? '（静默模式：只出报表，不发通知不改动）' : ''}…`);
+    // 留空 = 已纳管的全部论坛。两万个帖子分散在好几个论坛里，
+    // 一个一个敲既慢又容易漏掉一个
+    const forumIds = picked ? [picked.id] : db.listForums(guildId).map(f => f.forumId);
+    if (forumIds.length === 0) {
+        await interaction.editReply('还没纳管任何论坛。先用 `/标题规范 论坛 添加`。');
+        return;
+    }
+
+    await interaction.editReply(
+        `🔎 开始扫描${picked ? ` <#${picked.id}>` : `已纳管的 ${forumIds.length} 个论坛`}`
+        + `${dryRun ? '（静默模式：只出报表，不发通知不改动）' : ''}…`);
 
     try {
-        const { rows, progress } = await scanForum(interaction.client, interaction.guildId!, forum.id, {
+        const { rows, progress, failed } = await scanForums(interaction.client, guildId, forumIds, {
             dryRun,
             onProgress: p => {
                 void interaction.editReply(`🔎 扫描中… 已看 ${p.scanned} 个帖子，命中 ${p.flagged} 个`).catch(() => { /* 忽略 */ });
@@ -1312,8 +1326,14 @@ async function handleScan(interaction: ChatInputCommandInteraction): Promise<voi
                     : `\n已入队。按当前速率：活跃那批约 `
                         + `${Math.ceil(fastLane / Math.max(1, settings.fastBatchSize))} 批 × `
                         + `${settings.fastBatchPauseMinutes} 分钟，`
-                        + `老帖那批约 ${Math.ceil(slowLane * settings.queueIntervalMinutes / 60)} 小时。`),
-            files: [new AttachmentBuilder(Buffer.from(buffer), { name: `扫描结果_${forum.name}.xlsx` })],
+                        + `老帖那批约 ${Math.ceil(slowLane * settings.queueIntervalMinutes / 60)} 小时。`)
+                + (failed.length > 0
+                    ? `\n\n⚠️ 有 ${failed.length} 个论坛没扫成（频道删了或没权限），`
+                        + '上面的数字不含它们。'
+                    : ''),
+            files: [new AttachmentBuilder(Buffer.from(buffer), {
+                name: `扫描结果_${picked ? picked.name : '全部论坛'}.xlsx`,
+            })],
         });
     } catch (err) {
         await interaction.editReply(`❌ 扫描失败：${err instanceof Error ? err.message : err}`);
@@ -1440,28 +1460,48 @@ async function handleQueue(interaction: ChatInputCommandInteraction, sub: string
 
     if (sub === '暂停' || sub === '继续') {
         db.saveSettings({ guildId, queuePaused: sub === '暂停' });
-        await interaction.reply(ephemeral(sub === '暂停' ? '⏸️ 老帖队列已暂停。' : '▶️ 老帖队列已继续。'));
+        await interaction.reply(ephemeral(sub === '暂停'
+            ? '⏸️ 整改队列已暂停（两条都停）。'
+            : '▶️ 整改队列已继续。'));
         return;
     }
 
     if (sub === '清空') {
         db.clearBackfill(guildId);
-        await interaction.reply(ephemeral('✅ 老帖队列已清空。'));
+        await interaction.reply(ephemeral('✅ 整改队列已清空（两条都清）。'));
         return;
     }
 
     const stats = db.backfillStats(guildId);
     const settings = db.getSettings(guildId);
-    const pending = stats.pending ?? 0;
-    const etaHours = pending * settings.queueIntervalMinutes / 60;
+    const fast = db.pendingCount(guildId, 'fast');
+    const slow = db.pendingCount(guildId, 'slow');
 
-    await interaction.reply(ephemeral(
-        `**老帖队列**\n`
-        + `• 待处理：**${pending}**　已完成：${stats.done ?? 0}　跳过：${stats.skipped ?? 0}　失败：${stats.failed ?? 0}\n`
-        + `• 速率：${settings.queueIntervalMinutes} 分钟 / 帖　状态：${settings.queuePaused ? '⏸️ 暂停' : '▶️ 运行中'}\n`
-        + `• 按当前速率跑完还需约 **${etaHours.toFixed(1)} 小时**（${(etaHours / 24).toFixed(1)} 天）\n\n`
-        + '_队列慢是故意的：老帖发通知会顶帖，慢速摊平才不会把论坛首页刷成老帖。_',
-    ));
+    // 快队列是「一批 N 个然后歇 M 分钟」，所以耗时取决于**批数**，不是条数。
+    // 最后一批发完就结束了，不用再歇，所以减一
+    const fastBatches = Math.ceil(fast / Math.max(1, settings.fastBatchSize));
+    const fastMin = Math.max(0, fastBatches - 1) * settings.fastBatchPauseMinutes;
+    const slowMin = slow * settings.queueIntervalMinutes;
+
+    const dur = (min: number) => min < 60
+        ? `${min} 分钟`
+        : min < 60 * 48 ? `${(min / 60).toFixed(1)} 小时` : `${(min / 60 / 24).toFixed(1)} 天`;
+
+    await interaction.reply(ephemeral([
+        `**整改队列**　${settings.queuePaused ? '⏸️ 已暂停' : '▶️ 运行中'}`,
+        '',
+        `🏃 **快队列**（活跃帖 + 近期归档）　待处理 **${fast}**`,
+        `　　${settings.fastBatchSize} 条一批，每批歇 ${settings.fastBatchPauseMinutes} 分钟`
+            + `　→ 共 ${fastBatches} 批，约 ${dur(fastMin)}`,
+        '',
+        `🐢 **慢队列**（沉寂老帖）　待处理 **${slow}**`,
+        `　　${settings.queueIntervalMinutes} 分钟一个　→ 约 ${dur(slowMin)}`,
+        '',
+        `累计：已完成 ${stats.done ?? 0}　跳过 ${stats.skipped ?? 0}　失败 ${stats.failed ?? 0}`,
+        '',
+        '_两条队列并行跑，所以实际跑完的时间取慢的那条。_',
+        '_限速是故意的：发通知一定会顶帖，一口气发几百条会把论坛首页整个刷掉。_',
+    ].join('\n')));
 }
 
 // ============================================================

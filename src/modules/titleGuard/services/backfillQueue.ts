@@ -212,6 +212,50 @@ export async function scanForum(
     return { rows, progress };
 }
 
+/**
+ * 一口气扫好几个论坛。
+ *
+ * 进度是**累计**的：管理组看的是「一共看了多少个」，
+ * 而不是「第三个论坛看了多少个」——后者在一堆论坛之间来回跳，读不出还剩多少。
+ *
+ * 某个论坛读不到（频道删了、没权限）不会中断整趟，记下来最后一起报。
+ */
+export async function scanForums(
+    client: Client,
+    guildId: string,
+    forumIds: string[],
+    options: { dryRun?: boolean; onProgress?: (p: ScanProgress) => void } = {},
+): Promise<{ rows: ScanRow[]; progress: ScanProgress; failed: string[] }> {
+    const rows: ScanRow[] = [];
+    const total: ScanProgress = { scanned: 0, flagged: 0, skipped: 0 };
+    const failed: string[] = [];
+
+    for (const forumId of forumIds) {
+        // 每个论坛内部的进度加上前面已经累计的，报出去才是全局进度
+        const base = { ...total };
+        try {
+            const r = await scanForum(client, guildId, forumId, {
+                dryRun: options.dryRun,
+                onProgress: p => options.onProgress?.({
+                    scanned: base.scanned + p.scanned,
+                    flagged: base.flagged + p.flagged,
+                    skipped: base.skipped + p.skipped,
+                }),
+            });
+            rows.push(...r.rows);
+            total.scanned += r.progress.scanned;
+            total.flagged += r.progress.flagged;
+            total.skipped += r.progress.skipped;
+        } catch (err) {
+            failed.push(forumId);
+            console.warn(`[TitleGuard] 扫描论坛 ${forumId} 失败：`, err);
+        }
+    }
+
+    options.onProgress?.(total);
+    return { rows, progress: total, failed };
+}
+
 // ============================================================
 // 队列驱动（一次只处理一个帖子）
 // ============================================================
