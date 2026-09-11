@@ -36,49 +36,101 @@ export interface ScanProgress {
     skipped: number;
 }
 
+/** 归档帖分页一次抓多少。Discord 上限 100 */
+const ARCHIVE_PAGE = 100;
+/** 最多翻多少页。100 × 1000 = 十万个归档帖，够用了；撞到上限会报「没取全」 */
+const MAX_ARCHIVE_PAGES = 1000;
+
+export interface CollectResult {
+    threads: ThreadChannel[];
+    /**
+     * 帖子**没取全**。
+     *
+     * 必须往上报，不能只打一行 warn 就算了：取不全的后果是一大批帖子
+     * 压根没进扫描，而报表上只显示「看了 N 个」，看的人会以为剩下的都合格。
+     */
+    incomplete: boolean;
+    /** 没取全的原因，给人看 */
+    reason?: string;
+}
+
 /**
  * 取一个论坛下的全部帖子（活跃 + 归档）。
  *
  * **返回的是帖子对象本身，不是 ID。** 这一点很要紧：
  * Discord 翻页时已经把完整的帖子给你了——标题、TAG、归档状态、最后消息时间全在里面，
- * 判定需要的东西一样不缺。以前这里只留了 ID 把对象扔掉，外面再对每个帖子单独 fetch 一次，
- * 两万个帖子就是两万次 REST 请求，限速下要跑几个小时。
- * 直接用翻页的结果，同样两万个帖子只要两百来次请求。
+ * 判定需要的东西一样不缺。只留 ID 再对每个帖子单独 fetch 一次的话，
+ * 两万个帖子就是两万次 REST 请求，限速下要跑几个小时；
+ * 直接用翻页的结果，同样两万个帖子只要两百来次。
  *
- * 归档帖的分页要靠 before 游标，这里一次抓 100、抓到空为止。
+ * 归档帖靠 before 游标翻页。**游标必须是数字**——
+ * discord.js 只认「17~19 位的帖子 ID」或「Date 能解析的东西」，
+ * 传一个 13 位的时间戳**字符串**两头都不沾：它会去走 new Date('1757…')，
+ * 而 JS 不把纯数字字符串当时间戳，结果是 Invalid Date 然后抛 InvalidType。
+ * 这个坑的表现是「第一页之后全部取不到」，而且只打一行 warn，很难发现。
  */
-export async function collectThreads(forum: ForumChannel): Promise<ThreadChannel[]> {
+export async function collectThreads(forum: ForumChannel): Promise<CollectResult> {
     const found = new Map<string, ThreadChannel>();
+    let incomplete = false;
+    let reason: string | undefined;
 
     try {
         const active = await forum.threads.fetchActive();
         for (const [id, thread] of active.threads) found.set(id, thread);
     } catch (err) {
+        incomplete = true;
+        reason = '活跃帖读取失败：' + (err instanceof Error ? err.message : String(err));
         console.warn(`[TitleGuard] 读取论坛 ${forum.id} 活跃帖失败：`, err);
     }
 
-    let before: string | undefined;
-    for (let page = 0; page < 400; page++) {
+    // 数字，不是字符串。见上面的说明
+    let before: number | undefined;
+    let page = 0;
+
+    for (; page < MAX_ARCHIVE_PAGES; page++) {
+        let archived;
         try {
-            const archived = await forum.threads.fetchArchived({ limit: 100, before });
-            if (archived.threads.size === 0) break;
-
-            let oldest: number | undefined;
-            for (const [id, thread] of archived.threads) {
-                if (!found.has(id)) found.set(id, thread);
-                const ts = thread.archivedAt?.getTime() ?? thread.createdTimestamp ?? undefined;
-                if (ts !== undefined && (oldest === undefined || ts < oldest)) oldest = ts;
-            }
-
-            if (!archived.hasMore || oldest === undefined) break;
-            before = String(oldest);
+            archived = await forum.threads.fetchArchived({ limit: ARCHIVE_PAGE, before });
         } catch (err) {
-            console.warn(`[TitleGuard] 读取论坛 ${forum.id} 归档帖失败：`, err);
+            incomplete = true;
+            reason = `归档帖翻到第 ${page + 1} 页时失败：`
+                + (err instanceof Error ? err.message : String(err));
+            console.warn(`[TitleGuard] 读取论坛 ${forum.id} 归档帖失败（第 ${page + 1} 页）：`, err);
             break;
         }
+
+        if (archived.threads.size === 0) break;
+
+        // 游标只认 archivedAt。混用 createdTimestamp 会让游标跳错位置，
+        // 要么漏掉一段，要么在原地打转
+        let oldest: number | undefined;
+        for (const [id, thread] of archived.threads) {
+            if (!found.has(id)) found.set(id, thread);
+            const ts = thread.archivedAt?.getTime();
+            if (ts !== undefined && (oldest === undefined || ts < oldest)) oldest = ts;
+        }
+
+        if (!archived.hasMore) break;
+        if (oldest === undefined) {
+            incomplete = true;
+            reason = `归档帖翻到第 ${page + 1} 页时拿不到归档时间，没法继续翻页`;
+            break;
+        }
+        // 游标没往前走就说明翻不动了，再转下去是死循环
+        if (before !== undefined && oldest >= before) {
+            incomplete = true;
+            reason = `归档帖翻页卡在第 ${page + 1} 页，游标不再前进`;
+            break;
+        }
+        before = oldest;
     }
 
-    return [...found.values()];
+    if (page >= MAX_ARCHIVE_PAGES) {
+        incomplete = true;
+        reason = `归档帖超过 ${MAX_ARCHIVE_PAGES * ARCHIVE_PAGE} 个，只取了这么多`;
+    }
+
+    return { threads: [...found.values()], incomplete, reason };
 }
 
 // ============================================================
@@ -135,7 +187,7 @@ export async function scanForum(
     guildId: string,
     forumId: string,
     options: { dryRun?: boolean; onProgress?: (p: ScanProgress) => void } = {},
-): Promise<{ rows: ScanRow[]; progress: ScanProgress }> {
+): Promise<{ rows: ScanRow[]; progress: ScanProgress; incomplete: boolean; reason?: string }> {
     const dryRun = options.dryRun ?? true;
     const settings = db.getSettings(guildId);
 
@@ -145,7 +197,7 @@ export async function scanForum(
     }
     const forum = channel as ForumChannel;
 
-    const threads = await collectThreads(forum);
+    const { threads, incomplete, reason } = await collectThreads(forum);
     const rows: ScanRow[] = [];
     const progress: ScanProgress = { scanned: 0, flagged: 0, skipped: 0 };
     const cleanIds: string[] = [];
@@ -209,7 +261,7 @@ export async function scanForum(
     }
 
     options.onProgress?.(progress);
-    return { rows, progress };
+    return { rows, progress, incomplete, reason };
 }
 
 /**
@@ -219,16 +271,23 @@ export async function scanForum(
  * 而不是「第三个论坛看了多少个」——后者在一堆论坛之间来回跳，读不出还剩多少。
  *
  * 某个论坛读不到（频道删了、没权限）不会中断整趟，记下来最后一起报。
+ * 「取不全」也要单独报——那意味着有一批帖子压根没进扫描。
  */
 export async function scanForums(
     client: Client,
     guildId: string,
     forumIds: string[],
     options: { dryRun?: boolean; onProgress?: (p: ScanProgress) => void } = {},
-): Promise<{ rows: ScanRow[]; progress: ScanProgress; failed: string[] }> {
+): Promise<{
+    rows: ScanRow[];
+    progress: ScanProgress;
+    failed: string[];
+    incomplete: { forumId: string; reason: string }[];
+}> {
     const rows: ScanRow[] = [];
     const total: ScanProgress = { scanned: 0, flagged: 0, skipped: 0 };
     const failed: string[] = [];
+    const incomplete: { forumId: string; reason: string }[] = [];
 
     for (const forumId of forumIds) {
         // 每个论坛内部的进度加上前面已经累计的，报出去才是全局进度
@@ -246,6 +305,9 @@ export async function scanForums(
             total.scanned += r.progress.scanned;
             total.flagged += r.progress.flagged;
             total.skipped += r.progress.skipped;
+            if (r.incomplete) {
+                incomplete.push({ forumId, reason: r.reason ?? '原因不明' });
+            }
         } catch (err) {
             failed.push(forumId);
             console.warn(`[TitleGuard] 扫描论坛 ${forumId} 失败：`, err);
@@ -253,7 +315,7 @@ export async function scanForums(
     }
 
     options.onProgress?.(total);
-    return { rows, progress: total, failed };
+    return { rows, progress: total, failed, incomplete };
 }
 
 // ============================================================

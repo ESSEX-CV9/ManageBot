@@ -1276,10 +1276,13 @@ async function handleScan(interaction: ChatInputCommandInteraction): Promise<voi
         + `${dryRun ? '（静默模式：只出报表，不发通知不改动）' : ''}…`);
 
     try {
-        const { rows, progress, failed } = await scanForums(interaction.client, guildId, forumIds, {
+        const { rows, progress, failed, incomplete } = await scanForums(
+            interaction.client, guildId, forumIds, {
             dryRun,
             onProgress: p => {
-                void interaction.editReply(`🔎 扫描中… 已看 ${p.scanned} 个帖子，命中 ${p.flagged} 个`).catch(() => { /* 忽略 */ });
+                void interaction.editReply(
+                    `🔎 扫描中… 已看 ${p.scanned} 个帖子，命中 ${p.flagged} 个`,
+                ).catch(() => { /* 忽略 */ });
             },
         });
 
@@ -1330,6 +1333,12 @@ async function handleScan(interaction: ChatInputCommandInteraction): Promise<voi
                 + (failed.length > 0
                     ? `\n\n⚠️ 有 ${failed.length} 个论坛没扫成（频道删了或没权限），`
                         + '上面的数字不含它们。'
+                    : '')
+                // 取不全比扫不到更危险：数字看着正常，实际有一大批帖子压根没进来
+                + (incomplete.length > 0
+                    ? `\n\n🚨 **有 ${incomplete.length} 个论坛的帖子没取全**，`
+                        + '上面的数字是不完整的，别拿它当摸底结论：\n'
+                        + incomplete.map(x => `• <#${x.forumId}> — ${x.reason}`).join('\n')
                     : ''),
             files: [new AttachmentBuilder(Buffer.from(buffer), {
                 name: `扫描结果_${picked ? picked.name : '全部论坛'}.xlsx`,
