@@ -23,7 +23,7 @@ import {
     type ThreadChannel,
 } from 'discord.js';
 
-import { compileConfig, detect, type CompiledConfig } from './ruleEngine';
+import { compileConfig, detect, judgeHitsOf, type CompiledConfig } from './ruleEngine';
 import {
     pendingHits, planProgramStage, previewTagPlan, type RewritePlan,
 } from './rewriter';
@@ -151,6 +151,8 @@ export interface InspectResult {
      * 但改写方案出不来或没过校验，与其直接转人工，不如先问模型要个方案。
      */
     llmFallback: boolean;
+    /** 本论坛是否要求所有问题（包括程序本可直接判的）都先经模型 */
+    llmForced: boolean;
     /**
      * 存在需要 LLM 定性的违规，但还没拿到判定结论
      * （dryRun、LLM 没配、调用失败）。这种状态**不该给作者发通知**——
@@ -180,6 +182,7 @@ export async function inspectThread(
         judgement: null,
         llmCleared: false,
         llmFallback: false,
+        llmForced: false,
         llmPending: false,
     };
 
@@ -207,11 +210,12 @@ export async function inspectThread(
     let llmFallback = false;
 
     const settings = db.getSettings(guildId);
+    const llmForced = forumConfig.forceLlmReview;
 
     // 程序那一段先跑出来：它决定了「还剩哪几处要问模型」，
     // 也决定了「整改后 TAG 长什么样」。两件事都得在提问之前算好。
     const stage = planProgramStage({ detectResult, tags, forumTags: availableTags, compiled });
-    const pending = pendingHits(detectResult, stage);
+    const pending = llmForced ? judgeHitsOf(detectResult) : pendingHits(detectResult, stage);
 
     /** 真调一次模型。retryFeedback 非空时是「打回重写」那一轮 */
     const callModel = async (retryFeedback?: string): Promise<Judgement | null> => {
@@ -273,10 +277,11 @@ export async function inspectThread(
         compiled,
         authorChoice: options.authorChoice,
         judgement,
+        modelHandlesAll: llmForced && !options.dryRun,
     });
 
-    // 触发点一：判定阶段就说了「这些词得先定性」
-    if (detectResult.needsLlm && !options.dryRun) await askModel();
+    // 触发点一：规则本身要求模型定性，或本论坛明确要求所有问题都先经模型。
+    if ((detectResult.needsLlm || llmForced) && !options.dryRun) await askModel();
 
     // 模型给的标题不合规时，把「哪儿还不合规」告诉它，让它重写一次再出方案
     const canRewrite = !options.dryRun && settings.llmEnabled;
@@ -309,14 +314,14 @@ export async function inspectThread(
         && plan.removeTagIds.length === 0
         && plan.addTagIds.length === 0;
 
-    const llmPending = detectResult.needsLlm && judgement === null;
+    const llmPending = (detectResult.needsLlm || llmForced) && judgement === null;
     if (llmPending && llmError) {
         console.warn(`[TitleGuard] 帖子 ${thread.id} 需要 LLM 定性但未取得结论：${llmError}`);
     }
 
     return {
         ...base,
-        detectResult, tags, availableTags, plan, judgement, llmCleared, llmFallback, llmPending,
+        detectResult, tags, availableTags, plan, judgement, llmCleared, llmFallback, llmForced, llmPending,
         skipped: null,
     };
 }
@@ -327,7 +332,7 @@ export async function inspectThread(
  * 以前只截 200 字，因为那会儿首楼只是「把握低时补一刀」的可选料。
  * 现在定性是第一步，光看标题做不了，所以给足一点。
  */
-async function readFirstPostExcerpt(thread: ThreadChannel): Promise<string | undefined> {
+export async function readFirstPostExcerpt(thread: ThreadChannel): Promise<string | undefined> {
     try {
         const starter = await thread.fetchStarterMessage();
         const content = starter?.content?.trim();

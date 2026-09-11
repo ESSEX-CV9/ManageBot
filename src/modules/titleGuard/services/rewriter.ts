@@ -22,7 +22,7 @@
 // 第二段交回来的答卷要过校验（validateModelPlan）。没过就打回重写，
 // 并且告诉它**具体还剩哪条没解决**，而不是笼统一句「不合规」。
 
-import { detect, pickByPriority, declarationOf, classifyingGroup, tierOf,
+import { detect, pickByPriority, declarationOf, classifyingGroup, judgeHitsOf, tierOf,
     type CompiledConfig } from './ruleEngine';
 import {
     applyDecisions,
@@ -508,14 +508,32 @@ export interface BuildPlanInput {
     authorChoice?: GroupId | null;
     /** 模型的答卷。没有就先只跑第一段 */
     judgement?: Judgement | null;
+    /** 论坛要求所有问题都交给模型时，程序只给出参考方案，不先落任何改动 */
+    modelHandlesAll?: boolean;
 }
 
 export function buildPlan(input: BuildPlanInput): RewritePlan {
-    const { detectResult, tags, forumTags, compiled, authorChoice, judgement } = input;
+    const { detectResult, tags, forumTags, compiled, authorChoice, judgement, modelHandlesAll } = input;
     const originalTitle = detectResult.normalized.original;
 
-    const stage = planProgramStage({ detectResult, tags, forumTags, compiled, authorChoice });
-    const pending = pendingHits(detectResult, stage);
+    const programStage = planProgramStage({ detectResult, tags, forumTags, compiled, authorChoice });
+    // 强制模型复核时，程序阶段仍会在提示词里作为参考方案展示，但不会先落地。
+    // 标题命中和最终 TAG 都交给模型，再由下面同一套安全校验兜底。
+    const stage: ProgramStage = modelHandlesAll
+        ? {
+            edits: [],
+            handled: new Set(),
+            removeTagIds: new Set(),
+            addTagIds: new Set(),
+            tagsAfter: tags,
+            keepGroup: null,
+            keepSource: 'none',
+            notes: [],
+            blocked: [],
+        }
+        : programStage;
+    const pending = modelHandlesAll ? judgeHitsOf(detectResult) : pendingHits(detectResult, stage);
+    const needsModel = Boolean(modelHandlesAll) || pending.length > 0;
 
     const base = {
         originalTitle,
@@ -525,7 +543,7 @@ export function buildPlan(input: BuildPlanInput): RewritePlan {
     };
 
     // ---------- 只有第一段 ----------
-    if (pending.length === 0) {
+    if (!needsModel) {
         const newTitle = tidyTitle(applySpanEdits(detectResult, stage.edits));
         const blocked = stage.blocked.length > 0 ? stage.blocked.join('；') : null;
         return {

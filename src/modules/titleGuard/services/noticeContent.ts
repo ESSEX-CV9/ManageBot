@@ -68,6 +68,8 @@ export interface NoticeInput {
         upheld: boolean;
         reason: string;
     } | null;
+    /** 额外一次 AI 复核名额是否已经使用（包括正在处理但尚无结论的状态） */
+    aiReviewUsed?: boolean;
     /** 申诉已升到人工，等管理组处理 */
     awaitingHuman?: boolean;
     /**
@@ -196,6 +198,11 @@ function aiFooterLine(input: NoticeInput): string {
         : '本帖的整改方案经过 AI 语义判定。';
 }
 
+/** 兼容调试台未显式传 aiReviewUsed 的旧输入：已有复核结论就视为已使用。 */
+function canRequestAiReview(input: NoticeInput): boolean {
+    return !input.awaitingHuman && !(input.aiReviewUsed ?? Boolean(input.review));
+}
+
 /**
  * 已结案的通知长什么样。
  *
@@ -309,7 +316,10 @@ export function buildNoticeContent(input: NoticeInput): NoticeContent {
     fields.push({ name: '四、规范依据', value: basisLines.join('\n') });
 
     const description = '本帖分类信息不符合社区规范，请按下列说明处理。'
-        + (input.isOldPost ? '\n本帖为旧帖，已相应延长处理期限。' : '');
+        + (input.isOldPost ? '\n本帖为旧帖，已相应延长处理期限。' : '')
+        + (canRequestAiReview(input)
+            ? '\n\n> 如果认为判定有误，可以点击复核按钮调用 LLM 再次复核。'
+            : '');
 
     return {
         mention: input.authorId ? `<@${input.authorId}>` : null,
@@ -321,9 +331,9 @@ export function buildNoticeContent(input: NoticeInput): NoticeContent {
             aiFooterLine(input),
             input.awaitingHuman
                 ? '本帖已提请人工复核，倒计时保持暂停，请等待管理组处理。'
-                : input.review
-                    ? '如仍有异议，可点击下方按钮提请人工复核。'
-                    : '如对判定有异议，请点击下方按钮提请复核，倒计时将即时暂停。',
+                : canRequestAiReview(input)
+                    ? '提交复核后，倒计时将即时暂停。'
+                    : '如仍有异议，可点击下方按钮提请人工复核。',
         ].filter(Boolean).join('\n'),
         buttons: buildButtonList(input),
     };
@@ -343,7 +353,7 @@ function buildButtonList(input: NoticeInput): NoticeButton[] {
         buttons.push({ label: '驳回申诉', style: 'secondary', who: '有「复核」权限的身份组' });
     } else {
         buttons.push({
-            label: input.review ? '申请人工复核' : '申请复核',
+            label: canRequestAiReview(input) ? '申请复核' : '申请人工复核',
             style: 'secondary',
             who: '帖主 / 管理组',
         });

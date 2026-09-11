@@ -143,7 +143,8 @@ const data = new SlashCommandBuilder()
         .addSubcommand(s => s.setName('添加').setDescription('把一个论坛纳入管理')
             .addChannelOption(o => o.setName('论坛').setDescription('论坛频道（和「频道id」二选一）').addChannelTypes(ChannelType.GuildForum))
             .addStringOption(o => o.setName('频道id').setDescription('直接填论坛频道 ID，频道太多不好翻时用'))
-            .addBooleanOption(o => o.setName('正文给llm').setDescription('是否允许把首楼摘录发给 LLM（露骨内容多的论坛建议关）')))
+            .addBooleanOption(o => o.setName('正文给llm').setDescription('是否允许把首楼摘录发给 LLM（露骨内容多的论坛建议关）'))
+            .addBooleanOption(o => o.setName('所有问题给llm').setDescription('是否强制所有问题帖先经 LLM 判定')))
         .addSubcommand(s => s.setName('移除').setDescription('移出管理')
             .addChannelOption(o => o.setName('论坛').setDescription('论坛频道（和「频道id」二选一）').addChannelTypes(ChannelType.GuildForum))
             .addStringOption(o => o.setName('频道id').setDescription('直接填论坛频道 ID')))
@@ -550,7 +551,9 @@ async function handleForum(interaction: ChatInputCommandInteraction, sub: string
             return;
         }
         const lines = forums.map(f =>
-            `• <#${f.forumId}> — ${f.enabled ? '启用' : '停用'}，正文给 LLM：${f.sendBodyToLlm ? '是' : '否'}`,
+            `• <#${f.forumId}> — ${f.enabled ? '启用' : '停用'}，`
+            + `所有问题给 LLM：${f.forceLlmReview ? '是' : '否'}，`
+            + `首楼给 LLM：${f.sendBodyToLlm ? '是' : '否'}`,
         );
         await interaction.reply(ephemeral(`**已纳入管理的论坛（${forums.length}）**\n${lines.join('\n')}`));
         return;
@@ -569,6 +572,8 @@ async function handleForum(interaction: ChatInputCommandInteraction, sub: string
     db.addForum(guildId, forum.id);
     const sendBody = interaction.options.getBoolean('正文给llm');
     if (sendBody !== null) db.updateForum(guildId, forum.id, { sendBodyToLlm: sendBody });
+    const forceLlm = interaction.options.getBoolean('所有问题给llm');
+    if (forceLlm !== null) db.updateForum(guildId, forum.id, { forceLlmReview: forceLlm });
 
     const mapped = autoMapTags(interaction.guild!, forum);
     await interaction.reply(ephemeral(

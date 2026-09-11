@@ -36,6 +36,10 @@ const TICK_MS = 60_000;
 let timer: NodeJS.Timeout | null = null;
 let ticking = false;
 
+/** 启动时抓取一次旧通知，之后每轮少量原地编辑，避免瞬间打满 Discord API。 */
+let noticeRefreshQueue: number[] | null = null;
+const NOTICE_REFRESH_BATCH_SIZE = 20;
+
 /** 上次处理老帖队列的时间（按服务器各自的速率节流） */
 const lastBackfill = new Map<string, number>();
 
@@ -150,7 +154,7 @@ async function processDue(client: Client): Promise<void> {
         }
 
         // LLM 判出来的违规是否需要管理组先确认
-        const llmDriven = violations.some(v => v.arbiter === 'LLM');
+        const llmDriven = inspection.llmForced || violations.some(v => v.arbiter === 'LLM');
         if (llmDriven && settings.llmNeedsConfirm) {
             db.updateCase(guardCase.id, {
                 state: 'pending_admin',
@@ -314,6 +318,22 @@ async function processBackfill(client: Client): Promise<void> {
 // 主循环
 // ============================================================
 
+async function refreshExistingNoticeBatch(client: Client): Promise<void> {
+    if (noticeRefreshQueue === null) {
+        noticeRefreshQueue = db.listOpenNoticeCases().map(c => c.id);
+        if (noticeRefreshQueue.length > 0) {
+            console.log(`[TitleGuard] 将自动刷新 ${noticeRefreshQueue.length} 条已有通知面板`);
+        }
+    }
+
+    const batch = noticeRefreshQueue.splice(0, NOTICE_REFRESH_BATCH_SIZE);
+    for (const caseId of batch) await refreshNotice(client, caseId);
+
+    if (batch.length > 0 && noticeRefreshQueue.length === 0) {
+        console.log('[TitleGuard] 已有通知面板刷新完成');
+    }
+}
+
 async function tick(client: Client): Promise<void> {
     if (ticking) return;
     ticking = true;
@@ -321,6 +341,7 @@ async function tick(client: Client): Promise<void> {
         await processUnnotified(client);
         await processDue(client);
         await processBackfill(client);
+        await refreshExistingNoticeBatch(client);
     } catch (err) {
         console.error('[TitleGuard] 调度器出错：', err);
     } finally {
@@ -330,6 +351,7 @@ async function tick(client: Client): Promise<void> {
 
 export function startTitleGuardScheduler(client: Client): void {
     if (timer) return;
+    noticeRefreshQueue = null;
     timer = setInterval(() => { void tick(client); }, TICK_MS);
     // 启动后先等一会儿再跑第一轮，让 guild 缓存先填好
     setTimeout(() => { void tick(client); }, 30_000);
@@ -340,4 +362,5 @@ export function stopTitleGuardScheduler(): void {
     if (!timer) return;
     clearInterval(timer);
     timer = null;
+    noticeRefreshQueue = null;
 }

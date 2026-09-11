@@ -5,7 +5,7 @@
 // 设计要点：
 //   - 词典、互斥集合、TAG 映射**不内置任何默认值**，全部由管理组通过 /标题规范 线上维护。
 //   - 词典和互斥集合是**服务器级**共用一份（社区共识层面的东西），
-//     论坛级只配「启不启用」和「本论坛哪个 TAG 对应哪个分类组」。
+//     论坛级配置启用状态、模型策略，以及「本论坛哪个 TAG 对应哪个分类组」。
 //   - 每次改动都写 tt_actions 流水，留原值，管理组可一键还原。
 
 import path from 'path';
@@ -69,6 +69,7 @@ db.exec(`
         forum_id          TEXT NOT NULL,
         enabled           INTEGER NOT NULL DEFAULT 1,
         send_body_to_llm  INTEGER NOT NULL DEFAULT 0,
+        force_llm_review  INTEGER NOT NULL DEFAULT 0,
         added_at          INTEGER NOT NULL,
         PRIMARY KEY (guild_id, forum_id)
     );
@@ -351,6 +352,8 @@ ensureColumn('tt_settings', 'dict_source_guild_id', "TEXT NOT NULL DEFAULT ''");
 // 一口气把上百条通知发出去，论坛首页会被这上百个帖子全顶上来，等于刷屏。
 ensureColumn('tt_settings', 'fast_batch_size', 'INTEGER NOT NULL DEFAULT 50');
 ensureColumn('tt_settings', 'fast_batch_pause_minutes', 'INTEGER NOT NULL DEFAULT 30');
+// 论坛级开关：即使程序已经能直接判，也要先让模型完整复核一次再形成整改方案。
+ensureColumn('tt_forums', 'force_llm_review', 'INTEGER NOT NULL DEFAULT 0');
 seedWordTier();
 
 // ============================================================
@@ -575,18 +578,24 @@ export interface ForumConfig {
     enabled: boolean;
     /** 是否允许把首楼摘录发给 LLM。露骨内容多的论坛建议关掉，免得被内容审核拦截 */
     sendBodyToLlm: boolean;
+    /** 是否让本论坛每一个有问题的帖子都先经 LLM 判定，再形成整改方案 */
+    forceLlmReview: boolean;
 }
 
 const listForumsStmt = db.prepare('SELECT * FROM tt_forums WHERE guild_id = ? ORDER BY added_at');
 const getForumStmt = db.prepare('SELECT * FROM tt_forums WHERE guild_id = ? AND forum_id = ?');
 const addForumStmt = db.prepare(`
-    INSERT INTO tt_forums (guild_id, forum_id, enabled, send_body_to_llm, added_at)
-    VALUES (?, ?, 1, 0, ?)
+    INSERT INTO tt_forums (
+        guild_id, forum_id, enabled, send_body_to_llm, force_llm_review, added_at
+    )
+    VALUES (?, ?, 1, 0, 0, ?)
     ON CONFLICT(guild_id, forum_id) DO NOTHING
 `);
 const removeForumStmt = db.prepare('DELETE FROM tt_forums WHERE guild_id = ? AND forum_id = ?');
 const updateForumStmt = db.prepare(`
-    UPDATE tt_forums SET enabled = ?, send_body_to_llm = ? WHERE guild_id = ? AND forum_id = ?
+    UPDATE tt_forums
+    SET enabled = ?, send_body_to_llm = ?, force_llm_review = ?
+    WHERE guild_id = ? AND forum_id = ?
 `);
 
 interface ForumRow {
@@ -594,6 +603,7 @@ interface ForumRow {
     forum_id: string;
     enabled: number;
     send_body_to_llm: number;
+    force_llm_review: number;
 }
 
 function toForum(row: ForumRow): ForumConfig {
@@ -602,6 +612,7 @@ function toForum(row: ForumRow): ForumConfig {
         forumId: row.forum_id,
         enabled: Boolean(row.enabled),
         sendBodyToLlm: Boolean(row.send_body_to_llm),
+        forceLlmReview: Boolean(row.force_llm_review),
     };
 }
 
@@ -626,7 +637,13 @@ export function updateForum(guildId: string, forumId: string, patch: Partial<For
     const current = getForum(guildId, forumId);
     if (!current) return;
     const merged = { ...current, ...patch };
-    updateForumStmt.run(merged.enabled ? 1 : 0, merged.sendBodyToLlm ? 1 : 0, guildId, forumId);
+    updateForumStmt.run(
+        merged.enabled ? 1 : 0,
+        merged.sendBodyToLlm ? 1 : 0,
+        merged.forceLlmReview ? 1 : 0,
+        guildId,
+        forumId,
+    );
 }
 
 // ============================================================
@@ -1125,6 +1142,11 @@ const listDueCasesStmt = db.prepare(`
 const listUnnotifiedStmt = db.prepare(`
     SELECT * FROM tt_cases WHERE state = 'detected' AND closed_at IS NULL ORDER BY created_at LIMIT ?
 `);
+const listOpenNoticeCasesStmt = db.prepare(`
+    SELECT * FROM tt_cases
+    WHERE closed_at IS NULL AND notice_message_id IS NOT NULL
+    ORDER BY id
+`);
 
 export interface CreateCaseInput {
     guildId: string;
@@ -1187,6 +1209,11 @@ export function listDueCases(now: number, limit = 20): GuardCase[] {
 
 export function listUnnotifiedCases(limit = 20): GuardCase[] {
     return (listUnnotifiedStmt.all(limit) as CaseRow[]).map(toCase);
+}
+
+/** 已经发过通知、且仍未结案的案件。用于新版上线后原地刷新旧面板文案。 */
+export function listOpenNoticeCases(): GuardCase[] {
+    return (listOpenNoticeCasesStmt.all() as CaseRow[]).map(toCase);
 }
 
 const updateCaseStmt = db.prepare(`

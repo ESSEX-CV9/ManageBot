@@ -17,7 +17,7 @@
 // 复核是**两级**的：
 //   1. AI 复核每个案子只有一次。它维持原判 → 恢复倒计时，作者可以再升人工；
 //      它认为申诉成立 → 直接放行（不动帖子这个方向是无损的，出错也只是少改一个帖子）。
-//   2. 建案时本来就经过 AI 定性的案子，跳过第一级——它已经说过话了，再问一次没有意义。
+//      建案时即使已经经过 AI 定性，也仍有这一次额外复核机会：申诉理由和首楼是新的证据。
 //
 // 作者填的那句理由是**不可信输入**，会被塞进给模型的提示里，所以先过一道安检
 //（llmAppeal.screenAppealText）。安检没过 → 这段话永远不进提示，案子直接转人工：
@@ -42,7 +42,14 @@ import {
 } from 'discord.js';
 
 import * as db from '../services/titleGuardDatabase';
-import { alertMentions, fetchThread, inspectThread, readAppliedTags, getCompiledConfig } from '../services/enforcer';
+import {
+    alertMentions,
+    fetchThread,
+    getCompiledConfig,
+    inspectThread,
+    readAppliedTags,
+    readFirstPostExcerpt,
+} from '../services/enforcer';
 import { hasCapability, reviewerMentions, type GuardCapability } from '../services/titleGuardPermissions';
 import { APPEAL_MAX_LENGTH, reviewAppeal, screenAppealText } from '../services/llmAppeal';
 import { buildJudgeRules } from '../services/llmJudge';
@@ -95,6 +102,7 @@ export function buildNoticeEmbed(
         review: guardCase.aiReviewUpheld === null
             ? null
             : { upheld: guardCase.aiReviewUpheld, reason: guardCase.llmReviewReason ?? '' },
+        aiReviewUsed: guardCase.aiReviewUsed,
         awaitingHuman: guardCase.state === 'pending_admin',
         resolution: resolutionOf(guardCase),
     });
@@ -189,12 +197,11 @@ export function buildNoticeButtons(guardCase: db.GuardCase): ActionRowBuilder<Bu
 }
 
 /**
- * 这个案子还能不能走 AI 复核。
- * 两种情况都不能：已经用掉了，或者建案时本来就是 AI 定性的
- *（它已经就这个帖子表过态，再问一次是拿同样的输入要同样的答案）。
+ * 这个案子还能不能走 AI 复核。每案固定额外给一次；
+ * 建案时是否已经由 AI 定性不影响，因为作者的申诉理由是新的证据。
  */
 function aiReviewAvailable(guardCase: db.GuardCase): boolean {
-    return !guardCase.aiReviewUsed && !guardCase.llmReason;
+    return !guardCase.aiReviewUsed;
 }
 
 /**
@@ -563,9 +570,7 @@ export async function handleAppealModal(interaction: ModalSubmitInteraction): Pr
 
     // ---------- 直接人工 ----------
     await escalateToHuman(interaction, guardCase.id, text, {
-        note: guardCase.aiReviewUsed
-            ? '作者对 AI 复核结论仍有异议。'
-            : '本案由 AI 定性，按规则直接转人工复核。',
+        note: '作者对 AI 复核结论仍有异议。',
         flagged: false,
     });
 }
@@ -585,10 +590,17 @@ async function runAiReview(
     const tags = readAppliedTags(thread);
     const plan = guardCase.plan as RewritePlan | null;
     const names = tagNamesOf(thread);
+    const forumConfig = thread.parentId
+        ? db.getForum(guardCase.guildId, thread.parentId)
+        : null;
+    const bodyExcerpt = forumConfig?.sendBodyToLlm
+        ? await readFirstPostExcerpt(thread)
+        : undefined;
 
     const outcome = await reviewAppeal({
         title: guardCase.originalTitle,
         forumName: thread.parent?.name ?? '',
+        bodyExcerpt,
         tags: tags.map(t => ({ name: t.tagName, group: t.group })),
         hits: guardCase.violations.flatMap(v => v.hits)
             .filter(h => h.entry.group)

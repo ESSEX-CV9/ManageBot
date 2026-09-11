@@ -259,7 +259,7 @@ export async function scanForum(
         const plan = inspection.plan;
         const activity = activityOf(thread, settings.oldPostInactiveHours);
         const disposition: Disposition =
-            violations.some(v => v.arbiter === 'LLM') ? '需模型定性'
+            inspection.llmPending ? '需模型定性'
                 : plan?.autoFixable ? '可自动整改'
                     : '转人工';
 

@@ -70,6 +70,7 @@ const SEL_CAP = `${P}:cap`;         // 选哪一项能力
 const SEL_ROLES = `${P}:roles`;     // tt_cfg:roles:<capability>
 const SEL_FORUMS = `${P}:forumsel`;
 const SEL_BODY = `${P}:bodysel`;
+const SEL_FORCE_LLM = `${P}:forcellm`;
 const MODAL_GRACE = `${P}:gracemodal`;
 const MODAL_QUEUE = `${P}:queuemodal`;
 const MODAL_DICTSRC = `${P}:dictsrcmodal`;
@@ -251,6 +252,7 @@ function forumsView(guildId: string) {
     const enabled = forums.filter(f => f.enabled).map(f => f.forumId);
 
     const withBody = forums.filter(f => f.enabled && f.sendBodyToLlm).map(f => f.forumId);
+    const forceLlm = forums.filter(f => f.enabled && f.forceLlmReview).map(f => f.forumId);
 
     // 没对上分类组的 TAG 在判定里等于不存在，所以这个数得摆在明面上
     let mappedTotal = 0;
@@ -277,6 +279,17 @@ function forumsView(guildId: string) {
                     + '移出不会删掉已有的案件记录，只是不再检查新帖。',
             },
             {
+                name: '所有问题先经模型',
+                value: [
+                    forceLlm.length > 0
+                        ? `开着的：${forceLlm.map(id => `<#${id}>`).join('、')}`
+                        : '_一个都没开。_',
+                    '',
+                    '开着后，连程序本来能直接整改的问题也会先交给模型完整判定。',
+                    '模型不可用时会转人工，不会绕过模型直接执行。',
+                ].join('\n'),
+            },
+            {
                 name: '首楼给模型',
                 value: [
                     withBody.length > 0
@@ -285,6 +298,7 @@ function forumsView(guildId: string) {
                     '',
                     '模型判定的**第一步是给作品定性**，而定性主要靠首楼——'
                         + '光看标题分不出「这是纯爱作品」还是「作者在描述人设」。',
+                    '作者点击「申请复核」后的第一次 AI 复核也共用这个开关。',
                     '关着的话模型只能靠标题猜，判错的概率明显更高。',
                     '⚠️ 开了就意味着**首楼开头 600 字会发给第三方模型**，'
                         + '露骨内容多的论坛自己掂量。',
@@ -319,10 +333,20 @@ function forumsView(guildId: string) {
         .setDisabled(enabled.length === 0);
     if (withBody.length > 0) bodySelect.setDefaultChannels(withBody.slice(0, 25));
 
+    const forceLlmSelect = new ChannelSelectMenuBuilder()
+        .setCustomId(SEL_FORCE_LLM)
+        .setPlaceholder('选哪些论坛的所有问题都必须先经模型（可多选）')
+        .addChannelTypes(ChannelType.GuildForum)
+        .setMinValues(0)
+        .setMaxValues(25)
+        .setDisabled(enabled.length === 0);
+    if (forceLlm.length > 0) forceLlmSelect.setDefaultChannels(forceLlm.slice(0, 25));
+
     return {
         embeds: [embed],
         components: [
             new ActionRowBuilder<ChannelSelectMenuBuilder>().addComponents(select),
+            new ActionRowBuilder<ChannelSelectMenuBuilder>().addComponents(forceLlmSelect),
             new ActionRowBuilder<ChannelSelectMenuBuilder>().addComponents(bodySelect),
             new ActionRowBuilder<ButtonBuilder>().addComponents(
                 new ButtonBuilder().setCustomId(BTN_AUTOMAP)
@@ -693,7 +717,35 @@ export async function handleConfigSelect(interaction: AnySelectMenuInteraction):
         return true;
     }
 
-    // ④ 哪些论坛把首楼发给模型
+    // ④ 哪些论坛的所有问题都必须先经模型
+    if (interaction.customId === SEL_FORCE_LLM) {
+        if (!hasCapability(memberOf(interaction), guildId, '设置')) {
+            await denied(interaction, '改这个需要「设置」权限。');
+            return true;
+        }
+        if (!interaction.isChannelSelectMenu()) return true;
+
+        const wanted = new Set(interaction.values);
+        const enrolled = db.listForums(guildId);
+        for (const f of enrolled) {
+            db.updateForum(guildId, f.forumId, { forceLlmReview: wanted.has(f.forumId) });
+        }
+
+        const stray = [...wanted].filter(id => !enrolled.some(f => f.forumId === id));
+
+        invalidateConfigCache();
+        await interaction.update(forumsView(guildId));
+        if (stray.length > 0) {
+            await interaction.followUp({
+                content: `⚠️ ${stray.map(id => `<#${id}>`).join('、')} 还没纳入管理，这个开关对它没意义。`
+                    + `\n先用最上面的菜单把它勾上纳管，再回来开这个。`,
+                flags: MessageFlags.Ephemeral,
+            });
+        }
+        return true;
+    }
+
+    // ⑤ 哪些论坛把首楼发给模型
     if (interaction.customId === SEL_BODY) {
         if (!hasCapability(memberOf(interaction), guildId, '设置')) {
             await denied(interaction, '改这个需要「设置」权限。');

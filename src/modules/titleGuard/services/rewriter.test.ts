@@ -8,7 +8,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 
-import { compileConfig, detect } from './ruleEngine';
+import { compileConfig, detect, judgeHitsOf } from './ruleEngine';
 import {
     buildPlan, isDeletionOnly, pendingHits, planProgramStage, previewTagPlan,
     tidyTitle, validateNewTitle,
@@ -203,6 +203,68 @@ test('程序段：previewTagPlan 和真方案算的是同一份', () => {
     });
     assert.deepEqual(preview.after, ['纯爱']);
     assert.ok(preview.changes.some(c => c.includes('NTR')), preview.changes.join('；'));
+});
+
+test('强制模型复核：程序本可直改时也必须先等模型', () => {
+    const tags = [tag('NTR', 'NTR')];
+    const detectResult = detect({
+        title: '【纯爱 NTR】某某的故事', tags, config: CONFIG,
+    }, compiled);
+
+    const waiting = buildPlan({
+        detectResult, tags, forumTags: FORUM_TAGS, compiled, modelHandlesAll: true,
+    });
+    assert.equal(waiting.awaitingModel, true);
+    assert.equal(waiting.autoFixable, false);
+
+    const hits = judgeHitsOf(detectResult);
+    const judgement: Judgement = {
+        verdict: '纯爱',
+        verdictReason: '（测试用）',
+        finalTagGroups: ['纯爱'],
+        decisions: hits.map((m, i) => ({
+            hit: i + 1,
+            action: m.entry.group === '纯爱' ? '保留' : '删除',
+            why: '（测试用）',
+        })),
+        confidence: 'high',
+    };
+    const reviewed = buildPlan({
+        detectResult, tags, forumTags: FORUM_TAGS, compiled, judgement, modelHandlesAll: true,
+    });
+
+    assert.equal(reviewed.autoFixable, true);
+    assert.equal(reviewed.keepSource, 'llm');
+    assert.equal(reviewed.newTitle, '【纯爱】某某的故事');
+    assert.deepEqual(reviewed.removeTagIds, ['tag_NTR']);
+    assert.deepEqual(reviewed.addTagIds, ['tag_纯爱']);
+});
+
+test('强制模型复核：只有 TAG 冲突、标题零命中时也必须经过模型', () => {
+    const tags = [tag('纯爱', '纯爱'), tag('NTR', 'NTR')];
+    const detectResult = detect({ title: '某某的故事', tags, config: CONFIG }, compiled);
+
+    const waiting = buildPlan({
+        detectResult, tags, forumTags: FORUM_TAGS, compiled, modelHandlesAll: true,
+    });
+    assert.equal(judgeHitsOf(detectResult).length, 0);
+    assert.equal(waiting.awaitingModel, true);
+
+    const judgement: Judgement = {
+        verdict: 'NTR',
+        verdictReason: '（测试用）',
+        finalTagGroups: ['NTR', '多路线'],
+        decisions: [],
+        confidence: 'high',
+    };
+    const reviewed = buildPlan({
+        detectResult, tags, forumTags: FORUM_TAGS, compiled, judgement, modelHandlesAll: true,
+    });
+
+    assert.equal(reviewed.autoFixable, true);
+    assert.equal(reviewed.newTitle, '某某的故事');
+    assert.deepEqual(reviewed.removeTagIds, ['tag_纯爱']);
+    assert.deepEqual(reviewed.addTagIds, ['tag_多路线']);
 });
 
 // ============================================================
