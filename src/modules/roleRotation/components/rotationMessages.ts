@@ -71,6 +71,7 @@ export function buildRecruitmentMessage(
     round: RotationRound,
     currentMembers: number,
     closedReason?: string,
+    pingHere = false,
 ) {
     const vacancies = Math.max(0, config.capacity - currentMembers);
     const closed = Boolean(closedReason) || vacancies === 0;
@@ -101,9 +102,12 @@ export function buildRecruitmentMessage(
             .setDisabled(closed),
     );
     return {
+        content: pingHere ? '@here' : '',
         embeds: [embed],
         components: [row],
-        allowedMentions: { parse: [] as const },
+        allowedMentions: pingHere
+            ? { parse: ['everyone'] as const }
+            : { parse: [] as const },
     };
 }
 

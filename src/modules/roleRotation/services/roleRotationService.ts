@@ -104,6 +104,7 @@ async function sendToDestination(
     payload: MessageCreateOptions,
     forumPostTitle: string,
     mentionRole?: Role,
+    mentionHere = false,
 ): Promise<{ channelId: string; messageId: string } | { error: string }> {
     const destination = await client.channels.fetch(destinationId).catch(() => null);
     if (!destination || !('guildId' in destination) || destination.guildId !== guildId) {
@@ -111,12 +112,9 @@ async function sendToDestination(
     }
 
     const me = destination.guild.members.me;
-    if (
-        mentionRole
-        && !mentionRole.mentionable
-        && (!me || !destination.permissionsFor(me).has(PermissionFlagsBits.MentionEveryone))
-    ) {
-        return { error: `<#${destinationId}> 缺少提及身份组权限` };
+    const needsMentionPermission = mentionHere || Boolean(mentionRole && !mentionRole.mentionable);
+    if (needsMentionPermission && (!me || !destination.permissionsFor(me).has(PermissionFlagsBits.MentionEveryone))) {
+        return { error: `<#${destinationId}> 缺少提及 @here/身份组权限` };
     }
 
     if (destination.isThreadOnly()) {
@@ -537,8 +535,10 @@ async function ensureRecruitmentMessagesInternal(
             client,
             channelId,
             config.guildId,
-            buildRecruitmentMessage(config, round, currentMembers),
+            buildRecruitmentMessage(config, round, currentMembers, undefined, true),
             `公开招募｜${role.name}｜#${round.id}`,
+            undefined,
+            true,
         );
         if ('error' in published) {
             failures.push(published.error);
