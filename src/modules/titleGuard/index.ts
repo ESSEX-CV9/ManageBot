@@ -25,6 +25,7 @@ import {
     handleConfigModal,
     handleConfigSelect,
 } from './components/configPanel';
+import { handleCaseListButton } from './components/caseListPanel';
 
 /**
  * 模块里所有 tt_ 按钮从这儿分流。
@@ -35,6 +36,7 @@ import {
 export async function handleTitleGuardButton(interaction: ButtonInteraction): Promise<void> {
     if (await handleConfigButton(interaction)) return;
     if (await handleAuthorFixButton(interaction)) return;
+    if (await handleCaseListButton(interaction)) return;
     await handleNoticeButton(interaction);
 }
 

@@ -44,6 +44,7 @@ import { autoMapTags, scanForums, type ScanRow } from '../services/backfillQueue
 import { describeLlmConfig, summarizeJudgement } from '../services/llmJudge';
 import { cutForDebug } from '../services/wordBoundary';
 import { openConfigPanel } from '../components/configPanel';
+import { buildCaseListView } from '../components/caseListPanel';
 import { normalize } from '../services/normalizer';
 import type {
     DictKind, DictScope, ExclusiveDimension, SegmenterWord, WordTier,
@@ -1381,22 +1382,10 @@ async function handleCases(interaction: ChatInputCommandInteraction, sub: string
     const guildId = interaction.guildId!;
 
     if (sub === '列表') {
-        const cases = db.listOpenCases(guildId, 25);
-        if (cases.length === 0) {
-            await interaction.reply(ephemeral('✅ 当前没有未结案件。'));
-            return;
-        }
-        const lines = cases.map(c =>
-            `**#${c.id}** \`${c.state}\` <#${c.threadId}>\n　${c.originalTitle.slice(0, 60)}\n　${c.violations.map(v => v.rule).join(' ')}`
-            + (c.llmReason ? `\n　🤖 定性：${c.llmReason.slice(0, 70)}` : '')
-            + (c.appealText
-                ? `\n　🙋 申诉：${c.appealText.split('\n').pop()!.slice(0, 70)}`
-                : '')
-            + (c.aiReviewUpheld === null
-                ? ''
-                : `\n　⚖️ 复核：${c.aiReviewUpheld ? '维持原判' : '申诉成立'}——${(c.llmReviewReason ?? '').slice(0, 60)}`),
-        );
-        await interaction.reply(ephemeral(`**未结案件（${cases.length}）**\n\n${lines.join('\n\n').slice(0, 1900)}`));
+        await interaction.reply({
+            ...buildCaseListView(guildId),
+            flags: MessageFlags.Ephemeral,
+        });
         return;
     }
 

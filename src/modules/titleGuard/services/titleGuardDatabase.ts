@@ -1148,7 +1148,11 @@ const getOpenCaseStmt = db.prepare('SELECT * FROM tt_cases WHERE thread_id = ? A
 const getCaseStmt = db.prepare('SELECT * FROM tt_cases WHERE id = ?');
 const listCasesStmt = db.prepare(`
     SELECT * FROM tt_cases WHERE guild_id = ? AND closed_at IS NULL
-    ORDER BY created_at DESC LIMIT ?
+    ORDER BY created_at DESC, id DESC LIMIT ?
+`);
+const listCasesPageStmt = db.prepare(`
+    SELECT * FROM tt_cases WHERE guild_id = ? AND closed_at IS NULL
+    ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?
 `);
 const countOpenCasesStmt = db.prepare(`
     SELECT COUNT(*) AS count FROM tt_cases WHERE guild_id = ? AND closed_at IS NULL
@@ -1220,6 +1224,19 @@ export function getOpenCase(threadId: string): GuardCase | null {
 
 export function listOpenCases(guildId: string, limit = 50): GuardCase[] {
     return (listCasesStmt.all(guildId, limit) as CaseRow[]).map(toCase);
+}
+
+/** 管理面板分页读取；排序补上 id，避免同一毫秒建案时跨页重复或漏项。 */
+export function listOpenCasesPage(
+    guildId: string,
+    limit: number,
+    offset: number,
+): GuardCase[] {
+    return (listCasesPageStmt.all(
+        guildId,
+        Math.max(1, Math.trunc(limit)),
+        Math.max(0, Math.trunc(offset)),
+    ) as CaseRow[]).map(toCase);
 }
 
 export function countOpenCases(guildId: string): number {
