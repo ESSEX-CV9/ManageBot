@@ -774,7 +774,7 @@ async function handleOverride(interaction: ButtonInteraction, guardCase: db.Guar
     await refreshNotice(interaction.client, guardCase.id);
     if (interaction.channel && !interaction.channel.isDMBased()) {
         await interaction.channel.send({
-            content: `🛡️ 管理组 <@${interaction.user.id}> 已人工放行本帖，无需再做调整。`,
+            content: `审核员 <@${interaction.user.id}> 已人工放行本帖，无需再做调整。`,
         }).catch(() => { /* 忽略 */ });
     }
 }
