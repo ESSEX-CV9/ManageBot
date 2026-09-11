@@ -215,8 +215,13 @@ export async function inspectThread(
 
     /** 真调一次模型。retryFeedback 非空时是「打回重写」那一轮 */
     const callModel = async (retryFeedback?: string): Promise<Judgement | null> => {
-        // 定性这一步主要靠首楼。「纯爱牛娘」被分词切成「纯爱牛」这种误伤，
-        // 不看首楼根本分不出来，所以默认就要带上。
+        // 定性这一步主要靠首楼：光看标题分不出「这是纯爱作品」还是「作者在描述人设」，
+        // 「纯爱牛娘」被分词切成「纯爱牛」这种误伤更是非看首楼不可。
+        //
+        // 但**默认是关的**，而且要一个论坛一个论坛地开
+        //（/标题规范 论坛 添加 … 正文给llm:true，或配置台的论坛页）。
+        // 这是有意的：开了就等于把首楼开头发给第三方模型，那是管理组该点头的事，
+        // 不该由代码替他们决定。关着的时候模型只能靠标题判，判错的概率明显更高。
         const bodyExcerpt = forumConfig.sendBodyToLlm
             ? await readFirstPostExcerpt(thread) : undefined;
 

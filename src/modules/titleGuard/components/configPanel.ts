@@ -69,6 +69,7 @@ const BTN_AUTOMAP = `${P}:automap`;
 const SEL_CAP = `${P}:cap`;         // 选哪一项能力
 const SEL_ROLES = `${P}:roles`;     // tt_cfg:roles:<capability>
 const SEL_FORUMS = `${P}:forumsel`;
+const SEL_BODY = `${P}:bodysel`;
 const MODAL_GRACE = `${P}:gracemodal`;
 const MODAL_QUEUE = `${P}:queuemodal`;
 const MODAL_DICTSRC = `${P}:dictsrcmodal`;
@@ -249,6 +250,8 @@ function forumsView(guildId: string) {
     const forums = db.listForums(guildId);
     const enabled = forums.filter(f => f.enabled).map(f => f.forumId);
 
+    const withBody = forums.filter(f => f.enabled && f.sendBodyToLlm).map(f => f.forumId);
+
     // 没对上分类组的 TAG 在判定里等于不存在，所以这个数得摆在明面上
     let mappedTotal = 0;
     let unmapped = 0;
@@ -274,6 +277,20 @@ function forumsView(guildId: string) {
                     + '移出不会删掉已有的案件记录，只是不再检查新帖。',
             },
             {
+                name: '首楼给模型',
+                value: [
+                    withBody.length > 0
+                        ? `开着的：${withBody.map(id => `<#${id}>`).join('、')}`
+                        : '_一个都没开。_',
+                    '',
+                    '模型判定的**第一步是给作品定性**，而定性主要靠首楼——'
+                        + '光看标题分不出「这是纯爱作品」还是「作者在描述人设」。',
+                    '关着的话模型只能靠标题猜，判错的概率明显更高。',
+                    '⚠️ 开了就意味着**首楼开头 600 字会发给第三方模型**，'
+                        + '露骨内容多的论坛自己掂量。',
+                ].join('\n'),
+            },
+            {
                 name: 'TAG 映射',
                 value: unmapped > 0
                     ? `这些论坛一共有 **${unmapped}** 个 TAG 还没对上分类组。\n`
@@ -293,10 +310,20 @@ function forumsView(guildId: string) {
         .setMaxValues(25);
     if (enabled.length > 0) select.setDefaultChannels(enabled.slice(0, 25));
 
+    const bodySelect = new ChannelSelectMenuBuilder()
+        .setCustomId(SEL_BODY)
+        .setPlaceholder('选哪些论坛把首楼发给模型（可多选，勾着的就是开着的）')
+        .addChannelTypes(ChannelType.GuildForum)
+        .setMinValues(0)
+        .setMaxValues(25)
+        .setDisabled(enabled.length === 0);
+    if (withBody.length > 0) bodySelect.setDefaultChannels(withBody.slice(0, 25));
+
     return {
         embeds: [embed],
         components: [
             new ActionRowBuilder<ChannelSelectMenuBuilder>().addComponents(select),
+            new ActionRowBuilder<ChannelSelectMenuBuilder>().addComponents(bodySelect),
             new ActionRowBuilder<ButtonBuilder>().addComponents(
                 new ButtonBuilder().setCustomId(BTN_AUTOMAP)
                     .setLabel('全部论坛生成 TAG 映射')
@@ -663,6 +690,36 @@ export async function handleConfigSelect(interaction: AnySelectMenuInteraction):
 
         invalidateConfigCache();
         await interaction.update(forumsView(guildId));
+        return true;
+    }
+
+    // ④ 哪些论坛把首楼发给模型
+    if (interaction.customId === SEL_BODY) {
+        if (!hasCapability(memberOf(interaction), guildId, '设置')) {
+            await denied(interaction, '改这个需要「设置」权限。');
+            return true;
+        }
+        if (!interaction.isChannelSelectMenu()) return true;
+
+        const wanted = new Set(interaction.values);
+        const enrolled = db.listForums(guildId);
+        // 覆盖语义，和上面那个菜单一致：勾着的就是开着的
+        for (const f of enrolled) {
+            db.updateForum(guildId, f.forumId, { sendBodyToLlm: wanted.has(f.forumId) });
+        }
+
+        // 选了没纳管的论坛：不替他做主直接纳管（那是另一件事），说清楚就行
+        const stray = [...wanted].filter(id => !enrolled.some(f => f.forumId === id));
+
+        invalidateConfigCache();
+        await interaction.update(forumsView(guildId));
+        if (stray.length > 0) {
+            await interaction.followUp({
+                content: `⚠️ ${stray.map(id => `<#${id}>`).join('、')} 还没纳入管理，这个开关对它没意义。`
+                    + `\n先用上面那个菜单把它勾上纳管，再回来开这个。`,
+                flags: MessageFlags.Ephemeral,
+            });
+        }
         return true;
     }
 
