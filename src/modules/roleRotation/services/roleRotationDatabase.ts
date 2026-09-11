@@ -57,7 +57,10 @@ export interface RotationParticipant {
 export interface RotationMessage {
     roundId: number;
     phase: RotationMessagePhase;
+    /** 实际承载消息的频道/帖子 ID。论坛目标会是新建帖子的 ID。 */
     channelId: string;
+    /** 管理员配置的原始目标 ID（普通频道/帖子时与 channelId 相同）。 */
+    destinationId: string;
     messageId: string;
 }
 
@@ -191,10 +194,11 @@ db.exec(`
     );
 
     CREATE TABLE IF NOT EXISTS rr_message (
-        round_id    INTEGER NOT NULL REFERENCES rr_round(id) ON DELETE CASCADE,
-        phase       TEXT NOT NULL CHECK (phase IN ('inquiry', 'recruitment')),
-        channel_id  TEXT NOT NULL,
-        message_id  TEXT NOT NULL,
+        round_id       INTEGER NOT NULL REFERENCES rr_round(id) ON DELETE CASCADE,
+        phase          TEXT NOT NULL CHECK (phase IN ('inquiry', 'recruitment')),
+        channel_id     TEXT NOT NULL,
+        destination_id TEXT NOT NULL,
+        message_id     TEXT NOT NULL,
         PRIMARY KEY (round_id, phase, channel_id)
     );
 
@@ -230,6 +234,18 @@ db.exec(`
 
     CREATE INDEX IF NOT EXISTS idx_rr_audit_guild
         ON rr_audit(guild_id, created_at DESC);
+`);
+
+// 兼容已经由上一版模块创建的 rr_message：论坛目标需要同时记录“论坛 ID”和
+// “实际新建的帖子 ID”，否则调度器会误以为尚未发布而重复建帖。
+const messageColumns = db.pragma('table_info(rr_message)') as { name: string }[];
+if (!messageColumns.some(column => column.name === 'destination_id')) {
+    db.exec('ALTER TABLE rr_message ADD COLUMN destination_id TEXT');
+}
+db.exec(`
+    UPDATE rr_message SET destination_id = channel_id WHERE destination_id IS NULL;
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_rr_message_destination
+        ON rr_message(round_id, phase, destination_id);
 `);
 
 function mapRound(row: RoundRow): RotationRound {
@@ -501,18 +517,31 @@ export function markParticipantRemoval(roundId: number, userId: string, error?: 
 
 export function saveMessage(message: RotationMessage): void {
     db.prepare(`
-        INSERT INTO rr_message (round_id, phase, channel_id, message_id)
-        VALUES (?, ?, ?, ?)
-        ON CONFLICT(round_id, phase, channel_id) DO UPDATE SET message_id = excluded.message_id
-    `).run(message.roundId, message.phase, message.channelId, message.messageId);
+        INSERT INTO rr_message (round_id, phase, channel_id, destination_id, message_id)
+        VALUES (?, ?, ?, ?, ?)
+        ON CONFLICT(round_id, phase, destination_id) DO UPDATE SET
+            channel_id = excluded.channel_id,
+            message_id = excluded.message_id
+    `).run(message.roundId, message.phase, message.channelId, message.destinationId, message.messageId);
 }
 
 export function listMessages(roundId: number, phase?: RotationMessagePhase): RotationMessage[] {
     const rows = phase
         ? db.prepare('SELECT * FROM rr_message WHERE round_id = ? AND phase = ?').all(roundId, phase)
         : db.prepare('SELECT * FROM rr_message WHERE round_id = ?').all(roundId);
-    return (rows as { round_id: number; phase: RotationMessagePhase; channel_id: string; message_id: string }[])
-        .map(row => ({ roundId: row.round_id, phase: row.phase, channelId: row.channel_id, messageId: row.message_id }));
+    return (rows as {
+        round_id: number;
+        phase: RotationMessagePhase;
+        channel_id: string;
+        destination_id: string | null;
+        message_id: string;
+    }[]).map(row => ({
+        roundId: row.round_id,
+        phase: row.phase,
+        channelId: row.channel_id,
+        destinationId: row.destination_id ?? row.channel_id,
+        messageId: row.message_id,
+    }));
 }
 
 export function hasApplication(roundId: number, userId: string): boolean {
@@ -607,4 +636,3 @@ export function listAudit(guildId: string, configId?: number, limit = 20): Rotat
         createdAt: row.created_at,
     }));
 }
-

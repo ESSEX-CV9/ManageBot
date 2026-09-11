@@ -1,9 +1,11 @@
 import {
+    ChannelFlags,
     PermissionFlagsBits,
     type Client,
     type Guild,
     type GuildMember,
     type GuildTextBasedChannel,
+    type MessageCreateOptions,
     type Role,
 } from 'discord.js';
 import {
@@ -91,6 +93,62 @@ async function fetchOutputChannel(
     return { channel: fetched as GuildTextBasedChannel };
 }
 
+/**
+ * 向普通频道/现有子区发送；若目标是论坛或媒体频道，则为本轮自动创建一个帖子。
+ */
+async function sendToDestination(
+    client: Client,
+    destinationId: string,
+    guildId: string,
+    payload: MessageCreateOptions,
+    forumPostTitle: string,
+    mentionRole?: Role,
+): Promise<{ channelId: string; messageId: string } | { error: string }> {
+    const destination = await client.channels.fetch(destinationId).catch(() => null);
+    if (!destination || !('guildId' in destination) || destination.guildId !== guildId) {
+        return { error: `<#${destinationId}> 不存在或不可访问` };
+    }
+
+    const me = destination.guild.members.me;
+    if (
+        mentionRole
+        && !mentionRole.mentionable
+        && (!me || !destination.permissionsFor(me).has(PermissionFlagsBits.MentionEveryone))
+    ) {
+        return { error: `<#${destinationId}> 缺少提及身份组权限` };
+    }
+
+    if (destination.isThreadOnly()) {
+        const requiresTag = destination.flags.has(ChannelFlags.RequireTag);
+        const fallbackTag = destination.availableTags[0];
+        if (requiresTag && !fallbackTag) {
+            return { error: `<#${destinationId}> 要求帖子 TAG，但当前没有可用 TAG` };
+        }
+        try {
+            const thread = await destination.threads.create({
+                name: forumPostTitle.slice(0, 100),
+                message: payload,
+                appliedTags: requiresTag && fallbackTag ? [fallbackTag.id] : undefined,
+                reason: '分管身份组轮替自动发布',
+            });
+            const starterMessage = await thread.fetchStarterMessage();
+            if (!starterMessage) return { error: `<#${destinationId}> 已创建帖子但无法读取首条消息` };
+            return { channelId: thread.id, messageId: starterMessage.id };
+        } catch (error) {
+            return { error: `<#${destinationId}> 创建论坛帖子失败：${error instanceof Error ? error.message : String(error)}` };
+        }
+    }
+
+    const output = await fetchOutputChannel(client, destinationId, guildId);
+    if ('error' in output) return output;
+    try {
+        const message = await output.channel.send(payload);
+        return { channelId: output.channel.id, messageId: message.id };
+    } catch (error) {
+        return { error: `<#${destinationId}> 发送失败：${error instanceof Error ? error.message : String(error)}` };
+    }
+}
+
 async function fetchGuildAndRole(
     client: Client,
     config: RoleRotationConfig,
@@ -116,33 +174,31 @@ async function sendInquiryMessages(
     participantCount: number,
     role: Role,
 ): Promise<{ available: number; errors: string[] }> {
-    const existingChannels = new Set(listMessages(round.id, 'inquiry').map(item => item.channelId));
-    let available = existingChannels.size;
+    const existingDestinations = new Set(listMessages(round.id, 'inquiry').map(item => item.destinationId));
+    let available = config.notificationChannelIds.filter(id => existingDestinations.has(id)).length;
     const errors: string[] = [];
     for (const channelId of config.notificationChannelIds) {
-        if (existingChannels.has(channelId)) continue;
-        const output = await fetchOutputChannel(client, channelId, config.guildId);
-        if ('error' in output) {
-            errors.push(output.error);
+        if (existingDestinations.has(channelId)) continue;
+        const sent = await sendToDestination(
+            client,
+            channelId,
+            config.guildId,
+            buildInquiryMessage(config, round, participantCount),
+            `月度留任确认｜${role.name}｜#${round.id}`,
+            role,
+        );
+        if ('error' in sent) {
+            errors.push(sent.error);
             continue;
         }
-        const channel = output.channel;
-        const me = channel.guild.members.me;
-        if (
-            !role.mentionable
-            && 'permissionsFor' in channel
-            && (!me || !channel.permissionsFor(me).has(PermissionFlagsBits.MentionEveryone))
-        ) {
-            errors.push(`<#${channelId}> 缺少提及身份组权限`);
-            continue;
-        }
-        try {
-            const message = await channel.send(buildInquiryMessage(config, round, participantCount));
-            saveMessage({ roundId: round.id, phase: 'inquiry', channelId, messageId: message.id });
-            available++;
-        } catch (error) {
-            errors.push(`<#${channelId}>：${error instanceof Error ? error.message : String(error)}`);
-        }
+        saveMessage({
+            roundId: round.id,
+            phase: 'inquiry',
+            channelId: sent.channelId,
+            destinationId: channelId,
+            messageId: sent.messageId,
+        });
+        available++;
     }
     return { available, errors };
 }
@@ -405,28 +461,34 @@ async function ensureRecruitmentMessagesInternal(
         return '名额已满，招募已关闭。';
     }
 
-    const existingChannels = new Set(listMessages(round.id, 'recruitment').map(item => item.channelId));
+    const existingDestinations = new Set(listMessages(round.id, 'recruitment').map(item => item.destinationId));
     let sent = 0;
     const failures: string[] = [];
     for (const channelId of config.recruitmentChannelIds) {
-        if (existingChannels.has(channelId)) continue;
-        const output = await fetchOutputChannel(client, channelId, config.guildId);
-        if ('error' in output) {
-            failures.push(output.error);
+        if (existingDestinations.has(channelId)) continue;
+        const published = await sendToDestination(
+            client,
+            channelId,
+            config.guildId,
+            buildRecruitmentMessage(config, round, currentMembers),
+            `公开招募｜${role.name}｜#${round.id}`,
+        );
+        if ('error' in published) {
+            failures.push(published.error);
             continue;
         }
-        const channel = output.channel;
-        try {
-            const message = await channel.send(buildRecruitmentMessage(config, round, currentMembers));
-            saveMessage({ roundId: round.id, phase: 'recruitment', channelId, messageId: message.id });
-            sent++;
-        } catch (error) {
-            failures.push(`<#${channelId}>：${error instanceof Error ? error.message : String(error)}`);
-        }
+        saveMessage({
+            roundId: round.id,
+            phase: 'recruitment',
+            channelId: published.channelId,
+            destinationId: channelId,
+            messageId: published.messageId,
+        });
+        sent++;
     }
     await refreshRecruitmentMessages(client, config, round, currentMembers);
     if (failures.length) return `已发布 ${sent} 个招募面板，${failures.length} 个频道失败。`;
-    return `已发布/刷新 ${sent || existingChannels.size} 个招募面板。`;
+    return `已发布/刷新 ${sent || existingDestinations.size} 个招募面板。`;
 }
 
 export async function ensureRecruitmentMessages(client: Client, roundInput: RotationRound): Promise<ServiceResult> {

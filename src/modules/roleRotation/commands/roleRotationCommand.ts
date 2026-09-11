@@ -73,28 +73,34 @@ const data = new SlashCommandBuilder()
         .addRoleOption(option => option.setName('身份组').setDescription('被管理的身份组').setRequired(true))
         .addStringOption(option => option.setName('类型').setDescription('频道用途').setRequired(true)
             .addChoices({ name: '通知频道', value: 'notification' }, { name: '招募频道', value: 'recruitment' }))
-        .addChannelOption(option => option.setName('频道').setDescription('要添加的频道').setRequired(true)
+        .addChannelOption(option => option.setName('频道').setDescription('普通频道或论坛（子区看不到时留空）').setRequired(false)
             .addChannelTypes(
                 ChannelType.GuildText,
                 ChannelType.GuildAnnouncement,
+                ChannelType.GuildForum,
+                ChannelType.GuildMedia,
                 ChannelType.PublicThread,
                 ChannelType.PrivateThread,
                 ChannelType.AnnouncementThread,
-            )))
+            ))
+        .addStringOption(option => option.setName('频道或子区id').setDescription('选择器看不到时，粘贴频道/子区/论坛帖子 ID 或频道提及').setMaxLength(100)))
     .addSubcommand(sub => sub
         .setName('移除频道')
         .setDescription('从配置中移除通知频道、招募频道或子区')
         .addRoleOption(option => option.setName('身份组').setDescription('被管理的身份组').setRequired(true))
         .addStringOption(option => option.setName('类型').setDescription('频道用途').setRequired(true)
             .addChoices({ name: '通知频道', value: 'notification' }, { name: '招募频道', value: 'recruitment' }))
-        .addChannelOption(option => option.setName('频道').setDescription('要移除的频道').setRequired(true)
+        .addChannelOption(option => option.setName('频道').setDescription('普通频道或论坛（子区看不到时留空）').setRequired(false)
             .addChannelTypes(
                 ChannelType.GuildText,
                 ChannelType.GuildAnnouncement,
+                ChannelType.GuildForum,
+                ChannelType.GuildMedia,
                 ChannelType.PublicThread,
                 ChannelType.PrivateThread,
                 ChannelType.AnnouncementThread,
-            )))
+            ))
+        .addStringOption(option => option.setName('频道或子区id').setDescription('选择器看不到时，粘贴频道/子区/论坛帖子 ID 或频道提及').setMaxLength(100)))
     .addSubcommand(sub => sub
         .setName('添加冲突')
         .setDescription('添加申请时互斥的身份组')
@@ -138,6 +144,24 @@ function getConfiguredRole(interaction: Parameters<Command['execute']>[0]): { ro
 function channelKindLabel(kind: RotationChannelKind): string {
     return kind === 'notification' ? '通知频道' : '招募频道';
 }
+
+function parseChannelId(raw: string | null): string | null {
+    if (!raw) return null;
+    const trimmed = raw.trim();
+    const mention = trimmed.match(/^<#(\d{15,25})>$/);
+    if (mention) return mention[1];
+    return /^\d{15,25}$/.test(trimmed) ? trimmed : null;
+}
+
+const SUPPORTED_DESTINATION_TYPES = new Set<ChannelType>([
+    ChannelType.GuildText,
+    ChannelType.GuildAnnouncement,
+    ChannelType.GuildForum,
+    ChannelType.GuildMedia,
+    ChannelType.PublicThread,
+    ChannelType.PrivateThread,
+    ChannelType.AnnouncementThread,
+]);
 
 function statusLabel(status: string): string {
     return ({ inquiry: '问询中', recruiting: '招募中', closed: '已结束', cancelled: '已取消', failed: '失败' } as Record<string, string>)[status] ?? status;
@@ -268,20 +292,44 @@ const command: Command = {
             const found = getConfiguredRole(interaction);
             if (!found) return interaction.reply({ content: '❌ 该身份组没有轮替配置。', flags: MessageFlags.Ephemeral });
             const kind = interaction.options.getString('类型', true) as RotationChannelKind;
-            const channel = interaction.options.getChannel('频道', true);
+            const selectedChannel = interaction.options.getChannel('频道');
+            const rawValue = interaction.options.getString('频道或子区id');
+            if (selectedChannel && rawValue) {
+                return interaction.reply({ content: '❌ “频道”和“频道或子区id”只需填写其中一个。', flags: MessageFlags.Ephemeral });
+            }
+            const parsedId = parseChannelId(rawValue);
+            if (!selectedChannel && !parsedId) {
+                return interaction.reply({
+                    content: rawValue
+                        ? '❌ 无法识别该 ID。请粘贴纯频道/子区 ID，或 `<#频道ID>` 格式的频道提及。'
+                        : '❌ 请选择频道，或填写“频道或子区id”。',
+                    flags: MessageFlags.Ephemeral,
+                });
+            }
+            const channelId = selectedChannel?.id ?? parsedId!;
             const adding = sub === '添加频道';
+            const fetchedChannel = selectedChannel
+                ?? await interaction.client.channels.fetch(channelId).catch(() => null);
+            if (adding) {
+                if (!fetchedChannel || !('guildId' in fetchedChannel) || fetchedChannel.guildId !== guild.id) {
+                    return interaction.reply({ content: '❌ 机器人无法访问这个频道/子区，或它不属于当前服务器。', flags: MessageFlags.Ephemeral });
+                }
+                if (!SUPPORTED_DESTINATION_TYPES.has(fetchedChannel.type)) {
+                    return interaction.reply({ content: '❌ 仅支持文字/公告频道、论坛/媒体频道，以及公开、私密或公告子区。', flags: MessageFlags.Ephemeral });
+                }
+            }
             const changed = adding
-                ? addChannel(found.config.id, kind, channel.id)
-                : removeChannel(found.config.id, kind, channel.id);
+                ? addChannel(found.config.id, kind, channelId)
+                : removeChannel(found.config.id, kind, channelId);
             if (changed) addAudit({
                 guildId: guild.id,
                 configId: found.config.id,
                 actorId: interaction.user.id,
                 event: adding ? 'channel_added' : 'channel_removed',
-                detail: `${kind}:${channel.id}`,
+                detail: `${kind}:${channelId}`,
             });
             return interaction.reply({
-                content: `${changed ? '✅' : 'ℹ️'} ${channel} ${changed ? `已${adding ? '添加到' : '移出'}` : '配置未变化：'}${channelKindLabel(kind)}。`,
+                content: `${changed ? '✅' : 'ℹ️'} <#${channelId}> ${changed ? `已${adding ? '添加到' : '移出'}` : '配置未变化：'}${channelKindLabel(kind)}。`,
                 flags: MessageFlags.Ephemeral,
                 allowedMentions: { parse: [] },
             });
