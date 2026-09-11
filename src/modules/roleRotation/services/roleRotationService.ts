@@ -105,7 +105,7 @@ async function sendToDestination(
     forumPostTitle: string,
     mentionRole?: Role,
     mentionHere = false,
-): Promise<{ channelId: string; messageId: string } | { error: string }> {
+): Promise<{ channelId: string; messageId: string; warning?: string } | { error: string }> {
     const destination = await client.channels.fetch(destinationId).catch(() => null);
     if (!destination || !('guildId' in destination) || destination.guildId !== guildId) {
         return { error: `<#${destinationId}> 不存在或不可访问` };
@@ -132,7 +132,16 @@ async function sendToDestination(
             });
             const starterMessage = await thread.fetchStarterMessage();
             if (!starterMessage) return { error: `<#${destinationId}> 已创建帖子但无法读取首条消息` };
-            return { channelId: thread.id, messageId: starterMessage.id };
+            let warning: string | undefined;
+            if (mentionHere) {
+                await thread.send({
+                    content: '@here',
+                    allowedMentions: { parse: ['everyone'] },
+                }).catch(error => {
+                    warning = `<#${thread.id}> 面板已发布，但单独的 @here 发送失败：${error instanceof Error ? error.message : String(error)}`;
+                });
+            }
+            return { channelId: thread.id, messageId: starterMessage.id, warning };
         } catch (error) {
             return { error: `<#${destinationId}> 创建论坛帖子失败：${error instanceof Error ? error.message : String(error)}` };
         }
@@ -142,7 +151,16 @@ async function sendToDestination(
     if ('error' in output) return output;
     try {
         const message = await output.channel.send(payload);
-        return { channelId: output.channel.id, messageId: message.id };
+        let warning: string | undefined;
+        if (mentionHere) {
+            await output.channel.send({
+                content: '@here',
+                allowedMentions: { parse: ['everyone'] },
+            }).catch(error => {
+                warning = `<#${destinationId}> 面板已发布，但单独的 @here 发送失败：${error instanceof Error ? error.message : String(error)}`;
+            });
+        }
+        return { channelId: output.channel.id, messageId: message.id, warning };
     } catch (error) {
         return { error: `<#${destinationId}> 发送失败：${error instanceof Error ? error.message : String(error)}` };
     }
@@ -164,6 +182,10 @@ async function fetchGuildAndRole(
 function canManageRole(guild: Guild, role: Role): boolean {
     const me = guild.members.me;
     return Boolean(me?.permissions.has(PermissionFlagsBits.ManageRoles) && role.editable);
+}
+
+function conflictRoleNames(config: RoleRotationConfig, guild: Guild | undefined): string[] {
+    return config.conflictRoleIds.map(id => guild?.roles.cache.get(id)?.name ?? `已删除身份组 ${id}`);
 }
 
 async function sendInquiryMessages(
@@ -198,6 +220,7 @@ async function sendInquiryMessages(
             destinationId: channelId,
             messageId: sent.messageId,
         });
+        if (sent.warning) errors.push(sent.warning);
         available++;
     }
     return { available, errors };
@@ -234,7 +257,10 @@ async function refreshRecruitmentMessages(
             const output = await fetchOutputChannel(client, item.channelId, config.guildId);
             if ('error' in output) throw new Error(output.error);
             const message = await output.channel.messages.fetch(item.messageId);
-            await message.edit(buildRecruitmentMessage(config, round, currentMembers, closedReason));
+            await message.edit(buildRecruitmentMessage(config, round, currentMembers, {
+                closedReason,
+                conflictRoleNames: conflictRoleNames(config, client.guilds.cache.get(config.guildId)),
+            }));
         } catch (error) {
             console.warn(`[RoleRotation] 无法更新招募消息 ${item.channelId}/${item.messageId}:`, error);
         }
@@ -536,7 +562,9 @@ async function ensureRecruitmentMessagesInternal(
             client,
             channelId,
             config.guildId,
-            buildRecruitmentMessage(config, round, currentMembers, undefined, true),
+            buildRecruitmentMessage(config, round, currentMembers, {
+                conflictRoleNames: conflictRoleNames(config, role.guild),
+            }),
             `公开招募｜${role.name}｜#${round.id}`,
             undefined,
             true,
@@ -552,6 +580,7 @@ async function ensureRecruitmentMessagesInternal(
             destinationId: channelId,
             messageId: published.messageId,
         });
+        if (published.warning) failures.push(published.warning);
         sent++;
     }
     await refreshRecruitmentMessages(client, config, round, currentMembers);

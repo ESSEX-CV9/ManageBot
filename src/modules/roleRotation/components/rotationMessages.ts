@@ -59,11 +59,11 @@ export function buildInquiryMessage(
     );
 
     return {
-        content: closed ? '' : `@here <@&${config.managedRoleId}>`,
+        content: closed ? '' : `<@&${config.managedRoleId}>`,
         embeds: [embed],
         components: [row],
         allowedMentions: {
-            parse: closed ? [] as const : ['everyone'] as const,
+            parse: [] as const,
             roles: closed ? [] : [config.managedRoleId],
             users: [],
         },
@@ -74,13 +74,17 @@ export function buildRecruitmentMessage(
     config: RoleRotationConfig,
     round: RotationRound,
     currentMembers: number,
-    closedReason?: string,
-    pingHere = false,
+    options: {
+        closedReason?: string;
+        conflictRoleNames?: string[];
+    } = {},
 ) {
+    const { closedReason, conflictRoleNames } = options;
     const vacancies = Math.max(0, config.capacity - currentMembers);
     const closed = Boolean(closedReason) || vacancies === 0;
-    const conflictText = config.conflictRoleIds.length
-        ? config.conflictRoleIds.map(id => `<@&${id}>`).join('、')
+    const conflictLabels = conflictRoleNames ?? config.conflictRoleIds.map(id => `身份组 ${id}`);
+    const conflictText = conflictLabels.length
+        ? conflictLabels.map(name => `\`${name.replace(/`/g, 'ˋ')}\``).join('、')
         : '无';
     const embed = new EmbedBuilder()
         .setTitle(closed ? '📣 分管身份组招募已结束' : '📣 分管身份组公开招募')
@@ -106,12 +110,10 @@ export function buildRecruitmentMessage(
             .setDisabled(closed),
     );
     return {
-        content: pingHere ? '@here' : '',
+        content: '',
         embeds: [embed],
         components: [row],
-        allowedMentions: pingHere
-            ? { parse: ['everyone'] as const }
-            : { parse: [] as const },
+        allowedMentions: { parse: [] as const },
     };
 }
 
