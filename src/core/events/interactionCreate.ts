@@ -21,6 +21,11 @@ import {
     handleTitleGuardModal,
 } from '../../modules/titleGuard';
 import { handleRoleRotationButton } from '../../modules/roleRotation';
+import {
+    handleCleanupButton,
+    handleCleanupModal,
+    handleCleanupSelect,
+} from '../../modules/messageCleanup';
 
 const INTERACTION_DEBUG_LOG = String(process.env.INTERACTION_DEBUG_LOG || '').toLowerCase() === 'true';
 
@@ -98,6 +103,8 @@ export async function interactionCreateHandler(interaction: Interaction): Promis
                 await handleTitleGuardButton(interaction);
             } else if (interaction.customId.startsWith('rr_')) {
                 await handleRoleRotationButton(interaction);
+            } else if (interaction.customId.startsWith('mc_')) {
+                await handleCleanupButton(interaction);
             }
             // 新模块：在此追加 else if (customId.startsWith('yourprefix_')) { ... }
             return;
@@ -111,6 +118,8 @@ export async function interactionCreateHandler(interaction: Interaction): Promis
                 await handleElectionModal(interaction);
             } else if (interaction.customId.startsWith('tt_')) {
                 await handleTitleGuardModal(interaction);
+            } else if (interaction.customId.startsWith('mc_')) {
+                await handleCleanupModal(interaction);
             }
             // 新模块：在此追加分支
             return;
@@ -122,6 +131,8 @@ export async function interactionCreateHandler(interaction: Interaction): Promis
                 await handleElectionSelect(interaction);
             } else if (interaction.customId.startsWith('tt_')) {
                 await handleTitleGuardSelect(interaction);
+            } else if (interaction.customId.startsWith('mc_')) {
+                await handleCleanupSelect(interaction);
             }
             // 新模块：在此追加 if (customId.startsWith('yourprefix_')) { ... }
             return;

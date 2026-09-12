@@ -1,0 +1,334 @@
+import path from 'path';
+import Database from 'better-sqlite3';
+
+import { DATA_DIR } from '../../../core/utils/database';
+import type {
+    CleanupJob,
+    CleanupJobStatus,
+    CleanupScanMode,
+    CleanupSettings,
+    CreateCleanupJobInput,
+} from './types';
+
+const DB_FILE = path.join(DATA_DIR, 'messageCleanup.sqlite');
+const db = new Database(DB_FILE);
+db.pragma('journal_mode = WAL');
+db.pragma('busy_timeout = 5000');
+
+db.exec(`
+    CREATE TABLE IF NOT EXISTS mc_settings (
+        guild_id        TEXT PRIMARY KEY,
+        manage_role_ids TEXT NOT NULL DEFAULT '[]',
+        updated_by      TEXT,
+        updated_at      INTEGER NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS mc_job (
+        id                       INTEGER PRIMARY KEY AUTOINCREMENT,
+        guild_id                 TEXT NOT NULL,
+        actor_id                 TEXT NOT NULL,
+        target_user_id           TEXT NOT NULL,
+        selected_channel_ids     TEXT NOT NULL,
+        excluded_channel_ids     TEXT NOT NULL DEFAULT '[]',
+        include_threads          INTEGER NOT NULL DEFAULT 1,
+        cutoff_at                INTEGER NOT NULL,
+        cutoff_label             TEXT NOT NULL,
+        status                   TEXT NOT NULL DEFAULT 'queued',
+        scan_mode                TEXT NOT NULL DEFAULT 'search',
+        scope_channel_ids        TEXT NOT NULL DEFAULT '[]',
+        scope_count              INTEGER NOT NULL DEFAULT 0,
+        cursor_batch             INTEGER NOT NULL DEFAULT 0,
+        cursor_id                TEXT,
+        found_count              INTEGER NOT NULL DEFAULT 0,
+        deleted_count            INTEGER NOT NULL DEFAULT 0,
+        skipped_count            INTEGER NOT NULL DEFAULT 0,
+        failed_count             INTEGER NOT NULL DEFAULT 0,
+        warning_text             TEXT,
+        error                    TEXT,
+        created_at               INTEGER NOT NULL,
+        started_at               INTEGER,
+        finished_at              INTEGER,
+        updated_at               INTEGER NOT NULL
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_mc_job_guild_created
+        ON mc_job(guild_id, created_at DESC);
+
+    CREATE INDEX IF NOT EXISTS idx_mc_job_status
+        ON mc_job(status, created_at);
+`);
+
+interface SettingsRow {
+    guild_id: string;
+    manage_role_ids: string;
+    updated_by: string | null;
+    updated_at: number;
+}
+
+interface JobRow {
+    id: number;
+    guild_id: string;
+    actor_id: string;
+    target_user_id: string;
+    selected_channel_ids: string;
+    excluded_channel_ids: string;
+    include_threads: number;
+    cutoff_at: number;
+    cutoff_label: string;
+    status: CleanupJobStatus;
+    scan_mode: CleanupScanMode;
+    scope_channel_ids: string;
+    scope_count: number;
+    cursor_batch: number;
+    cursor_id: string | null;
+    found_count: number;
+    deleted_count: number;
+    skipped_count: number;
+    failed_count: number;
+    warning_text: string | null;
+    error: string | null;
+    created_at: number;
+    started_at: number | null;
+    finished_at: number | null;
+    updated_at: number;
+}
+
+function parseIds(raw: string | null | undefined): string[] {
+    try {
+        const value = JSON.parse(raw || '[]');
+        if (!Array.isArray(value)) return [];
+        return [...new Set(value.map(String).filter(id => /^\d{17,20}$/.test(id)))];
+    } catch {
+        return [];
+    }
+}
+
+function mapSettings(row: SettingsRow | undefined, guildId: string): CleanupSettings {
+    return {
+        guildId,
+        manageRoleIds: parseIds(row?.manage_role_ids),
+        updatedBy: row?.updated_by ?? null,
+        updatedAt: row?.updated_at ?? 0,
+    };
+}
+
+function mapJob(row: JobRow): CleanupJob {
+    return {
+        id: row.id,
+        guildId: row.guild_id,
+        actorId: row.actor_id,
+        targetUserId: row.target_user_id,
+        selectedChannelIds: parseIds(row.selected_channel_ids),
+        excludedChannelIds: parseIds(row.excluded_channel_ids),
+        includeThreads: Boolean(row.include_threads),
+        cutoffAt: row.cutoff_at,
+        cutoffLabel: row.cutoff_label,
+        status: row.status,
+        scanMode: row.scan_mode,
+        scopeChannelIds: parseIds(row.scope_channel_ids),
+        scopeCount: row.scope_count,
+        cursorBatch: row.cursor_batch,
+        cursorId: row.cursor_id,
+        foundCount: row.found_count,
+        deletedCount: row.deleted_count,
+        skippedCount: row.skipped_count,
+        failedCount: row.failed_count,
+        warningText: row.warning_text,
+        error: row.error,
+        createdAt: row.created_at,
+        startedAt: row.started_at,
+        finishedAt: row.finished_at,
+        updatedAt: row.updated_at,
+    };
+}
+
+export function getSettings(guildId: string): CleanupSettings {
+    const row = db.prepare('SELECT * FROM mc_settings WHERE guild_id = ?').get(guildId) as SettingsRow | undefined;
+    return mapSettings(row, guildId);
+}
+
+export function setManageRoleIds(guildId: string, roleIds: string[], actorId: string): CleanupSettings {
+    const now = Date.now();
+    const normalized = [...new Set(roleIds.filter(id => /^\d{17,20}$/.test(id)))];
+    db.prepare(`
+        INSERT INTO mc_settings (guild_id, manage_role_ids, updated_by, updated_at)
+        VALUES (?, ?, ?, ?)
+        ON CONFLICT(guild_id) DO UPDATE SET
+            manage_role_ids = excluded.manage_role_ids,
+            updated_by = excluded.updated_by,
+            updated_at = excluded.updated_at
+    `).run(guildId, JSON.stringify(normalized), actorId, now);
+    return getSettings(guildId);
+}
+
+const getJobStmt = db.prepare('SELECT * FROM mc_job WHERE id = ?');
+
+export function getJob(jobId: number): CleanupJob | null {
+    const row = getJobStmt.get(jobId) as JobRow | undefined;
+    return row ? mapJob(row) : null;
+}
+
+export function findActiveJob(guildId: string): CleanupJob | null {
+    const row = db.prepare(`
+        SELECT * FROM mc_job
+        WHERE guild_id = ? AND status IN ('queued', 'running', 'paused')
+        ORDER BY created_at ASC LIMIT 1
+    `).get(guildId) as JobRow | undefined;
+    return row ? mapJob(row) : null;
+}
+
+export function listJobs(guildId: string, limit = 10): CleanupJob[] {
+    const safeLimit = Math.max(1, Math.min(25, Math.floor(limit)));
+    const rows = db.prepare(`
+        SELECT * FROM mc_job WHERE guild_id = ? ORDER BY created_at DESC LIMIT ?
+    `).all(guildId, safeLimit) as JobRow[];
+    return rows.map(mapJob);
+}
+
+const createJobTransaction = db.transaction((input: CreateCleanupJobInput): { job: CleanupJob; created: boolean } => {
+    const active = findActiveJob(input.guildId);
+    if (active) return { job: active, created: false };
+
+    const now = Date.now();
+    const result = db.prepare(`
+        INSERT INTO mc_job (
+            guild_id, actor_id, target_user_id, selected_channel_ids,
+            excluded_channel_ids, include_threads, cutoff_at, cutoff_label,
+            status, scan_mode, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'queued', 'search', ?, ?)
+    `).run(
+        input.guildId,
+        input.actorId,
+        input.targetUserId,
+        JSON.stringify([...new Set(input.selectedChannelIds)]),
+        JSON.stringify([...new Set(input.excludedChannelIds)]),
+        input.includeThreads ? 1 : 0,
+        input.cutoffAt,
+        input.cutoffLabel,
+        now,
+        now,
+    );
+    return { job: getJob(Number(result.lastInsertRowid))!, created: true };
+});
+
+export function createJob(input: CreateCleanupJobInput): { job: CleanupJob; created: boolean } {
+    return createJobTransaction(input);
+}
+
+export function claimJob(jobId: number): CleanupJob | null {
+    const now = Date.now();
+    const result = db.prepare(`
+        UPDATE mc_job SET
+            status = 'running',
+            started_at = COALESCE(started_at, ?),
+            error = NULL,
+            updated_at = ?
+        WHERE id = ? AND status = 'queued'
+    `).run(now, now, jobId);
+    return result.changes > 0 ? getJob(jobId) : null;
+}
+
+export function listRunnableJobs(): CleanupJob[] {
+    const rows = db.prepare(`
+        SELECT * FROM mc_job WHERE status = 'queued' ORDER BY created_at ASC
+    `).all() as JobRow[];
+    return rows.map(mapJob);
+}
+
+export function recoverInterruptedJobs(): number {
+    return db.prepare(`
+        UPDATE mc_job SET status = 'queued', updated_at = ? WHERE status = 'running'
+    `).run(Date.now()).changes;
+}
+
+export function setResolvedScope(jobId: number, channelIds: string[], warnings: string[]): void {
+    db.prepare(`
+        UPDATE mc_job SET
+            scope_channel_ids = ?, scope_count = ?, warning_text = ?, updated_at = ?
+        WHERE id = ?
+    `).run(
+        JSON.stringify([...new Set(channelIds)]),
+        new Set(channelIds).size,
+        warnings.length ? warnings.join('\n').slice(0, 4000) : null,
+        Date.now(),
+        jobId,
+    );
+}
+
+export function setScanMode(jobId: number, mode: CleanupScanMode, resetCursor = false): void {
+    db.prepare(`
+        UPDATE mc_job SET
+            scan_mode = ?,
+            cursor_batch = CASE WHEN ? THEN 0 ELSE cursor_batch END,
+            cursor_id = CASE WHEN ? THEN NULL ELSE cursor_id END,
+            updated_at = ?
+        WHERE id = ?
+    `).run(mode, resetCursor ? 1 : 0, resetCursor ? 1 : 0, Date.now(), jobId);
+}
+
+export function updateCursor(jobId: number, batch: number, cursorId: string | null): void {
+    db.prepare(`
+        UPDATE mc_job SET cursor_batch = ?, cursor_id = ?, updated_at = ? WHERE id = ?
+    `).run(batch, cursorId, Date.now(), jobId);
+}
+
+export function addCounts(
+    jobId: number,
+    counts: { found?: number; deleted?: number; skipped?: number; failed?: number },
+): void {
+    db.prepare(`
+        UPDATE mc_job SET
+            found_count = found_count + ?,
+            deleted_count = deleted_count + ?,
+            skipped_count = skipped_count + ?,
+            failed_count = failed_count + ?,
+            updated_at = ?
+        WHERE id = ?
+    `).run(
+        counts.found ?? 0,
+        counts.deleted ?? 0,
+        counts.skipped ?? 0,
+        counts.failed ?? 0,
+        Date.now(),
+        jobId,
+    );
+}
+
+export function appendWarning(jobId: number, warning: string): void {
+    const job = getJob(jobId);
+    const combined = [job?.warningText, warning].filter(Boolean).join('\n').slice(0, 4000);
+    db.prepare('UPDATE mc_job SET warning_text = ?, updated_at = ? WHERE id = ?')
+        .run(combined || null, Date.now(), jobId);
+}
+
+export function setJobStatus(jobId: number, status: CleanupJobStatus, error: string | null = null): void {
+    const terminal = status === 'completed' || status === 'cancelled' || status === 'failed';
+    db.prepare(`
+        UPDATE mc_job SET
+            status = ?, error = ?,
+            finished_at = CASE WHEN ? THEN ? ELSE finished_at END,
+            updated_at = ?
+        WHERE id = ?
+    `).run(status, error, terminal ? 1 : 0, Date.now(), Date.now(), jobId);
+}
+
+export function pauseJob(jobId: number): boolean {
+    return db.prepare(`
+        UPDATE mc_job SET status = 'paused', updated_at = ?
+        WHERE id = ? AND status IN ('queued', 'running')
+    `).run(Date.now(), jobId).changes > 0;
+}
+
+export function resumeJob(jobId: number): boolean {
+    return db.prepare(`
+        UPDATE mc_job SET status = 'queued', updated_at = ?
+        WHERE id = ? AND status = 'paused'
+    `).run(Date.now(), jobId).changes > 0;
+}
+
+export function cancelJob(jobId: number): boolean {
+    return db.prepare(`
+        UPDATE mc_job SET status = 'cancelled', finished_at = ?, updated_at = ?
+        WHERE id = ? AND status IN ('queued', 'running', 'paused')
+    `).run(Date.now(), Date.now(), jobId).changes > 0;
+}

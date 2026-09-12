@@ -50,6 +50,10 @@ import {
     startRoleRotationSystem,
 } from '../modules/roleRotation';
 
+// 6. 紧急消息冲水模块
+import messageCleanupCommand from '../modules/messageCleanup/commands/messageCleanupCommand';
+import { startMessageCleanupSystem } from '../modules/messageCleanup';
+
 // --- 进程级兜底日志（避免“无响应但控制台无日志”难以排查） ---
 const FATAL_EXIT_ON_EXCEPTION = String(process.env.FATAL_EXIT_ON_EXCEPTION || '').toLowerCase() === 'true';
 
@@ -133,6 +137,9 @@ client.commands.set(titleGuardCommand.data.name, titleGuardCommand);
 client.commands.set(roleRotationCommand.data.name, roleRotationCommand);
 client.commands.set(callFrogCommand.data.name, callFrogCommand);
 
+// 6. 紧急消息冲水命令注册
+client.commands.set(messageCleanupCommand.data.name, messageCleanupCommand);
+
 // 测试命令仅在测试模式下注册（生产环境不会出现 /募选测试）
 if (isElectionTestMode()) {
     client.commands.set(electionTestCommand.data.name, electionTestCommand);
@@ -161,6 +168,7 @@ client.once(Events.ClientReady, async (readyClient) => {
     await startElectionSystem(readyClient);
     await startTitleGuardSystem(readyClient);
     await startRoleRotationSystem(readyClient);
+    await startMessageCleanupSystem(readyClient);
 
     console.log('\n🤖 机器人已完全启动，所有系统正常运行！');
 });
