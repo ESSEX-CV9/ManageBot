@@ -64,6 +64,19 @@ db.exec(`
         opened_at    INTEGER NOT NULL,
         PRIMARY KEY (job_id, channel_id)
     );
+
+    -- 两阶段扫描（快速搜索 + 完整历史核验）共用这本去重账，保证“找到”是唯一消息数。
+    CREATE TABLE IF NOT EXISTS mc_job_message (
+        job_id       INTEGER NOT NULL,
+        channel_id   TEXT NOT NULL,
+        message_id   TEXT NOT NULL,
+        outcome      TEXT NOT NULL DEFAULT 'pending',
+        updated_at   INTEGER NOT NULL,
+        PRIMARY KEY (job_id, message_id)
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_mc_job_message_outcome
+        ON mc_job_message(job_id, outcome);
 `);
 
 interface SettingsRow {
@@ -280,26 +293,72 @@ export function updateCursor(jobId: number, batch: number, cursorId: string | nu
     `).run(batch, cursorId, Date.now(), jobId);
 }
 
-export function addCounts(
-    jobId: number,
-    counts: { found?: number; deleted?: number; skipped?: number; failed?: number },
-): void {
+export type CleanupMessageOutcome = 'pending' | 'deleted' | 'skipped' | 'failed';
+
+export interface CleanupMessageRef {
+    channelId: string;
+    messageId: string;
+}
+
+export interface CleanupMessageResult extends CleanupMessageRef {
+    outcome: Exclude<CleanupMessageOutcome, 'pending'>;
+}
+
+const refreshMessageCountsStmt = db.prepare(`
+    UPDATE mc_job SET
+        found_count = (SELECT COUNT(*) FROM mc_job_message WHERE job_id = ?),
+        deleted_count = (SELECT COUNT(*) FROM mc_job_message WHERE job_id = ? AND outcome = 'deleted'),
+        skipped_count = (SELECT COUNT(*) FROM mc_job_message WHERE job_id = ? AND outcome = 'skipped'),
+        failed_count = (SELECT COUNT(*) FROM mc_job_message WHERE job_id = ? AND outcome = 'failed'),
+        updated_at = ?
+    WHERE id = ?
+`);
+
+function refreshMessageCounts(jobId: number): void {
+    refreshMessageCountsStmt.run(jobId, jobId, jobId, jobId, Date.now(), jobId);
+}
+
+const recordCandidatesTransaction = db.transaction((jobId: number, messages: CleanupMessageRef[]): void => {
+    const stmt = db.prepare(`
+        INSERT INTO mc_job_message (job_id, channel_id, message_id, outcome, updated_at)
+        VALUES (?, ?, ?, 'pending', ?)
+        ON CONFLICT(job_id, message_id) DO NOTHING
+    `);
+    const now = Date.now();
+    for (const message of messages) stmt.run(jobId, message.channelId, message.messageId, now);
+    refreshMessageCounts(jobId);
+});
+
+/** 在发起删除前登记候选，快速搜索和完整核验重复命中同一 ID 时只计算一次。 */
+export function recordMessageCandidates(jobId: number, messages: CleanupMessageRef[]): void {
+    if (messages.length === 0) return;
+    recordCandidatesTransaction(jobId, messages);
+}
+
+const recordResultsTransaction = db.transaction((jobId: number, results: CleanupMessageResult[]): void => {
+    const stmt = db.prepare(`
+        UPDATE mc_job_message SET channel_id = ?, outcome = ?, updated_at = ?
+        WHERE job_id = ? AND message_id = ?
+    `);
+    const now = Date.now();
+    for (const result of results) {
+        stmt.run(result.channelId, result.outcome, now, jobId, result.messageId);
+    }
+    refreshMessageCounts(jobId);
+});
+
+export function recordMessageResults(jobId: number, results: CleanupMessageResult[]): void {
+    if (results.length === 0) return;
+    recordResultsTransaction(jobId, results);
+}
+
+/** 极小概率在 API 删除成功后、结果落库前进程退出；最终将无法确认的 pending 记为跳过。 */
+export function finalizePendingMessageResults(jobId: number): void {
     db.prepare(`
-        UPDATE mc_job SET
-            found_count = found_count + ?,
-            deleted_count = deleted_count + ?,
-            skipped_count = skipped_count + ?,
-            failed_count = failed_count + ?,
-            updated_at = ?
-        WHERE id = ?
-    `).run(
-        counts.found ?? 0,
-        counts.deleted ?? 0,
-        counts.skipped ?? 0,
-        counts.failed ?? 0,
-        Date.now(),
-        jobId,
-    );
+        UPDATE mc_job_message SET outcome = 'skipped', updated_at = ?
+        WHERE job_id = ? AND outcome = 'pending'
+    `).run(Date.now(), jobId);
+    refreshMessageCounts(jobId);
 }
 
 export function appendWarning(jobId: number, warning: string): void {

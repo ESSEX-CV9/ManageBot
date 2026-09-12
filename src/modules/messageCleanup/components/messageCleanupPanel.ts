@@ -254,10 +254,16 @@ const STATUS_LABEL: Record<CleanupJobStatus, string> = {
 };
 
 function jobLine(job: CleanupJob): string {
-    const counts = `找到 ${job.foundCount} / 删除 ${job.deletedCount} / 跳过 ${job.skippedCount} / 失败 ${job.failedCount}`;
+    const foundLabel = job.status === 'completed' ? '最终找到' : '已发现（仍会增长）';
+    const counts = `${foundLabel} ${job.foundCount} / 删除 ${job.deletedCount} / 跳过 ${job.skippedCount} / 失败 ${job.failedCount}`;
     const error = job.error ? `\n错误：${job.error.slice(0, 180)}` : '';
     const warning = job.warningText ? '　⚠️ 有提示' : '';
-    return `**#${job.id} ${STATUS_LABEL[job.status]}**　<@${job.targetUserId}>${warning}\n${counts}　范围 ${job.scopeCount || '待展开'} 个频道/子区${error}`;
+    const stage = job.status === 'completed'
+        ? '完整核验结束'
+        : job.scanMode === 'search'
+            ? '快速搜索阶段，之后还会完整核验'
+            : `完整核验阶段 ${Math.min(job.cursorBatch + 1, Math.max(job.scopeCount, 1))}/${Math.max(job.scopeCount, 1)}`;
+    return `**#${job.id} ${STATUS_LABEL[job.status]}**　<@${job.targetUserId}>${warning}\n${counts}\n${stage}　范围 ${job.scopeCount || '待展开'} 个频道/子区${error}`;
 }
 
 function tasksView(guildId: string): InteractionUpdateOptions {
@@ -284,7 +290,7 @@ function tasksView(guildId: string): InteractionUpdateOptions {
     buttons.push(new ButtonBuilder().setCustomId(ID.HOME).setLabel('返回').setStyle(ButtonStyle.Secondary));
 
     return {
-        content: (`## 📋 冲水任务\n${lines}${detail}`).slice(0, 2000),
+        content: (`## 📋 冲水任务\n_运行中的“已发现”是实时进度，只有“已完成”的数字才是完整核验结果。_\n\n${lines}${detail}`).slice(0, 2000),
         components: [new ActionRowBuilder<ButtonBuilder>().addComponents(...buttons)],
     };
 }
