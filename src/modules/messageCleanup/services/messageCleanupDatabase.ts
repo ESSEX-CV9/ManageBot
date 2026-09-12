@@ -56,6 +56,14 @@ db.exec(`
 
     CREATE INDEX IF NOT EXISTS idx_mc_job_status
         ON mc_job(status, created_at);
+
+    -- 记录由任务临时解归档、但尚未确认恢复的子区。进程异常退出后也能补关。
+    CREATE TABLE IF NOT EXISTS mc_opened_thread (
+        job_id       INTEGER NOT NULL,
+        channel_id   TEXT NOT NULL,
+        opened_at    INTEGER NOT NULL,
+        PRIMARY KEY (job_id, channel_id)
+    );
 `);
 
 interface SettingsRow {
@@ -296,9 +304,48 @@ export function addCounts(
 
 export function appendWarning(jobId: number, warning: string): void {
     const job = getJob(jobId);
-    const combined = [job?.warningText, warning].filter(Boolean).join('\n').slice(0, 4000);
+    const lines = new Set((job?.warningText ?? '').split('\n').filter(Boolean));
+    lines.add(warning);
+    const combined = [...lines].join('\n').slice(0, 4000);
     db.prepare('UPDATE mc_job SET warning_text = ?, updated_at = ? WHERE id = ?')
         .run(combined || null, Date.now(), jobId);
+}
+
+export interface OpenedThreadRecord {
+    jobId: number;
+    guildId: string;
+    channelId: string;
+}
+
+export function markThreadOpened(jobId: number, channelId: string): void {
+    db.prepare(`
+        INSERT INTO mc_opened_thread (job_id, channel_id, opened_at)
+        VALUES (?, ?, ?)
+        ON CONFLICT(job_id, channel_id) DO NOTHING
+    `).run(jobId, channelId, Date.now());
+}
+
+export function unmarkThreadOpened(jobId: number, channelId: string): void {
+    db.prepare('DELETE FROM mc_opened_thread WHERE job_id = ? AND channel_id = ?')
+        .run(jobId, channelId);
+}
+
+export function isThreadMarkedOpened(jobId: number, channelId: string): boolean {
+    return Boolean(db.prepare(`
+        SELECT 1 FROM mc_opened_thread WHERE job_id = ? AND channel_id = ?
+    `).get(jobId, channelId));
+}
+
+/** 仅返回当前没有执行器工作的任务，避免后台恢复与正在删除的任务抢状态。 */
+export function listRestorableOpenedThreads(): OpenedThreadRecord[] {
+    const rows = db.prepare(`
+        SELECT t.job_id, j.guild_id, t.channel_id
+        FROM mc_opened_thread t
+        JOIN mc_job j ON j.id = t.job_id
+        WHERE j.status <> 'running'
+        ORDER BY t.opened_at ASC
+    `).all() as { job_id: number; guild_id: string; channel_id: string }[];
+    return rows.map(row => ({ jobId: row.job_id, guildId: row.guild_id, channelId: row.channel_id }));
 }
 
 export function setJobStatus(jobId: number, status: CleanupJobStatus, error: string | null = null): void {

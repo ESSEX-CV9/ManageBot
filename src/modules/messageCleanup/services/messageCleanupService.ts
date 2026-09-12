@@ -1,12 +1,16 @@
-import type { Client } from 'discord.js';
+import type { Client, ThreadChannel } from 'discord.js';
 
 import {
     addCounts,
     appendWarning,
     getJob,
+    isThreadMarkedOpened,
+    listRestorableOpenedThreads,
+    markThreadOpened,
     setJobStatus,
     setResolvedScope,
     setScanMode,
+    unmarkThreadOpened,
     updateCursor,
 } from './messageCleanupDatabase';
 import { snowflakeAt, timestampFromSnowflake } from './cleanupTime';
@@ -66,6 +70,71 @@ async function wait(ms: number): Promise<void> {
     await new Promise<void>(resolve => setTimeout(resolve, ms));
 }
 
+async function fetchThread(client: Client, channelId: string): Promise<ThreadChannel | null> {
+    const channel = await client.channels.fetch(channelId, { cache: true, force: true });
+    return channel?.isThread() ? channel : null;
+}
+
+async function restoreMarkedThread(client: Client, jobId: number, channelId: string): Promise<boolean> {
+    try {
+        const thread = await fetchThread(client, channelId);
+        if (!thread) {
+            // 子区已经被删除或 ID 不再指向子区，不存在可恢复的归档状态。
+            unmarkThreadOpened(jobId, channelId);
+            return true;
+        }
+        if (!thread.archived) {
+            await thread.setArchived(true, `恢复紧急隐私清理任务 #${jobId} 前的归档状态`);
+        }
+        unmarkThreadOpened(jobId, channelId);
+        return true;
+    } catch (error) {
+        appendWarning(jobId, `<#${channelId}> 删除后重新归档失败，将由后台继续重试：${errorText(error)}`);
+        return false;
+    }
+}
+
+async function withTemporarilyOpenedThread<T>(
+    client: Client,
+    job: CleanupJob,
+    channelId: string,
+    action: () => Promise<T>,
+): Promise<T> {
+    const thread = await fetchThread(client, channelId).catch(() => null);
+    if (!thread) return action();
+
+    const alreadyMarked = isThreadMarkedOpened(job.id, channelId);
+    if (!thread.archived && !alreadyMarked) return action();
+
+    if (thread.archived) {
+        // 先落库再打开：即使进程恰好在 API 成功后退出，重启也知道要把它关回去。
+        markThreadOpened(job.id, channelId);
+        try {
+            await thread.setArchived(false, `紧急隐私清理任务 #${job.id} 临时打开归档区域`);
+        } catch (error) {
+            await restoreMarkedThread(client, job.id, channelId);
+            throw new Error(`<#${channelId}> 无法临时打开：${errorText(error)}`);
+        }
+    }
+
+    try {
+        return await action();
+    } finally {
+        await restoreMarkedThread(client, job.id, channelId);
+    }
+}
+
+/** 进程重启或上一次恢复失败时，持续补关已经完成/暂停任务留下的子区。 */
+export async function restoreDanglingArchivedThreads(
+    client: Client,
+    skipGuildIds: ReadonlySet<string> = new Set(),
+): Promise<void> {
+    for (const record of listRestorableOpenedThreads()) {
+        if (skipGuildIds.has(record.guildId)) continue;
+        await restoreMarkedThread(client, record.jobId, record.channelId);
+    }
+}
+
 async function deleteOne(client: Client, channelId: string, messageId: string, reason: string): Promise<DeleteCounts> {
     try {
         await client.rest.delete(`/channels/${channelId}/messages/${messageId}`, { reason });
@@ -105,7 +174,12 @@ async function deleteRecentBatch(
     }
 }
 
-async function deleteCandidates(client: Client, job: CleanupJob, messages: ApiMessage[]): Promise<void> {
+async function deleteCandidates(
+    client: Client,
+    job: CleanupJob,
+    messages: ApiMessage[],
+    manageThreadState = true,
+): Promise<void> {
     const unique = new Map<string, ApiMessage>();
     const allowedChannels = new Set(job.scopeChannelIds);
     for (const message of messages) {
@@ -128,24 +202,37 @@ async function deleteCandidates(client: Client, job: CleanupJob, messages: ApiMe
 
     const total: DeleteCounts = { deleted: 0, skipped: 0, failed: 0 };
     for (const [channelId, channelMessages] of byChannel) {
-        const recent: string[] = [];
-        const old: string[] = [];
-        for (const message of channelMessages) {
-            const timestamp = message.timestamp ? Date.parse(message.timestamp) : timestampFromSnowflake(message.id);
-            (timestamp >= recentBoundary ? recent : old).push(message.id);
-        }
+        const deleteInChannel = async (): Promise<void> => {
+            const recent: string[] = [];
+            const old: string[] = [];
+            for (const message of channelMessages) {
+                const timestamp = message.timestamp ? Date.parse(message.timestamp) : timestampFromSnowflake(message.id);
+                (timestamp >= recentBoundary ? recent : old).push(message.id);
+            }
 
-        for (const batch of chunks(recent, 100)) {
-            const result = await deleteRecentBatch(client, channelId, batch, reason);
-            total.deleted += result.deleted;
-            total.skipped += result.skipped;
-            total.failed += result.failed;
-        }
-        for (const id of old) {
-            const result = await deleteOne(client, channelId, id, reason);
-            total.deleted += result.deleted;
-            total.skipped += result.skipped;
-            total.failed += result.failed;
+            for (const batch of chunks(recent, 100)) {
+                const result = await deleteRecentBatch(client, channelId, batch, reason);
+                total.deleted += result.deleted;
+                total.skipped += result.skipped;
+                total.failed += result.failed;
+            }
+            for (const id of old) {
+                const result = await deleteOne(client, channelId, id, reason);
+                total.deleted += result.deleted;
+                total.skipped += result.skipped;
+                total.failed += result.failed;
+            }
+        };
+
+        try {
+            if (manageThreadState) {
+                await withTemporarilyOpenedThread(client, job, channelId, deleteInChannel);
+            } else {
+                await deleteInChannel();
+            }
+        } catch (error) {
+            total.failed += channelMessages.length;
+            appendWarning(job.id, errorText(error));
         }
     }
 
@@ -237,29 +324,36 @@ async function runHistoryScan(client: Client, initialJob: CleanupJob): Promise<v
             ? initialJob.cursorId
             : cutoffId;
 
-        while (stillRunning(initialJob.id)) {
-            let page: ApiMessage[];
-            try {
-                page = await fetchHistoryPage(client, channelId, cursor);
-            } catch (error) {
-                appendWarning(initialJob.id, `<#${channelId}> 扫描中断：${errorText(error)}`);
-                break;
-            }
-            if (page.length === 0) break;
+        try {
+            await withTemporarilyOpenedThread(client, getJob(initialJob.id)!, channelId, async () => {
+                while (stillRunning(initialJob.id)) {
+                    let page: ApiMessage[];
+                    try {
+                        page = await fetchHistoryPage(client, channelId, cursor);
+                    } catch (error) {
+                        appendWarning(initialJob.id, `<#${channelId}> 扫描中断：${errorText(error)}`);
+                        break;
+                    }
+                    if (page.length === 0) break;
 
-            const fresh = getJob(initialJob.id)!;
-            const candidates = page.filter(message => message.author?.id === fresh.targetUserId);
-            if (!stillRunning(initialJob.id)) return;
-            await deleteCandidates(client, fresh, candidates);
+                    const fresh = getJob(initialJob.id)!;
+                    const candidates = page.filter(message => message.author?.id === fresh.targetUserId);
+                    if (!stillRunning(initialJob.id)) return;
+                    // 外层已经把归档子区保持为打开状态，避免每翻一页都反复开关。
+                    await deleteCandidates(client, fresh, candidates, false);
 
-            const nextCursor = oldestId(page);
-            if (nextCursor === cursor) {
-                appendWarning(initialJob.id, `<#${channelId}> 扫描游标没有继续前进，已跳过剩余历史`);
-                break;
-            }
-            updateCursor(initialJob.id, channelIndex, nextCursor);
-            cursor = nextCursor;
-            if (page.length < 100) break;
+                    const nextCursor = oldestId(page);
+                    if (nextCursor === cursor) {
+                        appendWarning(initialJob.id, `<#${channelId}> 扫描游标没有继续前进，已跳过剩余历史`);
+                        break;
+                    }
+                    updateCursor(initialJob.id, channelIndex, nextCursor);
+                    cursor = nextCursor;
+                    if (page.length < 100) break;
+                }
+            });
+        } catch (error) {
+            appendWarning(initialJob.id, `<#${channelId}> 无法完成归档区域扫描：${errorText(error)}`);
         }
 
         if (!stillRunning(initialJob.id)) return;

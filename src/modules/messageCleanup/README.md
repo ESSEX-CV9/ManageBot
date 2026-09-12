@@ -6,7 +6,8 @@
 - 论坛/媒体频道始终递归其活动与归档帖子。
 - 当前任务可排除频道、分类、子区或论坛帖子；没有默认保护项。
 - 优先使用 Discord 服务器消息搜索；不可用时自动降级为逐频道历史扫描。
+- 归档子区/论坛帖会在操作前临时打开，并在删除结束或报错后重新归档。
 - 14 天内消息批量删除，旧消息逐条删除。
 - 任务、游标和统计保存在 `data/messageCleanup.sqlite`，进程重启后可续跑。
 
-机器人在目标范围需要 `View Channel`、`Read Message History`、`Manage Messages`；枚举全部归档私密子区还需要 `Manage Threads`。
+机器人在目标范围需要 `View Channel`、`Read Message History`、`Manage Messages`；打开和恢复归档区域、枚举全部归档私密子区还需要 `Manage Threads`。

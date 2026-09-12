@@ -40,6 +40,9 @@ function canReadAndDelete(guild: Guild, channel: TextChannel | NewsChannel | Thr
     if (!permissions.has(PermissionFlagsBits.ViewChannel)) missing.push('查看频道');
     if (!permissions.has(PermissionFlagsBits.ReadMessageHistory)) missing.push('读取消息历史');
     if (!permissions.has(PermissionFlagsBits.ManageMessages)) missing.push('管理消息');
+    if (channel.isThread() && channel.archived && !permissions.has(PermissionFlagsBits.ManageThreads)) {
+        missing.push('管理子区（归档区域需要临时打开）');
+    }
     return missing;
 }
 

@@ -256,7 +256,8 @@ const STATUS_LABEL: Record<CleanupJobStatus, string> = {
 function jobLine(job: CleanupJob): string {
     const counts = `找到 ${job.foundCount} / 删除 ${job.deletedCount} / 跳过 ${job.skippedCount} / 失败 ${job.failedCount}`;
     const error = job.error ? `\n错误：${job.error.slice(0, 180)}` : '';
-    return `**#${job.id} ${STATUS_LABEL[job.status]}**　<@${job.targetUserId}>\n${counts}　范围 ${job.scopeCount || '待展开'} 个频道/子区${error}`;
+    const warning = job.warningText ? '　⚠️ 有提示' : '';
+    return `**#${job.id} ${STATUS_LABEL[job.status]}**　<@${job.targetUserId}>${warning}\n${counts}　范围 ${job.scopeCount || '待展开'} 个频道/子区${error}`;
 }
 
 function tasksView(guildId: string): InteractionUpdateOptions {

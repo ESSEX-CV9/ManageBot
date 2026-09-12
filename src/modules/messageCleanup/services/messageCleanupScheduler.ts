@@ -5,7 +5,7 @@ import {
     listRunnableJobs,
     recoverInterruptedJobs,
 } from './messageCleanupDatabase';
-import { executeCleanupJob } from './messageCleanupService';
+import { executeCleanupJob, restoreDanglingArchivedThreads } from './messageCleanupService';
 
 const TICK_MS = 2_000;
 let timer: NodeJS.Timeout | null = null;
@@ -16,6 +16,7 @@ export async function tickMessageCleanup(client: Client): Promise<void> {
     if (ticking) return;
     ticking = true;
     try {
+        await restoreDanglingArchivedThreads(client, runningGuildIds);
         for (const pending of listRunnableJobs()) {
             if (runningGuildIds.has(pending.guildId)) continue;
             const claimed = claimJob(pending.id);
