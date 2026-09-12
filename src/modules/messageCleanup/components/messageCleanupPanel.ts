@@ -254,15 +254,30 @@ const STATUS_LABEL: Record<CleanupJobStatus, string> = {
 };
 
 function jobLine(job: CleanupJob): string {
-    const foundLabel = job.status === 'completed' ? '最终找到' : '已发现（仍会增长）';
-    const counts = `${foundLabel} ${job.foundCount} / 删除 ${job.deletedCount} / 跳过 ${job.skippedCount} / 失败 ${job.failedCount}`;
+    const scanFinished = job.scanCompletedAt !== null || job.status === 'completed';
+    const foundLabel = scanFinished
+        ? '最终找到'
+        : job.status === 'running'
+            ? '已发现（仍会增长）'
+            : '已发现（扫描未完成）';
+    const counts = `${foundLabel} ${job.foundCount} / 待删除 ${job.pendingCount} / 已删除 ${job.deletedCount} / 跳过 ${job.skippedCount} / 失败 ${job.failedCount}`;
     const error = job.error ? `\n错误：${job.error.slice(0, 180)}` : '';
     const warning = job.warningText ? '　⚠️ 有提示' : '';
     const stage = job.status === 'completed'
-        ? '完整核验结束'
+        ? '完整核验与删除队列均已结束'
+        : job.status === 'cancelled'
+            ? '任务已取消，待删除队列已停止'
+        : job.status === 'failed'
+            ? '任务因异常停止'
+        : job.status === 'paused'
+            ? scanFinished ? '扫描已完成，删除队列已暂停' : '扫描器与删除器均已暂停'
+        : job.status === 'queued'
+            ? scanFinished ? '扫描已完成，等待删除器继续' : '等待扫描器与删除器开始或继续'
+        : job.scanCompletedAt !== null
+            ? '扫描已完成，删除器正在清空待删除队列'
         : job.scanMode === 'search'
-            ? '快速搜索阶段，之后还会完整核验'
-            : `完整核验阶段 ${Math.min(job.cursorBatch + 1, Math.max(job.scopeCount, 1))}/${Math.max(job.scopeCount, 1)}`;
+            ? '扫描器：快速搜索；删除器：并行工作中'
+            : `扫描器：完整核验 ${Math.min(job.cursorBatch + 1, Math.max(job.scopeCount, 1))}/${Math.max(job.scopeCount, 1)}；删除器：并行工作中`;
     return `**#${job.id} ${STATUS_LABEL[job.status]}**　<@${job.targetUserId}>${warning}\n${counts}\n${stage}　范围 ${job.scopeCount || '待展开'} 个频道/子区${error}`;
 }
 
@@ -290,7 +305,7 @@ function tasksView(guildId: string): InteractionUpdateOptions {
     buttons.push(new ButtonBuilder().setCustomId(ID.HOME).setLabel('返回').setStyle(ButtonStyle.Secondary));
 
     return {
-        content: (`## 📋 冲水任务\n_运行中的“已发现”是实时进度，只有“已完成”的数字才是完整核验结果。_\n\n${lines}${detail}`).slice(0, 2000),
+        content: (`## 📋 冲水任务\n_扫描和删除相互独立；“待删除”会持续被后台删除器消费。扫描完成后“最终找到”才是完整数量。_\n\n${lines}${detail}`).slice(0, 2000),
         components: [new ActionRowBuilder<ButtonBuilder>().addComponents(...buttons)],
     };
 }

@@ -27,11 +27,13 @@ export interface CleanupJob {
     cutoffLabel: string;
     status: CleanupJobStatus;
     scanMode: CleanupScanMode;
+    scanCompletedAt: number | null;
     scopeChannelIds: string[];
     scopeCount: number;
     cursorBatch: number;
     cursorId: string | null;
     foundCount: number;
+    pendingCount: number;
     deletedCount: number;
     skippedCount: number;
     failedCount: number;

@@ -35,6 +35,7 @@ db.exec(`
         cutoff_label             TEXT NOT NULL,
         status                   TEXT NOT NULL DEFAULT 'queued',
         scan_mode                TEXT NOT NULL DEFAULT 'search',
+        scan_completed_at        INTEGER,
         scope_channel_ids        TEXT NOT NULL DEFAULT '[]',
         scope_count              INTEGER NOT NULL DEFAULT 0,
         cursor_batch             INTEGER NOT NULL DEFAULT 0,
@@ -71,12 +72,31 @@ db.exec(`
         channel_id   TEXT NOT NULL,
         message_id   TEXT NOT NULL,
         outcome      TEXT NOT NULL DEFAULT 'pending',
+        attempt_count INTEGER NOT NULL DEFAULT 0,
+        next_attempt_at INTEGER NOT NULL DEFAULT 0,
+        last_error   TEXT,
         updated_at   INTEGER NOT NULL,
         PRIMARY KEY (job_id, message_id)
     );
 
     CREATE INDEX IF NOT EXISTS idx_mc_job_message_outcome
         ON mc_job_message(job_id, outcome);
+`);
+
+function ensureColumn(table: string, column: string, definition: string): void {
+    const columns = db.prepare(`PRAGMA table_info(${table})`).all() as { name: string }[];
+    if (columns.some(item => item.name === column)) return;
+    db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition}`);
+}
+
+// 兼容已经存在的任务数据库，启动时原地补齐生产者/消费者所需状态。
+ensureColumn('mc_job', 'scan_completed_at', 'INTEGER');
+ensureColumn('mc_job_message', 'attempt_count', 'INTEGER NOT NULL DEFAULT 0');
+ensureColumn('mc_job_message', 'next_attempt_at', 'INTEGER NOT NULL DEFAULT 0');
+ensureColumn('mc_job_message', 'last_error', 'TEXT');
+db.exec(`
+    CREATE INDEX IF NOT EXISTS idx_mc_job_message_pending
+        ON mc_job_message(job_id, outcome, next_attempt_at, channel_id);
 `);
 
 interface SettingsRow {
@@ -98,6 +118,7 @@ interface JobRow {
     cutoff_label: string;
     status: CleanupJobStatus;
     scan_mode: CleanupScanMode;
+    scan_completed_at: number | null;
     scope_channel_ids: string;
     scope_count: number;
     cursor_batch: number;
@@ -146,11 +167,13 @@ function mapJob(row: JobRow): CleanupJob {
         cutoffLabel: row.cutoff_label,
         status: row.status,
         scanMode: row.scan_mode,
+        scanCompletedAt: row.scan_completed_at,
         scopeChannelIds: parseIds(row.scope_channel_ids),
         scopeCount: row.scope_count,
         cursorBatch: row.cursor_batch,
         cursorId: row.cursor_id,
         foundCount: row.found_count,
+        pendingCount: Math.max(0, row.found_count - row.deleted_count - row.skipped_count - row.failed_count),
         deletedCount: row.deleted_count,
         skippedCount: row.skipped_count,
         failedCount: row.failed_count,
@@ -293,6 +316,14 @@ export function updateCursor(jobId: number, batch: number, cursorId: string | nu
     `).run(batch, cursorId, Date.now(), jobId);
 }
 
+export function markScanCompleted(jobId: number): void {
+    const now = Date.now();
+    db.prepare(`
+        UPDATE mc_job SET scan_completed_at = COALESCE(scan_completed_at, ?), updated_at = ?
+        WHERE id = ?
+    `).run(now, now, jobId);
+}
+
 export type CleanupMessageOutcome = 'pending' | 'deleted' | 'skipped' | 'failed';
 
 export interface CleanupMessageRef {
@@ -300,8 +331,14 @@ export interface CleanupMessageRef {
     messageId: string;
 }
 
+export interface PendingCleanupMessage extends CleanupMessageRef {
+    attemptCount: number;
+}
+
 export interface CleanupMessageResult extends CleanupMessageRef {
-    outcome: Exclude<CleanupMessageOutcome, 'pending'>;
+    outcome: CleanupMessageOutcome;
+    retryAt?: number;
+    error?: string | null;
 }
 
 const refreshMessageCountsStmt = db.prepare(`
@@ -337,12 +374,22 @@ export function recordMessageCandidates(jobId: number, messages: CleanupMessageR
 
 const recordResultsTransaction = db.transaction((jobId: number, results: CleanupMessageResult[]): void => {
     const stmt = db.prepare(`
-        UPDATE mc_job_message SET channel_id = ?, outcome = ?, updated_at = ?
+        UPDATE mc_job_message SET
+            channel_id = ?, outcome = ?, attempt_count = attempt_count + 1,
+            next_attempt_at = ?, last_error = ?, updated_at = ?
         WHERE job_id = ? AND message_id = ?
     `);
     const now = Date.now();
     for (const result of results) {
-        stmt.run(result.channelId, result.outcome, now, jobId, result.messageId);
+        stmt.run(
+            result.channelId,
+            result.outcome,
+            result.outcome === 'pending' ? Math.max(result.retryAt ?? now + 1_000, now) : 0,
+            result.error?.slice(0, 1000) ?? null,
+            now,
+            jobId,
+            result.messageId,
+        );
     }
     refreshMessageCounts(jobId);
 });
@@ -352,13 +399,54 @@ export function recordMessageResults(jobId: number, results: CleanupMessageResul
     recordResultsTransaction(jobId, results);
 }
 
-/** 极小概率在 API 删除成功后、结果落库前进程退出；最终将无法确认的 pending 记为跳过。 */
-export function finalizePendingMessageResults(jobId: number): void {
-    db.prepare(`
-        UPDATE mc_job_message SET outcome = 'skipped', updated_at = ?
+interface PendingMessageRow {
+    channel_id: string;
+    message_id: string;
+    attempt_count: number;
+}
+
+/** 每次只取一个频道，便于使用 Discord 的批量删除接口并控制归档帖状态。 */
+export function listPendingMessages(jobId: number, limit = 100): PendingCleanupMessage[] {
+    const now = Date.now();
+    const channel = db.prepare(`
+        SELECT channel_id
+        FROM mc_job_message
+        WHERE job_id = ? AND outcome = 'pending' AND next_attempt_at <= ?
+        ORDER BY updated_at ASC
+        LIMIT 1
+    `).get(jobId, now) as { channel_id: string } | undefined;
+    if (!channel) return [];
+
+    const safeLimit = Math.max(1, Math.min(100, Math.floor(limit)));
+    const rows = db.prepare(`
+        SELECT channel_id, message_id, attempt_count
+        FROM mc_job_message
+        WHERE job_id = ? AND channel_id = ? AND outcome = 'pending' AND next_attempt_at <= ?
+        ORDER BY message_id DESC
+        LIMIT ?
+    `).all(jobId, channel.channel_id, now, safeLimit) as PendingMessageRow[];
+    return rows.map(row => ({
+        channelId: row.channel_id,
+        messageId: row.message_id,
+        attemptCount: row.attempt_count,
+    }));
+}
+
+export interface DeletionQueueState {
+    pendingCount: number;
+    nextAttemptAt: number | null;
+}
+
+export function getDeletionQueueState(jobId: number): DeletionQueueState {
+    const row = db.prepare(`
+        SELECT COUNT(*) AS pending_count, MIN(next_attempt_at) AS next_attempt_at
+        FROM mc_job_message
         WHERE job_id = ? AND outcome = 'pending'
-    `).run(Date.now(), jobId);
-    refreshMessageCounts(jobId);
+    `).get(jobId) as { pending_count: number; next_attempt_at: number | null };
+    return {
+        pendingCount: row.pending_count,
+        nextAttemptAt: row.next_attempt_at,
+    };
 }
 
 export function appendWarning(jobId: number, warning: string): void {

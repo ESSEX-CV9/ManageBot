@@ -2,11 +2,13 @@ import type { Client, ThreadChannel } from 'discord.js';
 
 import {
     appendWarning,
-    finalizePendingMessageResults,
+    getDeletionQueueState,
     getJob,
     isThreadMarkedOpened,
+    listPendingMessages,
     listRestorableOpenedThreads,
     markThreadOpened,
+    markScanCompleted,
     recordMessageCandidates,
     recordMessageResults,
     setJobStatus,
@@ -15,7 +17,11 @@ import {
     unmarkThreadOpened,
     updateCursor,
 } from './messageCleanupDatabase';
-import type { CleanupMessageOutcome, CleanupMessageResult } from './messageCleanupDatabase';
+import type {
+    CleanupMessageOutcome,
+    CleanupMessageResult,
+    PendingCleanupMessage,
+} from './messageCleanupDatabase';
 import { snowflakeAt, timestampFromSnowflake } from './cleanupTime';
 import { resolveCleanupScope } from './scopeResolver';
 import type { CleanupJob } from './types';
@@ -36,8 +42,11 @@ interface SearchResponse {
 }
 
 interface DeleteResult {
+    channelId: string;
     messageId: string;
-    outcome: Exclude<CleanupMessageOutcome, 'pending'>;
+    outcome: CleanupMessageOutcome;
+    retryAt?: number;
+    error?: string | null;
 }
 
 const SEARCH_CHANNEL_BATCH = 100;
@@ -46,6 +55,8 @@ const RECENT_SAFETY_MARGIN = 60_000;
 const DEFAULT_HISTORY_PAGE_INTERVAL_MS = 1_100;
 const MIN_HISTORY_PAGE_INTERVAL_MS = 250;
 const MAX_HISTORY_PAGE_INTERVAL_MS = 10_000;
+const DELETE_QUEUE_IDLE_MS = 500;
+const MAX_DELETE_RETRY_DELAY_MS = 5 * 60_000;
 const historyPageIntervalMs = (() => {
     const raw = process.env.MESSAGE_CLEANUP_HISTORY_PAGE_INTERVAL_MS?.trim();
     if (!raw) return DEFAULT_HISTORY_PAGE_INTERVAL_MS;
@@ -54,6 +65,14 @@ const historyPageIntervalMs = (() => {
     return Math.min(Math.max(Math.trunc(configured), MIN_HISTORY_PAGE_INTERVAL_MS), MAX_HISTORY_PAGE_INTERVAL_MS);
 })();
 const lastHistoryPageStartedAt = new Map<string, number>();
+
+interface ThreadLeaseState {
+    count: number;
+    restoreArchived: boolean;
+}
+
+const threadLeases = new Map<string, ThreadLeaseState>();
+const threadTransitionTails = new Map<string, Promise<void>>();
 
 function chunks<T>(values: T[], size: number): T[][] {
     const result: T[][] = [];
@@ -66,9 +85,24 @@ function errorText(error: unknown): string {
 }
 
 function errorCode(error: unknown): number | null {
-    if (!error || typeof error !== 'object' || !('code' in error)) return null;
-    const code = Number((error as { code?: unknown }).code);
-    return Number.isFinite(code) ? code : null;
+    for (const item of errorChain(error)) {
+        if (!('code' in item)) continue;
+        const code = Number((item as { code?: unknown }).code);
+        if (Number.isFinite(code)) return code;
+    }
+    return null;
+}
+
+function errorChain(error: unknown): object[] {
+    const result: object[] = [];
+    const seen = new Set<object>();
+    let current = error;
+    while (current && typeof current === 'object' && !seen.has(current)) {
+        seen.add(current);
+        result.push(current);
+        current = 'cause' in current ? (current as { cause?: unknown }).cause : null;
+    }
+    return result;
 }
 
 function oldestId(messages: ApiMessage[]): string {
@@ -93,6 +127,21 @@ async function paceHistoryPage(channelId: string): Promise<void> {
 async function fetchThread(client: Client, channelId: string): Promise<ThreadChannel | null> {
     const channel = await client.channels.fetch(channelId, { cache: true, force: true });
     return channel?.isThread() ? channel : null;
+}
+
+async function withThreadTransitionLock<T>(key: string, action: () => Promise<T>): Promise<T> {
+    const previous = threadTransitionTails.get(key) ?? Promise.resolve();
+    let releaseLock!: () => void;
+    const gate = new Promise<void>(resolve => { releaseLock = resolve; });
+    const tail = previous.then(() => gate);
+    threadTransitionTails.set(key, tail);
+    await previous;
+    try {
+        return await action();
+    } finally {
+        releaseLock();
+        if (threadTransitionTails.get(key) === tail) threadTransitionTails.delete(key);
+    }
 }
 
 async function restoreMarkedThread(client: Client, jobId: number, channelId: string): Promise<boolean> {
@@ -120,27 +169,49 @@ async function withTemporarilyOpenedThread<T>(
     channelId: string,
     action: () => Promise<T>,
 ): Promise<T> {
-    const thread = await fetchThread(client, channelId).catch(() => null);
-    if (!thread) return action();
+    const leaseKey = `${job.id}:${channelId}`;
+    let released = false;
+    const release = await withThreadTransitionLock(leaseKey, async (): Promise<(() => Promise<void>) | null> => {
+        const existing = threadLeases.get(leaseKey);
+        if (existing) {
+            existing.count += 1;
+        } else {
+            const thread = await fetchThread(client, channelId).catch(() => null);
+            if (!thread) return null;
 
-    const alreadyMarked = isThreadMarkedOpened(job.id, channelId);
-    if (!thread.archived && !alreadyMarked) return action();
-
-    if (thread.archived) {
-        // 先落库再打开：即使进程恰好在 API 成功后退出，重启也知道要把它关回去。
-        markThreadOpened(job.id, channelId);
-        try {
-            await thread.setArchived(false, `紧急隐私清理任务 #${job.id} 临时打开归档区域`);
-        } catch (error) {
-            await restoreMarkedThread(client, job.id, channelId);
-            throw new Error(`<#${channelId}> 无法临时打开：${errorText(error)}`);
+            const alreadyMarked = isThreadMarkedOpened(job.id, channelId);
+            const restoreArchived = thread.archived || alreadyMarked;
+            if (thread.archived) {
+                // 先落库再打开：即使进程恰好在 API 成功后退出，重启也知道要把它关回去。
+                markThreadOpened(job.id, channelId);
+                try {
+                    await thread.setArchived(false, `紧急隐私清理任务 #${job.id} 临时打开归档区域`);
+                } catch (error) {
+                    await restoreMarkedThread(client, job.id, channelId);
+                    throw new Error(`<#${channelId}> 无法临时打开：${errorText(error)}`, { cause: error });
+                }
+            }
+            threadLeases.set(leaseKey, { count: 1, restoreArchived });
         }
-    }
+
+        return async (): Promise<void> => {
+            if (released) return;
+            released = true;
+            await withThreadTransitionLock(leaseKey, async () => {
+                const state = threadLeases.get(leaseKey);
+                if (!state) return;
+                state.count -= 1;
+                if (state.count > 0) return;
+                threadLeases.delete(leaseKey);
+                if (state.restoreArchived) await restoreMarkedThread(client, job.id, channelId);
+            });
+        };
+    });
 
     try {
         return await action();
     } finally {
-        await restoreMarkedThread(client, job.id, channelId);
+        await release?.();
     }
 }
 
@@ -155,48 +226,123 @@ export async function restoreDanglingArchivedThreads(
     }
 }
 
-async function deleteOne(client: Client, channelId: string, messageId: string, reason: string): Promise<DeleteResult> {
+function errorStatus(error: unknown): number | null {
+    for (const item of errorChain(error)) {
+        if (!('status' in item)) continue;
+        const status = Number((item as { status?: unknown }).status);
+        if (Number.isFinite(status)) return status;
+    }
+    return null;
+}
+
+function isRetryableDeleteError(error: unknown): boolean {
+    const status = errorStatus(error);
+    if (status === 429 || (status !== null && status >= 500)) return true;
+    for (const item of errorChain(error)) {
+        if (item instanceof Error && item.name === 'AbortError') return true;
+        if (!('code' in item)) continue;
+        const code = String((item as { code?: unknown }).code ?? '').toUpperCase();
+        if (code.startsWith('UND_ERR_')
+            || ['ABORT_ERR', 'ECONNRESET', 'ECONNREFUSED', 'EAI_AGAIN', 'ENOTFOUND', 'ETIMEDOUT'].includes(code)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+function isTerminalChannelDeleteError(error: unknown): boolean {
+    return errorStatus(error) === 403 || [10003, 50001, 50013].includes(errorCode(error) ?? 0);
+}
+
+function retryDelayMs(error: unknown, attemptCount: number): number {
+    for (const item of errorChain(error)) {
+        const shaped = item as {
+            retry_after?: unknown;
+            rawError?: { retry_after?: unknown };
+            data?: { retry_after?: unknown };
+        };
+        const raw = Number(shaped.retry_after ?? shaped.rawError?.retry_after ?? shaped.data?.retry_after);
+        if (Number.isFinite(raw) && raw > 0) {
+            const milliseconds = raw < 1_000 ? raw * 1_000 : raw;
+            return Math.min(Math.ceil(milliseconds) + 250, MAX_DELETE_RETRY_DELAY_MS);
+        }
+    }
+    return Math.min(2_000 * (2 ** Math.min(attemptCount, 7)), MAX_DELETE_RETRY_DELAY_MS);
+}
+
+function retryResult(message: PendingCleanupMessage, error: unknown): DeleteResult {
+    return {
+        channelId: message.channelId,
+        messageId: message.messageId,
+        outcome: 'pending',
+        retryAt: Date.now() + retryDelayMs(error, message.attemptCount),
+        error: errorText(error),
+    };
+}
+
+function failedResult(message: PendingCleanupMessage, error: unknown): DeleteResult {
+    return {
+        channelId: message.channelId,
+        messageId: message.messageId,
+        outcome: 'failed',
+        error: errorText(error),
+    };
+}
+
+async function deleteOne(client: Client, message: PendingCleanupMessage, reason: string): Promise<DeleteResult> {
     try {
-        await client.rest.delete(`/channels/${channelId}/messages/${messageId}`, { reason });
-        return { messageId, outcome: 'deleted' };
+        await client.rest.delete(`/channels/${message.channelId}/messages/${message.messageId}`, { reason });
+        return { channelId: message.channelId, messageId: message.messageId, outcome: 'deleted' };
     } catch (error) {
         // 重启续跑或管理员同时手动删除时，Unknown Message 不算真正失败。
-        if (errorCode(error) === 10008) return { messageId, outcome: 'skipped' };
-        console.warn(`[MessageCleanup] 删除消息 ${channelId}/${messageId} 失败：${errorText(error)}`);
-        return { messageId, outcome: 'failed' };
+        if (errorCode(error) === 10008) {
+            return { channelId: message.channelId, messageId: message.messageId, outcome: 'skipped' };
+        }
+        if (isRetryableDeleteError(error)) return retryResult(message, error);
+        console.warn(`[MessageCleanup] 删除消息 ${message.channelId}/${message.messageId} 失败：${errorText(error)}`);
+        return failedResult(message, error);
     }
 }
 
 async function deleteRecentBatch(
     client: Client,
-    channelId: string,
-    messageIds: string[],
+    jobId: number,
+    messages: PendingCleanupMessage[],
     reason: string,
 ): Promise<DeleteResult[]> {
-    if (messageIds.length === 1) return [await deleteOne(client, channelId, messageIds[0], reason)];
+    if (messages.length === 1) return [await deleteOne(client, messages[0], reason)];
+    const channelId = messages[0].channelId;
     try {
         await client.rest.post(`/channels/${channelId}/messages/bulk-delete`, {
-            body: { messages: messageIds },
+            body: { messages: messages.map(message => message.messageId) },
             reason,
         });
-        return messageIds.map(messageId => ({ messageId, outcome: 'deleted' }));
+        return messages.map(message => ({
+            channelId,
+            messageId: message.messageId,
+            outcome: 'deleted',
+        }));
     } catch (error) {
+        if (isRetryableDeleteError(error)) return messages.map(message => retryResult(message, error));
+        if (isTerminalChannelDeleteError(error)) {
+            appendWarning(jobId, `<#${channelId}> 无法批量删除：${errorText(error)}`);
+            return messages.map(message => failedResult(message, error));
+        }
         // 某一条碰到年龄边界或属于不可删除的系统消息时，整批会失败；逐条回退可保住其他消息。
         console.warn(`[MessageCleanup] 批量删除频道 ${channelId} 失败，回退逐条删除：${errorText(error)}`);
         const results: DeleteResult[] = [];
-        for (const id of messageIds) {
-            results.push(await deleteOne(client, channelId, id, reason));
+        for (const message of messages) {
+            if (!stillRunning(jobId)) break;
+            results.push(await deleteOne(client, message, reason));
         }
         return results;
     }
 }
 
-async function deleteCandidates(
-    client: Client,
+function recordCandidates(
     job: CleanupJob,
     messages: ApiMessage[],
-    manageThreadState = true,
-): Promise<void> {
+): void {
     const unique = new Map<string, ApiMessage>();
     const allowedChannels = new Set(job.scopeChannelIds);
     for (const message of messages) {
@@ -205,58 +351,72 @@ async function deleteCandidates(
         if (message.author?.id !== job.targetUserId) continue;
         unique.set(`${message.channel_id}:${message.id}`, message);
     }
-    const candidates = [...unique.values()];
-    if (candidates.length === 0) return;
-    recordMessageCandidates(job.id, candidates.map(message => ({
+    recordMessageCandidates(job.id, [...unique.values()].map(message => ({
         channelId: message.channel_id,
         messageId: message.id,
     })));
+}
 
+async function deleteQueuedMessages(
+    client: Client,
+    job: CleanupJob,
+    messages: PendingCleanupMessage[],
+): Promise<void> {
+    if (messages.length === 0) return;
+    const channelId = messages[0].channelId;
     const reason = `紧急隐私清理任务 #${job.id}，目标用户 ${job.targetUserId}`;
     const recentBoundary = Date.now() - RECENT_MESSAGE_AGE + RECENT_SAFETY_MARGIN;
-    const byChannel = new Map<string, ApiMessage[]>();
-    for (const message of candidates) {
-        const list = byChannel.get(message.channel_id) ?? [];
-        list.push(message);
-        byChannel.set(message.channel_id, list);
-    }
+    const deleteInChannel = async (): Promise<void> => {
+        const recent: PendingCleanupMessage[] = [];
+        const old: PendingCleanupMessage[] = [];
+        for (const message of messages) {
+            (timestampFromSnowflake(message.messageId) >= recentBoundary ? recent : old).push(message);
+        }
 
-    const outcomes: CleanupMessageResult[] = [];
-    for (const [channelId, channelMessages] of byChannel) {
-        const deleteInChannel = async (): Promise<void> => {
-            const recent: string[] = [];
-            const old: string[] = [];
-            for (const message of channelMessages) {
-                const timestamp = message.timestamp ? Date.parse(message.timestamp) : timestampFromSnowflake(message.id);
-                (timestamp >= recentBoundary ? recent : old).push(message.id);
-            }
+        if (recent.length > 0 && stillRunning(job.id)) {
+            const results = await deleteRecentBatch(client, job.id, recent, reason);
+            recordMessageResults(job.id, results);
+        }
+        for (const message of old) {
+            if (!stillRunning(job.id)) break;
+            recordMessageResults(job.id, [await deleteOne(client, message, reason)]);
+        }
+    };
 
-            for (const batch of chunks(recent, 100)) {
-                for (const result of await deleteRecentBatch(client, channelId, batch, reason)) {
-                    outcomes.push({ channelId, ...result });
-                }
-            }
-            for (const id of old) {
-                outcomes.push({ channelId, ...await deleteOne(client, channelId, id, reason) });
-            }
-        };
-
-        try {
-            if (manageThreadState) {
-                await withTemporarilyOpenedThread(client, job, channelId, deleteInChannel);
-            } else {
-                await deleteInChannel();
-            }
-        } catch (error) {
-            outcomes.push(...channelMessages.map(message => ({
-                channelId,
-                messageId: message.id,
-                outcome: 'failed' as const,
-            })));
-            appendWarning(job.id, errorText(error));
+    try {
+        await withTemporarilyOpenedThread(client, job, channelId, deleteInChannel);
+    } catch (error) {
+        const results: CleanupMessageResult[] = messages.map(message => (
+            isRetryableDeleteError(error) ? retryResult(message, error) : failedResult(message, error)
+        ));
+        recordMessageResults(job.id, results);
+        if (!isRetryableDeleteError(error)) {
+            appendWarning(job.id, `<#${channelId}> 无法执行待删除队列：${errorText(error)}`);
         }
     }
-    recordMessageResults(job.id, outcomes);
+}
+
+async function runDeletionWorker(client: Client, jobId: number): Promise<void> {
+    while (stillRunning(jobId)) {
+        const messages = listPendingMessages(jobId, 100);
+        if (messages.length > 0) {
+            const job = getJob(jobId);
+            if (!job || job.status !== 'running') return;
+            await deleteQueuedMessages(client, job, messages);
+            continue;
+        }
+
+        const state = getDeletionQueueState(jobId);
+        const job = getJob(jobId);
+        if (!job || job.status !== 'running') return;
+        if (job.scanCompletedAt !== null && state.pendingCount === 0) return;
+
+        const untilRetry = state.nextAttemptAt === null
+            ? DELETE_QUEUE_IDLE_MS
+            : Math.max(state.nextAttemptAt - Date.now(), DELETE_QUEUE_IDLE_MS);
+        // 最多睡一个轮询周期，以便扫描器新写入消息后删除器能快速接上。
+        await wait(Math.min(untilRetry, DELETE_QUEUE_IDLE_MS));
+    }
 }
 
 function flattenSearchMessages(response: SearchResponse, job: CleanupJob, scope: Set<string>): ApiMessage[] {
@@ -315,7 +475,7 @@ async function runSearchScan(client: Client, initialJob: CleanupJob): Promise<vo
                 throw new Error('Discord 消息搜索游标没有继续前进');
             }
             if (!stillRunning(initialJob.id)) return;
-            await deleteCandidates(client, fresh, found);
+            recordCandidates(fresh, found);
             updateCursor(initialJob.id, batchIndex, nextCursor);
             cursor = nextCursor;
         }
@@ -356,8 +516,7 @@ async function runHistoryScan(client: Client, initialJob: CleanupJob): Promise<v
                     const fresh = getJob(initialJob.id)!;
                     const candidates = page.filter(message => message.author?.id === fresh.targetUserId);
                     if (!stillRunning(initialJob.id)) return;
-                    // 外层已经把归档子区保持为打开状态，避免每翻一页都反复开关。
-                    await deleteCandidates(client, fresh, candidates, false);
+                    recordCandidates(fresh, candidates);
 
                     const nextCursor = oldestId(page);
                     if (nextCursor === cursor) {
@@ -380,6 +539,33 @@ async function runHistoryScan(client: Client, initialJob: CleanupJob): Promise<v
     }
 }
 
+async function runScanWorker(client: Client, initialJob: CleanupJob): Promise<void> {
+    if (initialJob.scanCompletedAt !== null) return;
+    let job = initialJob;
+    if (job.scanMode === 'search') {
+        try {
+            await runSearchScan(client, job);
+        } catch (error) {
+            if (!stillRunning(job.id)) return;
+            const warning = `服务器消息快速搜索未完整结束，继续逐频道完整核验：${errorText(error)}`;
+            console.warn(`[MessageCleanup] 任务 #${job.id} ${warning}`);
+            appendWarning(job.id, warning);
+        }
+
+        if (!stillRunning(job.id)) return;
+        // Discord 搜索只负责加速，绝不能作为“全部找完”的依据；随后逐频道翻到底兜底。
+        setScanMode(job.id, 'history', true);
+        job = getJob(job.id)!;
+    }
+
+    await runHistoryScan(client, job);
+    if (stillRunning(job.id)) {
+        markScanCompleted(job.id);
+        const scanned = getJob(job.id)!;
+        console.log(`[MessageCleanup] 🔎 任务 #${job.id} 扫描完成：找到 ${scanned.foundCount}，待删除 ${scanned.pendingCount}`);
+    }
+}
+
 export async function executeCleanupJob(client: Client, claimedJob: CleanupJob): Promise<void> {
     try {
         const guild = client.guilds.cache.get(claimedJob.guildId)
@@ -397,27 +583,26 @@ export async function executeCleanupJob(client: Client, claimedJob: CleanupJob):
         }
 
         if (!stillRunning(job.id)) return;
-        if (job.scanMode === 'search') {
+        const supervise = async (worker: '扫描器' | '删除器', action: () => Promise<void>): Promise<void> => {
             try {
-                await runSearchScan(client, job);
+                await action();
             } catch (error) {
-                if (!stillRunning(job.id)) return;
-                const warning = `服务器消息快速搜索未完整结束，继续逐频道完整核验：${errorText(error)}`;
-                console.warn(`[MessageCleanup] 任务 #${job.id} ${warning}`);
-                appendWarning(job.id, warning);
+                const current = getJob(job.id);
+                if (current?.status === 'running') {
+                    setJobStatus(job.id, 'failed', `${worker}异常：${errorText(error)}`.slice(0, 2000));
+                }
+                console.error(`[MessageCleanup] 任务 #${job.id} ${worker}异常：`, error);
             }
+        };
 
-            if (!stillRunning(job.id)) return;
-            // Discord 搜索只负责加速，绝不能作为“全部找完”的依据；随后逐频道翻到底兜底。
-            setScanMode(job.id, 'history', true);
-            job = getJob(job.id)!;
-            await runHistoryScan(client, job);
-        } else {
-            await runHistoryScan(client, job);
-        }
+        // 两个 Promise 独立等待各自的 Discord 限流桶；删除器排队不会阻塞扫描器继续翻页。
+        await Promise.all([
+            supervise('扫描器', () => runScanWorker(client, job)),
+            supervise('删除器', () => runDeletionWorker(client, job.id)),
+        ]);
 
-        if (stillRunning(job.id)) {
-            finalizePendingMessageResults(job.id);
+        const current = getJob(job.id);
+        if (current?.status === 'running' && current.scanCompletedAt !== null && current.pendingCount === 0) {
             setJobStatus(job.id, 'completed');
             const done = getJob(job.id)!;
             console.log(`[MessageCleanup] ✅ 任务 #${job.id} 完成：找到 ${done.foundCount}，删除 ${done.deletedCount}，失败 ${done.failedCount}`);
