@@ -11,4 +11,6 @@
 - 14 天内消息批量删除，旧消息逐条删除。
 - 任务、游标和统计保存在 `data/messageCleanup.sqlite`，进程重启后可续跑。
 
+完整历史核验会把同一频道的分页读取主动摊开，默认每 1100ms 最多发起一页（每页 100 条），以避免反复触发 Discord 的频道消息读取限流。可用 `MESSAGE_CLEANUP_HISTORY_PAGE_INTERVAL_MS` 调整，允许范围为 250–10000ms；除非确认仍频繁限流，否则建议保留默认值。
+
 机器人在目标范围需要 `View Channel`、`Read Message History`、`Manage Messages`；打开和恢复归档区域、枚举全部归档私密子区还需要 `Manage Threads`。

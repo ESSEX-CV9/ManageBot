@@ -43,6 +43,17 @@ interface DeleteResult {
 const SEARCH_CHANNEL_BATCH = 100;
 const RECENT_MESSAGE_AGE = 14 * 24 * 60 * 60_000;
 const RECENT_SAFETY_MARGIN = 60_000;
+const DEFAULT_HISTORY_PAGE_INTERVAL_MS = 1_100;
+const MIN_HISTORY_PAGE_INTERVAL_MS = 250;
+const MAX_HISTORY_PAGE_INTERVAL_MS = 10_000;
+const historyPageIntervalMs = (() => {
+    const raw = process.env.MESSAGE_CLEANUP_HISTORY_PAGE_INTERVAL_MS?.trim();
+    if (!raw) return DEFAULT_HISTORY_PAGE_INTERVAL_MS;
+    const configured = Number(raw);
+    if (!Number.isFinite(configured)) return DEFAULT_HISTORY_PAGE_INTERVAL_MS;
+    return Math.min(Math.max(Math.trunc(configured), MIN_HISTORY_PAGE_INTERVAL_MS), MAX_HISTORY_PAGE_INTERVAL_MS);
+})();
+const lastHistoryPageStartedAt = new Map<string, number>();
 
 function chunks<T>(values: T[], size: number): T[][] {
     const result: T[][] = [];
@@ -70,6 +81,13 @@ function stillRunning(jobId: number): boolean {
 
 async function wait(ms: number): Promise<void> {
     await new Promise<void>(resolve => setTimeout(resolve, ms));
+}
+
+async function paceHistoryPage(channelId: string): Promise<void> {
+    const earliestStart = (lastHistoryPageStartedAt.get(channelId) ?? 0) + historyPageIntervalMs;
+    const remaining = earliestStart - Date.now();
+    if (remaining > 0) await wait(remaining);
+    lastHistoryPageStartedAt.set(channelId, Date.now());
 }
 
 async function fetchThread(client: Client, channelId: string): Promise<ThreadChannel | null> {
@@ -308,6 +326,8 @@ async function runSearchScan(client: Client, initialJob: CleanupJob): Promise<vo
 }
 
 async function fetchHistoryPage(client: Client, channelId: string, before: string): Promise<ApiMessage[]> {
+    // Discord 会按频道限制历史消息读取。主动摊平分页请求，避免先突发请求再被 SDK 强制等待数秒。
+    await paceHistoryPage(channelId);
     const query = new URLSearchParams({ limit: '100', before });
     const raw = await client.rest.get(`/channels/${channelId}/messages`, { query });
     return Array.isArray(raw) ? raw as ApiMessage[] : [];
@@ -351,6 +371,8 @@ async function runHistoryScan(client: Client, initialJob: CleanupJob): Promise<v
             });
         } catch (error) {
             appendWarning(initialJob.id, `<#${channelId}> 无法完成归档区域扫描：${errorText(error)}`);
+        } finally {
+            lastHistoryPageStartedAt.delete(channelId);
         }
 
         if (!stillRunning(initialJob.id)) return;
