@@ -1507,6 +1507,14 @@ const claimAiReviewStmt = db.prepare(`
 `);
 const releaseAiReviewStmt = db.prepare(
     'UPDATE tt_cases SET ai_review_used = 0, updated_at = ? WHERE id = ? AND ai_review_upheld IS NULL');
+const recoverInterruptedAiReviewsStmt = db.prepare(`
+    UPDATE tt_cases SET
+        state = 'pending_admin',
+        deadline = NULL,
+        ai_review_used = 0,
+        updated_at = ?
+    WHERE closed_at IS NULL AND ai_review_used = 1 AND ai_review_upheld IS NULL
+`);
 
 /**
  * 抢占这个案子的 AI 复核名额，抢到才准往下走。
@@ -1525,6 +1533,14 @@ export function claimAiReview(caseId: number): boolean {
  */
 export function releaseAiReview(caseId: number): void {
     releaseAiReviewStmt.run(Date.now(), caseId);
+}
+
+/**
+ * 进程启动时不会有任何上次进程留下的模型请求仍在执行。
+ * 把这些已占名额却没有结论的案件转人工并退还名额，避免通知永久卡在「进行中」。
+ */
+export function recoverInterruptedAiReviews(): number {
+    return recoverInterruptedAiReviewsStmt.run(Date.now()).changes;
 }
 
 export function closeCase(id: number, state: CaseState): GuardCase | null {

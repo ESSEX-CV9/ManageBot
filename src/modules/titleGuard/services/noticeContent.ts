@@ -26,6 +26,8 @@ export interface NoticeButton {
     style: 'primary' | 'secondary' | 'danger';
     /** 谁能点 */
     who: string;
+    /** 调试台也要如实展示 Discord 上的禁用状态 */
+    disabled?: boolean;
 }
 
 export interface NoticeContent {
@@ -198,9 +200,17 @@ function aiFooterLine(input: NoticeInput): string {
         : '本帖的整改方案经过 AI 语义判定。';
 }
 
+type AiReviewState = 'available' | 'running' | 'complete';
+
 /** 兼容调试台未显式传 aiReviewUsed 的旧输入：已有复核结论就视为已使用。 */
+function aiReviewState(input: NoticeInput): AiReviewState {
+    const used = input.aiReviewUsed ?? Boolean(input.review);
+    if (!used) return 'available';
+    return input.review ? 'complete' : 'running';
+}
+
 function canRequestAiReview(input: NoticeInput): boolean {
-    return !input.awaitingHuman && !(input.aiReviewUsed ?? Boolean(input.review));
+    return !input.awaitingHuman && aiReviewState(input) === 'available';
 }
 
 /**
@@ -331,7 +341,9 @@ export function buildNoticeContent(input: NoticeInput): NoticeContent {
             aiFooterLine(input),
             input.awaitingHuman
                 ? '本帖已提请人工复核，倒计时保持暂停，请等待管理组处理。'
-                : canRequestAiReview(input)
+                : aiReviewState(input) === 'running'
+                    ? 'AI 复核正在处理中，倒计时已暂停，请等待复核完成。'
+                    : canRequestAiReview(input)
                     ? '提交复核后，倒计时将即时暂停。'
                     : '如仍有异议，可点击下方按钮提请人工复核。',
         ].filter(Boolean).join('\n'),
@@ -341,7 +353,8 @@ export function buildNoticeContent(input: NoticeInput): NoticeContent {
 
 /**
  * 通知上应该有哪几个按钮。
- * 复核那颗会随案件状态变：AI 复核用掉之前是「申请复核」，用掉之后是「申请人工复核」，
+ * 复核那颗会随案件状态变：AI 复核用掉之前是「申请复核」，调用期间不可点击，
+ * 得到结论之后才是「申请人工复核」，
  * 已经升到人工了就不再显示——重复点没有意义。
  */
 function buildButtonList(input: NoticeInput): NoticeButton[] {
@@ -352,10 +365,16 @@ function buildButtonList(input: NoticeInput): NoticeButton[] {
     if (input.awaitingHuman) {
         buttons.push({ label: '驳回申诉', style: 'secondary', who: '有「复核」权限的身份组' });
     } else {
+        const reviewState = aiReviewState(input);
         buttons.push({
-            label: canRequestAiReview(input) ? '申请复核' : '申请人工复核',
+            label: reviewState === 'available'
+                ? '申请复核'
+                : reviewState === 'running'
+                    ? 'AI 复核进行中'
+                    : '申请人工复核',
             style: 'secondary',
             who: '帖主 / 管理组',
+            disabled: reviewState === 'running',
         });
     }
 

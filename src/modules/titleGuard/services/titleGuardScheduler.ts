@@ -358,6 +358,10 @@ async function tick(client: Client): Promise<void> {
 export function startTitleGuardScheduler(client: Client): void {
     if (timer) return;
     noticeRefreshQueue = null;
+    const interruptedAiReviews = db.recoverInterruptedAiReviews();
+    if (interruptedAiReviews > 0) {
+        console.warn(`[TitleGuard] 已将 ${interruptedAiReviews} 个因进程中断的 AI 复核转交人工`);
+    }
     db.recoverCaseReaudits();
     const queued = db.enqueueOpenCaseReaudits(null, 'rules', 'startup');
     if (queued > 0) {

@@ -42,12 +42,13 @@ test('AI 复核用过后切换为人工复核提示', () => {
     assert.ok(content.buttons.some(b => b.label === '申请人工复核'));
 });
 
-test('AI 复核已占用但尚无结论时不再提示调用 LLM', () => {
+test('AI 复核已占用但尚无结论时显示不可点击的进行中状态', () => {
     const content = buildNoticeContent({
         ...BASE,
         aiReviewUsed: true,
     });
     assert.doesNotMatch(content.description, /调用 LLM 再次复核/);
-    assert.match(content.footer, /人工复核/);
-    assert.ok(content.buttons.some(b => b.label === '申请人工复核'));
+    assert.match(content.footer, /AI 复核正在处理中/);
+    const button = content.buttons.find(b => b.label === 'AI 复核进行中');
+    assert.equal(button?.disabled, true);
 });

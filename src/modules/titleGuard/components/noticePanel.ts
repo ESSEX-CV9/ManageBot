@@ -57,11 +57,11 @@ import type { NormalizedTitle, Violation } from '../services/types';
 import { buildNoticeContent, buildDoneMessage } from '../services/noticeContent';
 
 export const BTN_FIX = 'tt_fix';           // tt_fix:<caseId>
-export const BTN_APPEAL = 'tt_appeal';     // tt_appeal:<caseId>
+export const BTN_APPEAL = 'tt_appeal';     // tt_appeal:<caseId>:ai|human|running
 export const BTN_REJECT = 'tt_reject';     // tt_reject:<caseId>
 export const BTN_AI = 'tt_ai';             // tt_ai:<caseId>
 export const BTN_OVERRIDE = 'tt_override'; // tt_override:<caseId>
-export const MODAL_APPEAL = 'tt_appealtext'; // tt_appealtext:<caseId>
+export const MODAL_APPEAL = 'tt_appealtext'; // tt_appealtext:<caseId>:ai|human
 
 /** 恢复倒计时时至少留这么久。AI 维持原判后作者总得有时间去点人工复核 */
 const MIN_RESUME_MS = 60 * 60 * 1000;
@@ -141,7 +141,8 @@ function resolutionOf(guardCase: db.GuardCase): {
 
 /**
  * 通知上该有哪几个按钮。
- * 跟着案件状态走：AI 复核还没用掉就是「申请复核」，用掉了变「申请人工复核」，
+ * 跟着案件状态走：AI 复核还没用掉就是「申请复核」，正在调用时锁成
+ * 「AI 复核进行中」，已有结论后变「申请人工复核」。
  * 已经升到人工了就换成给管理组的「驳回申诉」。
  */
 export function buildNoticeButtons(guardCase: db.GuardCase): ActionRowBuilder<ButtonBuilder> {
@@ -163,12 +164,20 @@ export function buildNoticeButtons(guardCase: db.GuardCase): ActionRowBuilder<Bu
                 .setEmoji('📌'),
         );
     } else {
+        const appealState = appealButtonState(guardCase);
         row.addComponents(
             new ButtonBuilder()
-                .setCustomId(`${BTN_APPEAL}:${caseId}`)
-                .setLabel(aiReviewAvailable(guardCase) ? '申请复核' : '申请人工复核')
+                // 把用户看到的去向写进 customId。不能等弹窗提交时再按数据库状态猜，
+                // 否则失败的 AI 尝试释放名额后，「人工复核」也可能被改送给 AI。
+                .setCustomId(`${BTN_APPEAL}:${caseId}:${appealState}`)
+                .setLabel(appealState === 'ai'
+                    ? '申请复核'
+                    : appealState === 'running'
+                        ? 'AI 复核进行中'
+                        : '申请人工复核')
                 .setStyle(ButtonStyle.Secondary)
-                .setEmoji('⚖️'),
+                .setEmoji('⚖️')
+                .setDisabled(appealState === 'running'),
         );
     }
 
@@ -200,6 +209,21 @@ export function buildNoticeButtons(guardCase: db.GuardCase): ActionRowBuilder<Bu
  */
 function aiReviewAvailable(guardCase: db.GuardCase): boolean {
     return !guardCase.aiReviewUsed;
+}
+
+type AppealRoute = 'ai' | 'human';
+type AppealButtonState = AppealRoute | 'running';
+
+/** aiReviewUsed 在模型调用前就会抢占；尚无结论时不能误装成已经可以申请人工。 */
+function appealButtonState(guardCase: db.GuardCase): AppealButtonState {
+    if (aiReviewAvailable(guardCase)) return 'ai';
+    return guardCase.aiReviewUpheld === null ? 'running' : 'human';
+}
+
+/** 新按钮/弹窗把固定去向放在第三段；没有第三段的是部署前已经发出的旧组件。 */
+function encodedAppealRoute(customId: string): AppealRoute | null {
+    const route = customId.split(':')[2];
+    return route === 'ai' || route === 'human' ? route : null;
 }
 
 /**
@@ -423,17 +447,46 @@ async function handleAppeal(interaction: ButtonInteraction, guardCase: db.GuardC
         return;
     }
 
-    const toAi = aiReviewAvailable(guardCase);
+    // ai_review_used=true 且还没有结论，表示另一个交互正在调用模型。
+    // 老版通知曾在这里错误显示「申请人工复核」；即使点到旧按钮，也不能让两条流程并发。
+    const currentState = appealButtonState(guardCase);
+    if (currentState === 'running') {
+        await interaction.reply({
+            content: '⏳ AI 复核正在进行中，请等待本次复核完成。',
+            flags: MessageFlags.Ephemeral,
+        });
+        await refreshNotice(interaction.client, guardCase.id);
+        return;
+    }
+
+    const encodedRoute = encodedAppealRoute(interaction.customId);
+    // 兼容部署前已经发出的 tt_appeal:<id>：旧 customId 没有去向，只能以用户实际
+    // 看到的按钮文字为准。「申请人工复核」绝不能在提交时悄悄变成 AI 复核。
+    const oldLabel = 'label' in interaction.component ? interaction.component.label ?? '' : '';
+    const route: AppealRoute = encodedRoute
+        ?? (oldLabel.includes('人工') ? 'human' : currentState);
+
+    // 用户若点到了尚未刷新的旧「申请复核」，而 AI 名额已经真正用完，要求重新点击
+    // 更新后的人工按钮，避免把一次 AI 意图静默改成人工意图。
+    if (route === 'ai' && currentState !== 'ai') {
+        await interaction.reply({
+            content: '这次 AI 复核已经完成。通知按钮已更新，如仍有异议请点击“申请人工复核”。',
+            flags: MessageFlags.Ephemeral,
+        });
+        await refreshNotice(interaction.client, guardCase.id);
+        return;
+    }
+
     const modal = new ModalBuilder()
-        .setCustomId(`${MODAL_APPEAL}:${guardCase.id}`)
-        .setTitle(toAi ? '申请复核' : '申请人工复核');
+        .setCustomId(`${MODAL_APPEAL}:${guardCase.id}:${route}`)
+        .setTitle(route === 'ai' ? '申请复核' : '申请人工复核');
 
     modal.addComponents(
         new ActionRowBuilder<TextInputBuilder>().addComponents(
             new TextInputBuilder()
                 .setCustomId('reason')
                 .setLabel('你认为哪里判错了？')
-                .setPlaceholder(toAi
+                .setPlaceholder(route === 'ai'
                     ? '例如：「纯爱」是作品名的一部分，不是分类标记'
                     : '说明为什么对上一次复核结论仍有异议')
                 .setStyle(TextInputStyle.Paragraph)
@@ -513,21 +566,27 @@ export async function handleAppealModal(interaction: ModalSubmitInteraction): Pr
     // Discord 那边已经限长，这里再挡一次，防的是绕过客户端直接发交互的情况
     const text = raw.slice(0, APPEAL_MAX_LENGTH);
 
-    const wantAi = aiReviewAvailable(guardCase);
+    // 新弹窗的去向在打开时已经固定。旧版弹窗没有第三段，只能继续兼容为按当前名额判断。
+    // 尤其不能让明确写着 human 的弹窗因一次失败调用释放了名额而重新进入 LLM。
+    const route = encodedAppealRoute(interaction.customId);
+    const wantAi = route ? route === 'ai' : aiReviewAvailable(guardCase);
 
-    // 走 AI 这一路的话，先把名额抢下来再干别的。
-    // 抢占是一条带条件的 UPDATE，抢不到就说明有人已经在跑了——
-    // 连点几下按钮不该变成连调几次模型。
+    // 先确认 Discord 已经接住本次提交，再改变案件状态。否则交互本身若已超时，
+    // 先抢名额再 defer 会留下一个永远没有模型任务在跑的「复核进行中」。
+    await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+
+    // 走 AI 这一路的话，先把名额抢下来再干别的。抢占是一条带条件的 UPDATE，
+    // 抢不到就说明有人已经在跑了——连点几下按钮不该变成连调几次模型。
     if (wantAi && !db.claimAiReview(guardCase.id)) {
-        await interaction.reply({
-            content: '⏳ 上一次复核还在进行中，请稍等片刻。',
-            flags: MessageFlags.Ephemeral,
+        const latest = db.getCase(guardCase.id);
+        await interaction.editReply({
+            content: latest?.aiReviewUpheld === null
+                ? '⏳ 上一次复核还在进行中，请稍等片刻。'
+                : '这次 AI 复核已经完成。如仍有异议，请从通知面板申请人工复核。',
         });
+        await refreshNotice(interaction.client, guardCase.id);
         return;
     }
-
-    // 安检和复核都要真调模型，肯定超过 3 秒，先把交互挂起来
-    await interaction.deferReply({ flags: MessageFlags.Ephemeral });
 
     // 不管后面怎么走，倒计时先停下——作者已经明确表示有异议了
     pauseCountdown(guardCase);
@@ -536,6 +595,9 @@ export async function handleAppealModal(interaction: ModalSubmitInteraction): Pr
         appealBy: interaction.user.id,
         appealAt: Date.now(),
     });
+
+    // 及时把公开面板锁成「AI 复核进行中」，避免模型调用期间出现可重复点击的假象。
+    if (wantAi) await refreshNotice(interaction.client, guardCase.id);
 
     const settings = db.getSettings(guardCase.guildId);
 

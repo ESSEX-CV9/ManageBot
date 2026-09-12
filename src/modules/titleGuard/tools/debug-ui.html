@@ -141,6 +141,7 @@
   .dc .btn.primary{background:#5865f2}
   .dc .btn.secondary{background:#4e5058}
   .dc .btn.danger{background:#da373c}
+  .dc .btn.disabled{opacity:.45}
   .dc .btn small{display:block;font-size:10px;opacity:.7;font-weight:400}
   .dc .done{background:#2b2d31;border-radius:4px;padding:10px 14px;margin-top:10px;
     color:#dbdee1;font-size:13px;white-space:pre-wrap;border-left:4px solid #3fb950}
@@ -589,7 +590,7 @@ function renderNotice(r) {
         </div>`).join('')}
         <div class="foot">${esc(n.footer)}</div>
       </div>
-      <div class="btns">${n.buttons.map(b => `<div class="btn ${b.style}">
+      <div class="btns">${n.buttons.map(b => `<div class="btn ${b.style}${b.disabled ? ' disabled' : ''}">
         ${esc(b.label)}<small>${esc(b.who)}</small></div>`).join('')}</div>
     </div>
     ${r.doneMessage ? `<div style="margin-top:14px">
