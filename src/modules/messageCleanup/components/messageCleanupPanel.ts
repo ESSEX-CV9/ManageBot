@@ -24,8 +24,10 @@ import {
     createJob,
     findActiveJob,
     getSettings,
+    isJobListClearing,
     listJobs,
     pauseJob,
+    requestJobListClear,
     resumeJob,
     setManageRoleIds,
 } from '../services/messageCleanupDatabase';
@@ -49,6 +51,7 @@ const ID = {
     PAUSE: 'mc_pause',
     RESUME: 'mc_resume',
     CANCEL: 'mc_cancel',
+    CLEAR: 'mc_clear',
     ROLES: 'mc_roles',
     TIME_MODAL: 'mc_time_modal',
     TIME_INPUT: 'mc_time_input',
@@ -108,6 +111,13 @@ function resetDraft(guildId: string, userId: string): CleanupDraft {
     const draft = freshDraft();
     drafts.set(draftKey(guildId, userId), draft);
     return draft;
+}
+
+function clearGuildDrafts(guildId: string): void {
+    const prefix = `${guildId}:`;
+    for (const key of drafts.keys()) {
+        if (key.startsWith(prefix)) drafts.delete(key);
+    }
 }
 
 function memberOf(interaction: ButtonInteraction | AnySelectMenuInteraction | ModalSubmitInteraction): GuildMember | null {
@@ -253,7 +263,19 @@ const STATUS_LABEL: Record<CleanupJobStatus, string> = {
     failed: '❌ 失败',
 };
 
+function jobStage(job: CleanupJob, scanFinished: boolean): string {
+    if (job.status === 'completed') return '完整核验与删除队列均已结束';
+    if (job.status === 'cancelled') return '任务已取消，待删除队列已停止';
+    if (job.status === 'failed') return '任务因异常停止';
+    if (job.status === 'paused') return scanFinished ? '扫描已完成，删除队列已暂停' : '扫描器与删除器均已暂停';
+    if (job.status === 'queued') return scanFinished ? '扫描已完成，等待删除器继续' : '等待扫描器与删除器开始或继续';
+    if (scanFinished) return '扫描已完成，删除器正在清空待删除队列';
+    if (job.scanMode === 'search') return '扫描器：快速搜索；删除器：并行工作中';
+    return `扫描器：完整核验 ${Math.min(job.cursorBatch + 1, Math.max(job.scopeCount, 1))}/${Math.max(job.scopeCount, 1)}；删除器：并行工作中`;
+}
+
 function jobLine(job: CleanupJob): string {
+    const active = job.status === 'queued' || job.status === 'running' || job.status === 'paused';
     const scanFinished = job.scanCompletedAt !== null || job.status === 'completed';
     const foundLabel = scanFinished
         ? '最终找到'
@@ -263,27 +285,17 @@ function jobLine(job: CleanupJob): string {
     const counts = `${foundLabel} ${job.foundCount} / 待删除 ${job.pendingCount} / 已删除 ${job.deletedCount} / 跳过 ${job.skippedCount} / 失败 ${job.failedCount}`;
     const error = job.error ? `\n错误：${job.error.slice(0, 180)}` : '';
     const warning = job.warningText ? '　⚠️ 有提示' : '';
-    const stage = job.status === 'completed'
-        ? '完整核验与删除队列均已结束'
-        : job.status === 'cancelled'
-            ? '任务已取消，待删除队列已停止'
-        : job.status === 'failed'
-            ? '任务因异常停止'
-        : job.status === 'paused'
-            ? scanFinished ? '扫描已完成，删除队列已暂停' : '扫描器与删除器均已暂停'
-        : job.status === 'queued'
-            ? scanFinished ? '扫描已完成，等待删除器继续' : '等待扫描器与删除器开始或继续'
-        : job.scanCompletedAt !== null
-            ? '扫描已完成，删除器正在清空待删除队列'
-        : job.scanMode === 'search'
-            ? '扫描器：快速搜索；删除器：并行工作中'
-            : `扫描器：完整核验 ${Math.min(job.cursorBatch + 1, Math.max(job.scopeCount, 1))}/${Math.max(job.scopeCount, 1)}；删除器：并行工作中`;
-    return `**#${job.id} ${STATUS_LABEL[job.status]}**　<@${job.targetUserId}>${warning}\n${counts}\n${stage}　范围 ${job.scopeCount || '待展开'} 个频道/子区${error}`;
+    const stage = jobStage(job, scanFinished);
+    const heading = active
+        ? `#${job.id} ${STATUS_LABEL[job.status]}　<@${job.targetUserId}>`
+        : STATUS_LABEL[job.status];
+    return `**${heading}**${warning}\n${counts}\n${stage}　范围 ${job.scopeCount || '待展开'} 个频道/子区${error}`;
 }
 
-function tasksView(guildId: string): InteractionUpdateOptions {
-    const jobs = listJobs(guildId, 10);
-    const active = findActiveJob(guildId);
+function tasksView(guildId: string, notice?: string): InteractionUpdateOptions {
+    const clearing = isJobListClearing(guildId);
+    const jobs = clearing ? [] : listJobs(guildId, 10);
+    const active = clearing ? null : findActiveJob(guildId);
     const lines = jobs.length ? jobs.map(jobLine).join('\n\n') : '_还没有冲水任务。_';
     const detail = active?.warningText
         ? `\n\n**当前任务提示：**\n${active.warningText.slice(0, 700)}`
@@ -302,10 +314,13 @@ function tasksView(guildId: string): InteractionUpdateOptions {
             new ButtonBuilder().setCustomId(ID.CANCEL).setLabel('取消任务').setStyle(ButtonStyle.Danger),
         );
     }
+    if (jobs.length > 0) {
+        buttons.push(new ButtonBuilder().setCustomId(ID.CLEAR).setLabel('清空列表').setStyle(ButtonStyle.Secondary));
+    }
     buttons.push(new ButtonBuilder().setCustomId(ID.HOME).setLabel('返回').setStyle(ButtonStyle.Secondary));
 
     return {
-        content: (`## 📋 冲水任务\n_扫描和删除相互独立；“待删除”会持续被后台删除器消费。扫描完成后“最终找到”才是完整数量。_\n\n${lines}${detail}`).slice(0, 2000),
+        content: (`${notice ? `${notice}\n\n` : ''}## 📋 冲水任务\n_扫描和删除相互独立；“待删除”会持续被后台删除器消费。扫描完成后“最终找到”才是完整数量。_\n\n${lines}${detail}`).slice(0, 2000),
         components: [new ActionRowBuilder<ButtonBuilder>().addComponents(...buttons)],
     };
 }
@@ -480,19 +495,30 @@ export async function handleCleanupButton(interaction: ButtonInteraction): Promi
         return;
     }
 
+    if (interaction.customId === ID.CLEAR) {
+        const result = requestJobListClear(guildId, interaction.user.id);
+        if (!result.accepted) {
+            await interaction.update(tasksView(guildId, '列表暂时无法更新，请稍后再试。'));
+            return;
+        }
+        clearGuildDrafts(guildId);
+        await interaction.update(tasksView(guildId));
+        return;
+    }
+
     const active = findActiveJob(guildId);
     if (interaction.customId === ID.PAUSE) {
-        if (active) pauseJob(active.id);
+        if (active) pauseJob(active.id, interaction.user.id);
         await interaction.update(tasksView(guildId));
         return;
     }
     if (interaction.customId === ID.RESUME) {
-        if (active) resumeJob(active.id);
+        if (active) resumeJob(active.id, interaction.user.id);
         await interaction.update(tasksView(guildId));
         return;
     }
     if (interaction.customId === ID.CANCEL) {
-        if (active) cancelJob(active.id);
+        if (active) cancelJob(active.id, interaction.user.id);
         await interaction.update(tasksView(guildId));
         return;
     }
@@ -524,6 +550,10 @@ export async function handleCleanupButton(interaction: ButtonInteraction): Promi
             cutoffAt: cutoff.timestamp,
             cutoffLabel: cutoff.label,
         });
+        if (!result.job) {
+            await interaction.editReply(mainView(guildId, interaction.user.id, configurable, '列表正在更新，请稍后再试。'));
+            return;
+        }
         const prefix = result.created
             ? `✅ 已启动紧急冲水任务 #${result.job.id}。\n\n`
             : `⚠️ 本服务器已有未结束的任务 #${result.job.id}，未重复创建。\n\n`;

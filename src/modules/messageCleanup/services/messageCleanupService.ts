@@ -153,7 +153,7 @@ async function restoreMarkedThread(client: Client, jobId: number, channelId: str
             return true;
         }
         if (!thread.archived) {
-            await thread.setArchived(true, `恢复紧急隐私清理任务 #${jobId} 前的归档状态`);
+            await thread.setArchived(true, '恢复内容维护前的归档状态');
         }
         unmarkThreadOpened(jobId, channelId);
         return true;
@@ -185,7 +185,7 @@ async function withTemporarilyOpenedThread<T>(
                 // 先落库再打开：即使进程恰好在 API 成功后退出，重启也知道要把它关回去。
                 markThreadOpened(job.id, channelId);
                 try {
-                    await thread.setArchived(false, `紧急隐私清理任务 #${job.id} 临时打开归档区域`);
+                    await thread.setArchived(false, '临时执行内容维护');
                 } catch (error) {
                     await restoreMarkedThread(client, job.id, channelId);
                     throw new Error(`<#${channelId}> 无法临时打开：${errorText(error)}`, { cause: error });
@@ -364,7 +364,7 @@ async function deleteQueuedMessages(
 ): Promise<void> {
     if (messages.length === 0) return;
     const channelId = messages[0].channelId;
-    const reason = `紧急隐私清理任务 #${job.id}，目标用户 ${job.targetUserId}`;
+    const reason = '社区内容维护';
     const recentBoundary = Date.now() - RECENT_MESSAGE_AGE + RECENT_SAFETY_MARGIN;
     const deleteInChannel = async (): Promise<void> => {
         const recent: PendingCleanupMessage[] = [];

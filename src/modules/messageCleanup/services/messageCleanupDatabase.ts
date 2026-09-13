@@ -2,6 +2,7 @@ import path from 'path';
 import Database from 'better-sqlite3';
 
 import { DATA_DIR } from '../../../core/utils/database';
+import { appendRuntimeFileRecord } from '../../../core/utils/runtimeFileLog';
 import type {
     CleanupJob,
     CleanupJobStatus,
@@ -81,6 +82,13 @@ db.exec(`
 
     CREATE INDEX IF NOT EXISTS idx_mc_job_message_outcome
         ON mc_job_message(job_id, outcome);
+
+    -- 面板清空请求只在执行器安全退出前短暂存在，完成后整行移除。
+    CREATE TABLE IF NOT EXISTS mc_list_clear (
+        guild_id        TEXT PRIMARY KEY,
+        requested_by    TEXT NOT NULL,
+        requested_at    INTEGER NOT NULL
+    );
 `);
 
 function ensureColumn(table: string, column: string, definition: string): void {
@@ -186,6 +194,34 @@ function mapJob(row: JobRow): CleanupJob {
     };
 }
 
+function taskLogDetails(job: CleanupJob): Record<string, unknown> {
+    return {
+        task_id: job.id,
+        guild_id: job.guildId,
+        actor_id: job.actorId,
+        target_user_id: job.targetUserId,
+        selected_channel_ids: job.selectedChannelIds,
+        excluded_channel_ids: job.excludedChannelIds,
+        include_threads: job.includeThreads,
+        cutoff_at: job.cutoffAt,
+        cutoff_label: job.cutoffLabel,
+        status: job.status,
+        scan_mode: job.scanMode,
+        scan_completed_at: job.scanCompletedAt,
+        scope_channel_ids: job.scopeChannelIds,
+        found_count: job.foundCount,
+        pending_count: job.pendingCount,
+        deleted_count: job.deletedCount,
+        skipped_count: job.skippedCount,
+        failed_count: job.failedCount,
+        warning: job.warningText,
+        error: job.error,
+        created_at: job.createdAt,
+        started_at: job.startedAt,
+        finished_at: job.finishedAt,
+    };
+}
+
 export function getSettings(guildId: string): CleanupSettings {
     const row = db.prepare('SELECT * FROM mc_settings WHERE guild_id = ?').get(guildId) as SettingsRow | undefined;
     return mapSettings(row, guildId);
@@ -229,9 +265,16 @@ export function listJobs(guildId: string, limit = 10): CleanupJob[] {
     return rows.map(mapJob);
 }
 
-const createJobTransaction = db.transaction((input: CreateCleanupJobInput): { job: CleanupJob; created: boolean } => {
+export interface CreateCleanupJobResult {
+    job: CleanupJob | null;
+    created: boolean;
+    clearing: boolean;
+}
+
+const createJobTransaction = db.transaction((input: CreateCleanupJobInput): CreateCleanupJobResult => {
+    if (isJobListClearing(input.guildId)) return { job: null, created: false, clearing: true };
     const active = findActiveJob(input.guildId);
-    if (active) return { job: active, created: false };
+    if (active) return { job: active, created: false, clearing: false };
 
     const now = Date.now();
     const result = db.prepare(`
@@ -252,11 +295,13 @@ const createJobTransaction = db.transaction((input: CreateCleanupJobInput): { jo
         now,
         now,
     );
-    return { job: getJob(Number(result.lastInsertRowid))!, created: true };
+    return { job: getJob(Number(result.lastInsertRowid))!, created: true, clearing: false };
 });
 
-export function createJob(input: CreateCleanupJobInput): { job: CleanupJob; created: boolean } {
-    return createJobTransaction(input);
+export function createJob(input: CreateCleanupJobInput): CreateCleanupJobResult {
+    const result = createJobTransaction(input);
+    if (result.created && result.job) appendRuntimeFileRecord('maintenance.task_created', taskLogDetails(result.job));
+    return result;
 }
 
 export function claimJob(jobId: number): CleanupJob | null {
@@ -318,10 +363,12 @@ export function updateCursor(jobId: number, batch: number, cursorId: string | nu
 
 export function markScanCompleted(jobId: number): void {
     const now = Date.now();
-    db.prepare(`
+    const changed = db.prepare(`
         UPDATE mc_job SET scan_completed_at = COALESCE(scan_completed_at, ?), updated_at = ?
-        WHERE id = ?
-    `).run(now, now, jobId);
+        WHERE id = ? AND scan_completed_at IS NULL
+    `).run(now, now, jobId).changes > 0;
+    const job = changed ? getJob(jobId) : null;
+    if (job) appendRuntimeFileRecord('maintenance.scan_completed', taskLogDetails(job));
 }
 
 export type CleanupMessageOutcome = 'pending' | 'deleted' | 'skipped' | 'failed';
@@ -495,34 +542,144 @@ export function listRestorableOpenedThreads(): OpenedThreadRecord[] {
     return rows.map(row => ({ jobId: row.job_id, guildId: row.guild_id, channelId: row.channel_id }));
 }
 
+export interface JobListClearRequest {
+    guildId: string;
+    requestedBy: string;
+    requestedAt: number;
+}
+
+export interface RequestJobListClearResult {
+    accepted: boolean;
+    jobCount: number;
+}
+
+export function isJobListClearing(guildId: string): boolean {
+    return Boolean(db.prepare('SELECT 1 FROM mc_list_clear WHERE guild_id = ?').get(guildId));
+}
+
+export function requestJobListClear(guildId: string, actorId: string): RequestJobListClearResult {
+    const rows = db.prepare('SELECT * FROM mc_job WHERE guild_id = ? ORDER BY created_at ASC')
+        .all(guildId) as JobRow[];
+    const jobs = rows.map(mapJob);
+    if (jobs.length === 0) return { accepted: true, jobCount: 0 };
+    if (isJobListClearing(guildId)) return { accepted: true, jobCount: jobs.length };
+
+    // 在改变任务状态前先落一份完整快照；写盘失败时保留数据库记录，不静默丢失留档。
+    const recorded = appendRuntimeFileRecord('maintenance.list_clear_requested', {
+        guild_id: guildId,
+        action_by: actorId,
+        tasks: jobs.map(taskLogDetails),
+    });
+    if (!recorded) return { accepted: false, jobCount: jobs.length };
+
+    const now = Date.now();
+    db.transaction(() => {
+        db.prepare(`
+            INSERT INTO mc_list_clear (guild_id, requested_by, requested_at)
+            VALUES (?, ?, ?)
+            ON CONFLICT(guild_id) DO NOTHING
+        `).run(guildId, actorId, now);
+        db.prepare(`
+            UPDATE mc_job SET status = 'cancelled', finished_at = ?, updated_at = ?
+            WHERE guild_id = ? AND status IN ('queued', 'running', 'paused')
+        `).run(now, now, guildId);
+    })();
+    return { accepted: true, jobCount: jobs.length };
+}
+
+export function listJobListClearRequests(): JobListClearRequest[] {
+    const rows = db.prepare(`
+        SELECT guild_id, requested_by, requested_at FROM mc_list_clear ORDER BY requested_at ASC
+    `).all() as { guild_id: string; requested_by: string; requested_at: number }[];
+    return rows.map(row => ({
+        guildId: row.guild_id,
+        requestedBy: row.requested_by,
+        requestedAt: row.requested_at,
+    }));
+}
+
+export function hasOpenedThreadsForGuild(guildId: string): boolean {
+    return Boolean(db.prepare(`
+        SELECT 1
+        FROM mc_opened_thread t
+        JOIN mc_job j ON j.id = t.job_id
+        WHERE j.guild_id = ?
+        LIMIT 1
+    `).get(guildId));
+}
+
+export function completeJobListClear(request: JobListClearRequest): boolean {
+    if (hasOpenedThreadsForGuild(request.guildId)) return false;
+    const rows = db.prepare('SELECT * FROM mc_job WHERE guild_id = ? ORDER BY created_at ASC')
+        .all(request.guildId) as JobRow[];
+    const jobs = rows.map(mapJob);
+    const recorded = appendRuntimeFileRecord('maintenance.list_cleared', {
+        guild_id: request.guildId,
+        action_by: request.requestedBy,
+        requested_at: request.requestedAt,
+        tasks: jobs.map(taskLogDetails),
+    });
+    if (!recorded) return false;
+
+    db.transaction(() => {
+        db.prepare(`
+            DELETE FROM mc_job_message
+            WHERE job_id IN (SELECT id FROM mc_job WHERE guild_id = ?)
+        `).run(request.guildId);
+        db.prepare(`
+            DELETE FROM mc_opened_thread
+            WHERE job_id IN (SELECT id FROM mc_job WHERE guild_id = ?)
+        `).run(request.guildId);
+        db.prepare('DELETE FROM mc_job WHERE guild_id = ?').run(request.guildId);
+        db.prepare('DELETE FROM mc_list_clear WHERE guild_id = ?').run(request.guildId);
+        const remaining = db.prepare('SELECT COUNT(*) AS count FROM mc_job').get() as { count: number };
+        if (remaining.count === 0) db.prepare("DELETE FROM sqlite_sequence WHERE name = 'mc_job'").run();
+    })();
+    return true;
+}
+
 export function setJobStatus(jobId: number, status: CleanupJobStatus, error: string | null = null): void {
+    const before = getJob(jobId);
     const terminal = status === 'completed' || status === 'cancelled' || status === 'failed';
-    db.prepare(`
+    const changed = db.prepare(`
         UPDATE mc_job SET
             status = ?, error = ?,
             finished_at = CASE WHEN ? THEN ? ELSE finished_at END,
             updated_at = ?
         WHERE id = ?
-    `).run(status, error, terminal ? 1 : 0, Date.now(), Date.now(), jobId);
+    `).run(status, error, terminal ? 1 : 0, Date.now(), Date.now(), jobId).changes > 0;
+    if (changed && before?.status !== status) {
+        const job = getJob(jobId);
+        if (job) appendRuntimeFileRecord(`maintenance.task_${status}`, taskLogDetails(job));
+    }
 }
 
-export function pauseJob(jobId: number): boolean {
-    return db.prepare(`
+export function pauseJob(jobId: number, actorId?: string): boolean {
+    const changed = db.prepare(`
         UPDATE mc_job SET status = 'paused', updated_at = ?
         WHERE id = ? AND status IN ('queued', 'running')
     `).run(Date.now(), jobId).changes > 0;
+    const job = changed ? getJob(jobId) : null;
+    if (job) appendRuntimeFileRecord('maintenance.task_paused', { ...taskLogDetails(job), action_by: actorId ?? null });
+    return changed;
 }
 
-export function resumeJob(jobId: number): boolean {
-    return db.prepare(`
+export function resumeJob(jobId: number, actorId?: string): boolean {
+    const changed = db.prepare(`
         UPDATE mc_job SET status = 'queued', updated_at = ?
         WHERE id = ? AND status = 'paused'
     `).run(Date.now(), jobId).changes > 0;
+    const job = changed ? getJob(jobId) : null;
+    if (job) appendRuntimeFileRecord('maintenance.task_resumed', { ...taskLogDetails(job), action_by: actorId ?? null });
+    return changed;
 }
 
-export function cancelJob(jobId: number): boolean {
-    return db.prepare(`
+export function cancelJob(jobId: number, actorId?: string): boolean {
+    const changed = db.prepare(`
         UPDATE mc_job SET status = 'cancelled', finished_at = ?, updated_at = ?
         WHERE id = ? AND status IN ('queued', 'running', 'paused')
     `).run(Date.now(), Date.now(), jobId).changes > 0;
+    const job = changed ? getJob(jobId) : null;
+    if (job) appendRuntimeFileRecord('maintenance.task_cancelled', { ...taskLogDetails(job), action_by: actorId ?? null });
+    return changed;
 }

@@ -2,6 +2,9 @@ import type { Client } from 'discord.js';
 
 import {
     claimJob,
+    completeJobListClear,
+    hasOpenedThreadsForGuild,
+    listJobListClearRequests,
     listRunnableJobs,
     recoverInterruptedJobs,
 } from './messageCleanupDatabase';
@@ -17,6 +20,11 @@ export async function tickMessageCleanup(client: Client): Promise<void> {
     ticking = true;
     try {
         await restoreDanglingArchivedThreads(client, runningGuildIds);
+        for (const request of listJobListClearRequests()) {
+            if (runningGuildIds.has(request.guildId)) continue;
+            if (hasOpenedThreadsForGuild(request.guildId)) continue;
+            completeJobListClear(request);
+        }
         for (const pending of listRunnableJobs()) {
             if (runningGuildIds.has(pending.guildId)) continue;
             const claimed = claimJob(pending.id);
