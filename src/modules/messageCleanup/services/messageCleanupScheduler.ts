@@ -11,6 +11,7 @@ import {
 import { executeCleanupJob, restoreDanglingArchivedThreads } from './messageCleanupService';
 
 const TICK_MS = 2_000;
+const LIST_CLEAR_RESTORE_GRACE_MS = 30_000;
 let timer: NodeJS.Timeout | null = null;
 let ticking = false;
 const runningGuildIds = new Set<string>();
@@ -19,6 +20,14 @@ export async function tickMessageCleanup(client: Client): Promise<void> {
     if (ticking) return;
     ticking = true;
     try {
+        const clearRequests = listJobListClearRequests();
+        // 旧请求先强制收尾，避免重启后又被不可访问的归档子区拖住。
+        for (const request of clearRequests) {
+            if (Date.now() - request.requestedAt >= LIST_CLEAR_RESTORE_GRACE_MS) {
+                completeJobListClear(request, true);
+            }
+        }
+
         await restoreDanglingArchivedThreads(client, runningGuildIds);
         for (const request of listJobListClearRequests()) {
             if (runningGuildIds.has(request.guildId)) continue;

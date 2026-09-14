@@ -614,8 +614,15 @@ export function hasOpenedThreadsForGuild(guildId: string): boolean {
     `).get(guildId));
 }
 
-export function completeJobListClear(request: JobListClearRequest): boolean {
-    if (hasOpenedThreadsForGuild(request.guildId)) return false;
+export function completeJobListClear(request: JobListClearRequest, allowUnrestoredThreads = false): boolean {
+    const openedRows = db.prepare(`
+        SELECT t.channel_id
+        FROM mc_opened_thread t
+        JOIN mc_job j ON j.id = t.job_id
+        WHERE j.guild_id = ?
+        ORDER BY t.opened_at ASC
+    `).all(request.guildId) as { channel_id: string }[];
+    if (openedRows.length > 0 && !allowUnrestoredThreads) return false;
     const rows = db.prepare('SELECT * FROM mc_job WHERE guild_id = ? ORDER BY created_at ASC')
         .all(request.guildId) as JobRow[];
     const jobs = rows.map(mapJob);
@@ -623,9 +630,11 @@ export function completeJobListClear(request: JobListClearRequest): boolean {
         guild_id: request.guildId,
         action_by: request.requestedBy,
         requested_at: request.requestedAt,
+        unrestored_thread_ids: openedRows.map(row => row.channel_id),
         tasks: jobs.map(taskLogDetails),
     });
-    if (!recorded) return false;
+    // 请求建立时已经写过完整快照；强制收尾阶段不能因第二份完成记录写入失败而永久锁住任务系统。
+    if (!recorded && !allowUnrestoredThreads) return false;
 
     db.transaction(() => {
         db.prepare(`

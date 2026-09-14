@@ -50,6 +50,8 @@ interface DeleteResult {
 }
 
 const SEARCH_CHANNEL_BATCH = 100;
+const SEARCH_INDEX_MAX_ATTEMPTS = 3;
+const SEARCH_INDEX_MAX_WAIT_MS = 5_000;
 const RECENT_MESSAGE_AGE = 14 * 24 * 60 * 60_000;
 const RECENT_SAFETY_MARGIN = 60_000;
 const DEFAULT_HISTORY_PAGE_INTERVAL_MS = 1_100;
@@ -419,11 +421,11 @@ async function runDeletionWorker(client: Client, jobId: number): Promise<void> {
     }
 }
 
-function flattenSearchMessages(response: SearchResponse, job: CleanupJob, scope: Set<string>): ApiMessage[] {
+function flattenSearchMessages(response: SearchResponse, job: CleanupJob): ApiMessage[] {
     const result = new Map<string, ApiMessage>();
     for (const group of response.messages ?? []) {
         for (const message of group) {
-            if (message.author?.id !== job.targetUserId || !scope.has(message.channel_id)) continue;
+            if (message.author?.id !== job.targetUserId) continue;
             result.set(`${message.channel_id}:${message.id}`, message);
         }
     }
@@ -436,12 +438,11 @@ async function searchPage(
     channelIds: string[],
     maxId: string,
 ): Promise<ApiMessage[]> {
-    for (let attempt = 0; attempt < 15; attempt++) {
+    for (let attempt = 0; attempt < SEARCH_INDEX_MAX_ATTEMPTS; attempt++) {
         const query = new URLSearchParams();
         query.set('limit', '25');
         query.set('sort_by', 'timestamp');
         query.set('sort_order', 'desc');
-        query.set('include_nsfw', 'true');
         query.set('max_id', maxId);
         query.append('author_id', job.targetUserId);
         for (const channelId of channelIds) query.append('channel_id', channelId);
@@ -449,16 +450,22 @@ async function searchPage(
         const response = await client.rest.get(`/guilds/${job.guildId}/messages/search`, { query }) as SearchResponse;
         if (response.code === 110000) {
             const seconds = Number(response.retry_after);
-            await wait(Number.isFinite(seconds) && seconds > 0 ? Math.min(seconds * 1000, 10_000) : 2_000);
+            await wait(Number.isFinite(seconds) && seconds > 0
+                ? Math.min(seconds * 1000, SEARCH_INDEX_MAX_WAIT_MS)
+                : 2_000);
             continue;
         }
-        return flattenSearchMessages(response, job, new Set(channelIds));
+        return flattenSearchMessages(response, job);
     }
     throw new Error('Discord 消息搜索索引长时间未就绪');
 }
 
 async function runSearchScan(client: Client, initialJob: CleanupJob): Promise<void> {
-    const channelBatches = chunks(initialJob.scopeChannelIds, SEARCH_CHANNEL_BATCH);
+    // 全服任务直接使用 Discord 的服务器级作者搜索。候选写库时仍按已解析范围过滤，
+    // 因此排除项不会被删除；同时避免给一次搜索附带数百个 channel_id。
+    const channelBatches = initialJob.entireGuild
+        ? [[]]
+        : chunks(initialJob.scopeChannelIds, SEARCH_CHANNEL_BATCH);
     const cutoffId = snowflakeAt(initialJob.cutoffAt);
 
     for (let batchIndex = initialJob.cursorBatch; batchIndex < channelBatches.length; batchIndex++) {

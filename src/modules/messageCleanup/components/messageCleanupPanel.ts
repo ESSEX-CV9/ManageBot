@@ -277,6 +277,9 @@ function jobStage(job: CleanupJob, scanFinished: boolean): string {
     if (job.status === 'failed') return '任务因异常停止';
     if (job.status === 'paused') return scanFinished ? '扫描已完成，删除队列已暂停' : '扫描器与删除器均已暂停';
     if (job.status === 'queued') return scanFinished ? '扫描已完成，等待删除器继续' : '等待扫描器与删除器开始或继续';
+    if (job.scopeChannelIds.length === 0) {
+        return job.entireGuild ? '正在展开全服务器范围（包括归档子区与帖子）' : '正在展开所选清理范围';
+    }
     if (scanFinished) return '扫描已完成，删除器正在清空待删除队列';
     if (job.scanMode === 'search') return '扫描器：快速搜索；删除器：并行工作中';
     return `扫描器：完整核验 ${Math.min(job.cursorBatch + 1, Math.max(job.scopeCount, 1))}/${Math.max(job.scopeCount, 1)}；删除器：并行工作中`;
@@ -572,7 +575,10 @@ export async function handleCleanupButton(interaction: ButtonInteraction): Promi
             cutoffLabel: cutoff.label,
         });
         if (!result.job) {
-            await interaction.editReply(mainView(guildId, interaction.user.id, configurable, '列表正在更新，请稍后再试。'));
+            const notice = result.clearing
+                ? '上一轮列表正在收尾，最迟约 30 秒后可创建新任务。'
+                : '任务暂时无法创建，请稍后再试。';
+            await interaction.editReply(mainView(guildId, interaction.user.id, configurable, notice));
             return;
         }
         const prefix = result.created

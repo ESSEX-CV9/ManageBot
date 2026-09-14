@@ -26,6 +26,23 @@ const PARENT_TYPES = new Set<ChannelType>([
     ChannelType.GuildMedia,
 ]);
 
+const ARCHIVE_FETCH_CONCURRENCY = 4;
+
+async function forEachConcurrent<T>(
+    items: T[],
+    concurrency: number,
+    action: (item: T) => Promise<void>,
+): Promise<void> {
+    let index = 0;
+    const workers = Array.from({ length: Math.min(concurrency, items.length) }, async () => {
+        while (index < items.length) {
+            const item = items[index++];
+            await action(item);
+        }
+    });
+    await Promise.all(workers);
+}
+
 function isParentChannel(channel: GuildBasedChannel): channel is ParentChannel {
     return PARENT_TYPES.has(channel.type);
 }
@@ -128,8 +145,9 @@ export async function resolveCleanupScope(guild: Guild, job: CleanupJob): Promis
         }
     }
 
-    for (const parent of parents.values()) {
-        if (isExcluded(parent, excluded)) continue;
+    const includedParents = [...parents.values()].filter(parent => !isExcluded(parent, excluded));
+    const archiveParents: ParentChannel[] = [];
+    for (const parent of includedParents) {
         const isForumLike = parent.type === ChannelType.GuildForum || parent.type === ChannelType.GuildMedia;
         if (!isForumLike) {
             const missing = canReadAndDelete(guild, parent);
@@ -149,6 +167,12 @@ export async function resolveCleanupScope(guild: Guild, job: CleanupJob): Promis
             }
         }
 
+        archiveParents.push(parent);
+    }
+
+    // 不同父频道的归档列表使用有限并发展开；Discord.js 仍负责各路由桶的限流。
+    // 这可以避免全服任务在正式搜索前，因逐个探测大量空频道而等待数分钟。
+    await forEachConcurrent(archiveParents, ARCHIVE_FETCH_CONCURRENCY, async parent => {
         try {
             for (const thread of await fetchAllArchived(parent, 'public')) allThreads.set(thread.id, thread);
         } catch (error) {
@@ -162,7 +186,7 @@ export async function resolveCleanupScope(guild: Guild, job: CleanupJob): Promis
                 warnings.push(`<#${parent.id}> 的归档私密子区读取失败（通常是缺少“管理子区”权限）`);
             }
         }
-    }
+    });
 
     const resolved = new Set<string>();
     for (const parent of parents.values()) {
