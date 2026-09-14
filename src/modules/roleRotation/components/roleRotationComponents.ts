@@ -51,12 +51,14 @@ export async function handleRoleRotationButton(interaction: ButtonInteraction): 
     ] as const) {
         const roundId = readRoundId(interaction.customId, prefix);
         if (roundId !== null) {
+            // 回答要先落库，失败提示又必须仅本人可见，因此先私密确认交互；
+            // 成功后再单独向当前频道发布公开确认。
+            await interaction.deferReply({ flags: MessageFlags.Ephemeral });
             const result = submitInquiryResponse(interaction.guildId, roundId, interaction.user.id, response);
             if (!result.ok || !result.round) {
                 const failure = `⚠️ ${result.message}`;
-                await interaction.reply({
+                await interaction.editReply({
                     content: failure,
-                    flags: MessageFlags.Ephemeral,
                     allowedMentions: { parse: [] },
                 });
                 await trySendDmNotice(interaction, failure);
@@ -65,16 +67,35 @@ export async function handleRoleRotationButton(interaction: ButtonInteraction): 
             const publicContent = response === 'keep'
                 ? `✅ <@${interaction.user.id}> 已确认继续担任 <@&${result.round.roleId}>。`
                 : `👋 <@${interaction.user.id}> 已确认不再担任 <@&${result.round.roleId}>，将在本轮结束时卸任。`;
-            await interaction.reply({
-                content: publicContent,
-                allowedMentions: { users: [interaction.user.id], roles: [], repliedUser: false },
-            });
+            if (interaction.channel?.isSendable()) {
+                try {
+                    await interaction.channel.send({
+                        content: publicContent,
+                        allowedMentions: { users: [interaction.user.id], roles: [], repliedUser: false },
+                    });
+                    await interaction.editReply({
+                        content: '✅ 你的选择已记录，并已在当前频道公开确认。',
+                        allowedMentions: { parse: [] },
+                    });
+                } catch (error) {
+                    console.warn(`[RoleRotation] 留任回答已记录但公开通知发送失败 round=${roundId}:`, error);
+                    const warning = '✅ 你的选择已记录，但公开确认发送失败，请联系管理员检查频道权限。';
+                    await interaction.editReply({ content: warning, allowedMentions: { parse: [] } });
+                    await trySendDmNotice(interaction, warning);
+                }
+            } else {
+                const warning = '✅ 你的选择已记录，但当前频道无法发送公开确认。';
+                await interaction.editReply({ content: warning, allowedMentions: { parse: [] } });
+                await trySendDmNotice(interaction, warning);
+            }
             return;
         }
     }
 
     const applyRoundId = readRoundId(interaction.customId, ROTATION_IDS.APPLY);
     if (applyRoundId !== null) {
+        // 资格检查可能触发服务器、成员或身份组 REST 请求，必须在检查前确认交互。
+        await interaction.deferReply({ flags: MessageFlags.Ephemeral });
         const result = await previewApplication(
             interaction.client,
             interaction.guildId,
@@ -83,17 +104,15 @@ export async function handleRoleRotationButton(interaction: ButtonInteraction): 
         );
         if (!result.ok || !result.round || !result.config) {
             const failure = `⚠️ ${result.message}`;
-            await interaction.reply({
+            await interaction.editReply({
                 content: failure,
-                flags: MessageFlags.Ephemeral,
                 allowedMentions: { parse: [] },
             });
             await trySendDmNotice(interaction, failure);
             return;
         }
-        await interaction.reply({
+        await interaction.editReply({
             ...buildApplicationConfirmation(result.config, result.round),
-            flags: MessageFlags.Ephemeral,
         });
         return;
     }

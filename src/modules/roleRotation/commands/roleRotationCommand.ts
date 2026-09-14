@@ -3,6 +3,7 @@ import {
     MessageFlags,
     SlashCommandBuilder,
     type GuildMember,
+    type InteractionReplyOptions,
     type Role,
 } from 'discord.js';
 import type { Command } from '../../../core/types';
@@ -225,11 +226,27 @@ function auditLabel(event: string): string {
 const command: Command = {
     data,
     async execute(interaction) {
+        // 该命令的部分子命令会访问 Discord REST、扫描成员或等待配置锁。
+        // 先确认交互，避免这些操作在 REST 排队时超过 Discord 的首次响应时限。
+        await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+        const reply = (options: InteractionReplyOptions) => {
+            // 首次响应已固定为 ephemeral；editReply 不接受首次响应专用字段。
+            const {
+                ephemeral: _ephemeral,
+                flags: _flags,
+                tts: _tts,
+                withResponse: _withResponse,
+                fetchReply: _fetchReply,
+                ...editOptions
+            } = options;
+            return interaction.editReply(editOptions);
+        };
+
         if (!interaction.guild || !interaction.guildId) {
-            return interaction.reply({ content: '❌ 此命令只能在服务器中使用。', flags: MessageFlags.Ephemeral });
+            return reply({ content: '❌ 此命令只能在服务器中使用。', flags: MessageFlags.Ephemeral });
         }
         if (!checkAdminPermission(interaction.member as GuildMember | null)) {
-            return interaction.reply({ content: getPermissionDeniedMessage(), flags: MessageFlags.Ephemeral });
+            return reply({ content: getPermissionDeniedMessage(), flags: MessageFlags.Ephemeral });
         }
 
         const guild = interaction.guild;
@@ -239,13 +256,13 @@ const command: Command = {
             const role = interaction.options.getRole('身份组', true) as Role;
             const capacity = interaction.options.getInteger('人数上限', true);
             if (role.id === guild.id || role.managed) {
-                return interaction.reply({ content: '❌ 不能管理 @everyone 或由外部集成托管的身份组。', flags: MessageFlags.Ephemeral });
+                return reply({ content: '❌ 不能管理 @everyone 或由外部集成托管的身份组。', flags: MessageFlags.Ephemeral });
             }
             if (getConfigByRole(guild.id, role.id)) {
-                return interaction.reply({ content: '⚠️ 这个身份组已经有轮替配置。', flags: MessageFlags.Ephemeral });
+                return reply({ content: '⚠️ 这个身份组已经有轮替配置。', flags: MessageFlags.Ephemeral });
             }
             if (!guild.members.me || !role.editable) {
-                return interaction.reply({
+                return reply({
                     content: '❌ 机器人当前无法增删这个身份组。请授予“管理身份组”权限，并把机器人身份组移动到目标身份组上方。',
                     flags: MessageFlags.Ephemeral,
                 });
@@ -254,7 +271,7 @@ const command: Command = {
             const config = createConfig({ guildId: guild.id, managedRoleId: role.id, capacity, nextRunAt, createdBy: interaction.user.id });
             syncRoleMembers(config, role);
             addAudit({ guildId: guild.id, configId: config.id, actorId: interaction.user.id, event: 'config_created', detail: `capacity=${capacity}` });
-            return interaction.reply({
+            return reply({
                 content: `✅ 已为 ${role} 创建轮替配置。默认每月 15 日 09:00（Asia/Shanghai）问询 48 小时。\n下一步请分别添加至少一个通知频道和招募频道，并按需设置最低入服天数与冲突身份组。`,
                 flags: MessageFlags.Ephemeral,
                 allowedMentions: { parse: [] },
@@ -263,22 +280,22 @@ const command: Command = {
 
         if (sub === '删除') {
             const found = getConfiguredRole(interaction);
-            if (!found) return interaction.reply({ content: '❌ 该身份组没有轮替配置。', flags: MessageFlags.Ephemeral });
+            if (!found) return reply({ content: '❌ 该身份组没有轮替配置。', flags: MessageFlags.Ephemeral });
             const active = getActiveRound(found.config.id);
             if (active) {
-                return interaction.reply({
+                return reply({
                     content: `❌ 场次 #${active.id} 正处于“${statusLabel(active.status)}”，请先结算问询或结束招募。`,
                     flags: MessageFlags.Ephemeral,
                 });
             }
             addAudit({ guildId: guild.id, configId: found.config.id, actorId: interaction.user.id, event: 'config_deleted', detail: `role=${found.role.id}` });
             deleteConfig(found.config.id);
-            return interaction.reply({ content: `✅ 已删除 ${found.role} 的轮替配置。`, flags: MessageFlags.Ephemeral, allowedMentions: { parse: [] } });
+            return reply({ content: `✅ 已删除 ${found.role} 的轮替配置。`, flags: MessageFlags.Ephemeral, allowedMentions: { parse: [] } });
         }
 
         if (sub === '设置规则') {
             const found = getConfiguredRole(interaction);
-            if (!found) return interaction.reply({ content: '❌ 该身份组没有轮替配置。', flags: MessageFlags.Ephemeral });
+            if (!found) return reply({ content: '❌ 该身份组没有轮替配置。', flags: MessageFlags.Ephemeral });
             const capacity = interaction.options.getInteger('人数上限') ?? found.config.capacity;
             const minTenureDays = interaction.options.getInteger('最低入服天数') ?? found.config.minTenureDays;
             const scheduleDay = interaction.options.getInteger('问询日') ?? found.config.scheduleDay;
@@ -287,10 +304,10 @@ const command: Command = {
             const inquiryHours = interaction.options.getInteger('问询时长小时') ?? found.config.inquiryHours;
             const enabled = interaction.options.getBoolean('是否启用') ?? found.config.enabled;
             if (!isValidClockTime(scheduleTime)) {
-                return interaction.reply({ content: '❌ 问询时间格式应为 HH:mm，例如 09:00。', flags: MessageFlags.Ephemeral });
+                return reply({ content: '❌ 问询时间格式应为 HH:mm，例如 09:00。', flags: MessageFlags.Ephemeral });
             }
             if (!isValidTimeZone(timezone)) {
-                return interaction.reply({ content: '❌ 时区无效，请填写 IANA 时区，例如 Asia/Shanghai。', flags: MessageFlags.Ephemeral });
+                return reply({ content: '❌ 时区无效，请填写 IANA 时区，例如 Asia/Shanghai。', flags: MessageFlags.Ephemeral });
             }
             const scheduleChanged = scheduleDay !== found.config.scheduleDay
                 || scheduleTime !== found.config.scheduleTime
@@ -310,7 +327,7 @@ const command: Command = {
                 nextRunAt,
             })!;
             addAudit({ guildId: guild.id, configId: updated.id, actorId: interaction.user.id, event: 'config_updated', detail: JSON.stringify({ capacity, minTenureDays, scheduleDay, scheduleTime, timezone, inquiryHours, enabled }) });
-            return interaction.reply({
+            return reply({
                 content: `✅ 已更新 ${found.role}：上限 ${capacity} 人，最低入服 ${minTenureDays} 天，每月 ${scheduleDay} 日 ${scheduleTime}（${timezone}）问询 ${inquiryHours} 小时，自动执行${enabled ? '已启用' : '已停用'}。`,
                 flags: MessageFlags.Ephemeral,
                 allowedMentions: { parse: [] },
@@ -319,16 +336,16 @@ const command: Command = {
 
         if (sub === '添加频道' || sub === '移除频道') {
             const found = getConfiguredRole(interaction);
-            if (!found) return interaction.reply({ content: '❌ 该身份组没有轮替配置。', flags: MessageFlags.Ephemeral });
+            if (!found) return reply({ content: '❌ 该身份组没有轮替配置。', flags: MessageFlags.Ephemeral });
             const kind = interaction.options.getString('类型', true) as RotationChannelKind;
             const selectedChannel = interaction.options.getChannel('频道');
             const rawValue = interaction.options.getString('频道或子区id');
             if (selectedChannel && rawValue) {
-                return interaction.reply({ content: '❌ “频道”和“频道或子区id”只需填写其中一个。', flags: MessageFlags.Ephemeral });
+                return reply({ content: '❌ “频道”和“频道或子区id”只需填写其中一个。', flags: MessageFlags.Ephemeral });
             }
             const parsedId = parseChannelId(rawValue);
             if (!selectedChannel && !parsedId) {
-                return interaction.reply({
+                return reply({
                     content: rawValue
                         ? '❌ 无法识别该 ID。请粘贴纯频道/子区 ID，或 `<#频道ID>` 格式的频道提及。'
                         : '❌ 请选择频道，或填写“频道或子区id”。',
@@ -341,10 +358,10 @@ const command: Command = {
                 ?? await interaction.client.channels.fetch(channelId).catch(() => null);
             if (adding) {
                 if (!fetchedChannel || !('guildId' in fetchedChannel) || fetchedChannel.guildId !== guild.id) {
-                    return interaction.reply({ content: '❌ 机器人无法访问这个频道/子区，或它不属于当前服务器。', flags: MessageFlags.Ephemeral });
+                    return reply({ content: '❌ 机器人无法访问这个频道/子区，或它不属于当前服务器。', flags: MessageFlags.Ephemeral });
                 }
                 if (!SUPPORTED_DESTINATION_TYPES.has(fetchedChannel.type)) {
-                    return interaction.reply({ content: '❌ 仅支持文字/公告频道、论坛/媒体频道，以及公开、私密或公告子区。', flags: MessageFlags.Ephemeral });
+                    return reply({ content: '❌ 仅支持文字/公告频道、论坛/媒体频道，以及公开、私密或公告子区。', flags: MessageFlags.Ephemeral });
                 }
             }
             const changed = adding
@@ -357,7 +374,7 @@ const command: Command = {
                 event: adding ? 'channel_added' : 'channel_removed',
                 detail: `${kind}:${channelId}`,
             });
-            return interaction.reply({
+            return reply({
                 content: `${changed ? '✅' : 'ℹ️'} <#${channelId}> ${changed ? `已${adding ? '添加到' : '移出'}` : '配置未变化：'}${channelKindLabel(kind)}。`,
                 flags: MessageFlags.Ephemeral,
                 allowedMentions: { parse: [] },
@@ -366,10 +383,10 @@ const command: Command = {
 
         if (sub === '添加冲突' || sub === '移除冲突') {
             const found = getConfiguredRole(interaction);
-            if (!found) return interaction.reply({ content: '❌ 该身份组没有轮替配置。', flags: MessageFlags.Ephemeral });
+            if (!found) return reply({ content: '❌ 该身份组没有轮替配置。', flags: MessageFlags.Ephemeral });
             const conflict = interaction.options.getRole('冲突身份组', true) as Role;
             if (conflict.id === found.role.id) {
-                return interaction.reply({ content: '❌ 目标身份组不能与自身冲突。', flags: MessageFlags.Ephemeral });
+                return reply({ content: '❌ 目标身份组不能与自身冲突。', flags: MessageFlags.Ephemeral });
             }
             const adding = sub === '添加冲突';
             const changed = adding
@@ -382,7 +399,7 @@ const command: Command = {
                 event: adding ? 'conflict_added' : 'conflict_removed',
                 detail: conflict.id,
             });
-            return interaction.reply({
+            return reply({
                 content: `${changed ? '✅' : 'ℹ️'} ${conflict} ${changed ? `已${adding ? '加入' : '移出'}冲突列表` : '配置未变化'}。`,
                 flags: MessageFlags.Ephemeral,
                 allowedMentions: { parse: [] },
@@ -392,12 +409,12 @@ const command: Command = {
         if (sub === '设置蛙人' || sub === '清除蛙人') {
             const role = sub === '设置蛙人' ? interaction.options.getRole('身份组', true) as Role : null;
             if (role && role.id === guild.id) {
-                return interaction.reply({ content: '❌ 不能把 @everyone 设置为蛙人身份组。', flags: MessageFlags.Ephemeral });
+                return reply({ content: '❌ 不能把 @everyone 设置为蛙人身份组。', flags: MessageFlags.Ephemeral });
             }
             setFrogRole(guild.id, role?.id ?? null, interaction.user.id);
             addAudit({ guildId: guild.id, actorId: interaction.user.id, event: role ? 'frog_role_set' : 'frog_role_cleared', detail: role?.id });
             const cooldown = getFrogSettings(guild.id).cooldownSeconds;
-            return interaction.reply({
+            return reply({
                 content: role
                     ? `✅ 已将 ${role} 设置为蛙人身份组；其成员现在可以使用 \`/呼唤蛙人\`，每人冷却 ${cooldown} 秒。`
                     : '✅ 已关闭呼唤蛙人功能。',
@@ -415,7 +432,7 @@ const command: Command = {
                 event: 'frog_cooldown_set',
                 detail: `seconds=${cooldownSeconds}`,
             });
-            return interaction.reply({
+            return reply({
                 content: `✅ 每位成员的蛙人呼唤冷却已设置为 ${cooldownSeconds} 秒。`,
                 flags: MessageFlags.Ephemeral,
             });
@@ -424,7 +441,7 @@ const command: Command = {
         if (sub === '添加蛙人呼叫组' || sub === '移除蛙人呼叫组') {
             const role = interaction.options.getRole('身份组', true) as Role;
             if (role.id === guild.id) {
-                return interaction.reply({ content: '❌ 不能授权 @everyone 使用呼唤指令。', flags: MessageFlags.Ephemeral });
+                return reply({ content: '❌ 不能授权 @everyone 使用呼唤指令。', flags: MessageFlags.Ephemeral });
             }
             const adding = sub === '添加蛙人呼叫组';
             const changed = adding
@@ -436,7 +453,7 @@ const command: Command = {
                 event: adding ? 'frog_caller_role_added' : 'frog_caller_role_removed',
                 detail: `role=${role.id}`,
             });
-            return interaction.reply({
+            return reply({
                 content: `${changed ? '✅' : 'ℹ️'} ${role} ${changed ? `已${adding ? '获得' : '失去'}呼唤蛙人的权限` : '配置没有变化'}。`,
                 flags: MessageFlags.Ephemeral,
                 allowedMentions: { parse: [] },
@@ -446,7 +463,7 @@ const command: Command = {
         if (sub === '查看蛙人设置') {
             const settings = getFrogSettings(guild.id);
             const callerRoleIds = listFrogCallerRoleIds(guild.id);
-            return interaction.reply({
+            return reply({
                 content: [
                     '**蛙人呼叫设置**',
                     `被呼叫身份组：${settings.roleId ? `<@&${settings.roleId}>` : '未配置'}`,
@@ -462,40 +479,36 @@ const command: Command = {
 
         if (sub === '立即问询') {
             const found = getConfiguredRole(interaction);
-            if (!found) return interaction.reply({ content: '❌ 该身份组没有轮替配置。', flags: MessageFlags.Ephemeral });
-            await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+            if (!found) return reply({ content: '❌ 该身份组没有轮替配置。', flags: MessageFlags.Ephemeral });
             const result = await startInquiry(interaction.client, found.config, { createdBy: interaction.user.id });
             return interaction.editReply(`${result.ok ? '✅' : '⚠️'} ${result.message}`);
         }
 
         if (sub === '立即招募') {
             const found = getConfiguredRole(interaction);
-            if (!found) return interaction.reply({ content: '❌ 该身份组没有轮替配置。', flags: MessageFlags.Ephemeral });
-            await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+            if (!found) return reply({ content: '❌ 该身份组没有轮替配置。', flags: MessageFlags.Ephemeral });
             const result = await startRecruitmentNow(interaction.client, found.config, interaction.user.id);
             return interaction.editReply(`${result.ok ? '✅' : '⚠️'} ${result.message}`);
         }
 
         if (sub === '立即结算') {
             const found = getConfiguredRole(interaction);
-            if (!found) return interaction.reply({ content: '❌ 该身份组没有轮替配置。', flags: MessageFlags.Ephemeral });
+            if (!found) return reply({ content: '❌ 该身份组没有轮替配置。', flags: MessageFlags.Ephemeral });
             const round = getActiveRound(found.config.id);
             if (!round || round.status !== 'inquiry') {
-                return interaction.reply({ content: '⚠️ 当前没有进行中的问询。', flags: MessageFlags.Ephemeral });
+                return reply({ content: '⚠️ 当前没有进行中的问询。', flags: MessageFlags.Ephemeral });
             }
-            await interaction.deferReply({ flags: MessageFlags.Ephemeral });
             const result = await settleInquiry(interaction.client, round);
             return interaction.editReply(`${result.ok ? '✅' : '⚠️'} ${result.message}`);
         }
 
         if (sub === '结束招募') {
             const found = getConfiguredRole(interaction);
-            if (!found) return interaction.reply({ content: '❌ 该身份组没有轮替配置。', flags: MessageFlags.Ephemeral });
+            if (!found) return reply({ content: '❌ 该身份组没有轮替配置。', flags: MessageFlags.Ephemeral });
             const round = getActiveRound(found.config.id);
             if (!round || round.status !== 'recruiting') {
-                return interaction.reply({ content: '⚠️ 当前没有进行中的招募。', flags: MessageFlags.Ephemeral });
+                return reply({ content: '⚠️ 当前没有进行中的招募。', flags: MessageFlags.Ephemeral });
             }
-            await interaction.deferReply({ flags: MessageFlags.Ephemeral });
             const result = await closeRecruitment(interaction.client, round);
             return interaction.editReply(`${result.ok ? '✅' : '⚠️'} ${result.message}`);
         }
@@ -506,7 +519,7 @@ const command: Command = {
                 ? [getConfigByRole(guild.id, selected.id)].filter(Boolean)
                 : listConfigs(guild.id);
             if (!configs.length) {
-                return interaction.reply({ content: '当前服务器还没有分管轮替配置。', flags: MessageFlags.Ephemeral });
+                return reply({ content: '当前服务器还没有分管轮替配置。', flags: MessageFlags.Ephemeral });
             }
             const sections: string[] = [];
             for (const config of configs) {
@@ -526,7 +539,7 @@ const command: Command = {
                     `当前场次：${active ? `#${active.id} ${statusLabel(active.status)}` : '无'}`,
                 ].join('\n'));
             }
-            return interaction.reply({
+            return reply({
                 content: sections.join('\n\n').slice(0, 1950),
                 flags: MessageFlags.Ephemeral,
                 allowedMentions: { parse: [] },
@@ -536,16 +549,16 @@ const command: Command = {
         if (sub === '审计') {
             const selected = interaction.options.getRole('身份组') as Role | null;
             const config = selected ? getConfigByRole(guild.id, selected.id) : null;
-            if (selected && !config) return interaction.reply({ content: '❌ 该身份组没有轮替配置。', flags: MessageFlags.Ephemeral });
+            if (selected && !config) return reply({ content: '❌ 该身份组没有轮替配置。', flags: MessageFlags.Ephemeral });
             const rows = listAudit(guild.id, config?.id, 20);
-            if (!rows.length) return interaction.reply({ content: '暂无审计记录。', flags: MessageFlags.Ephemeral });
+            if (!rows.length) return reply({ content: '暂无审计记录。', flags: MessageFlags.Ephemeral });
             const lines = rows.map(row => {
                 const target = row.userId ? `｜用户 <@${row.userId}>` : '';
                 const round = row.roundId ? `｜场次 #${row.roundId}` : '';
                 const detail = row.detail ? `｜${row.detail.slice(0, 120)}` : '';
                 return `<t:${Math.floor(row.createdAt / 1000)}:f>｜${auditLabel(row.event)}${round}${target}${detail}`;
             });
-            return interaction.reply({
+            return reply({
                 content: `**最近的分管轮替记录**\n${lines.join('\n')}`.slice(0, 1950),
                 flags: MessageFlags.Ephemeral,
                 allowedMentions: { parse: [] },
