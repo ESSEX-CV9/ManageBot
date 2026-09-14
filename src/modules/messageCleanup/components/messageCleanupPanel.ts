@@ -86,6 +86,7 @@ interface CleanupDraft {
     excludedSelectedIds: string[];
     excludedManualIds: string[];
     includeThreads: boolean;
+    indexOnly: boolean;
     cutoffMode: CutoffMode;
     customCutoffAt: number | null;
     indexPriorityChannelIds: string[];
@@ -109,6 +110,7 @@ function freshDraft(): CleanupDraft {
         excludedSelectedIds: [],
         excludedManualIds: [],
         includeThreads: true,
+        indexOnly: false,
         cutoffMode: 'all',
         customCutoffAt: null,
         indexPriorityChannelIds: [],
@@ -202,6 +204,7 @@ function mainView(guildId: string, actorId: string, configurable: boolean, notic
         `**目标用户：** ${target}`,
         `**清理范围：** ${draft.entireGuild ? '🌐 全服务器（所有可访问的文字频道、论坛及帖子）' : mentionList(draft.selectedChannelIds, '❌ 未选择')}`,
         `**截止时间：** ${cutoff.label}`,
+        `**发现方式：** ${draft.indexOnly ? '⚡ 仅使用现有索引（不扫描 Discord）' : '🔎 索引优先，并完整核验 Discord 历史'}`,
         `**聊天频道子区：** ${draft.entireGuild ? '✅ 全服务器模式固定包含' : draft.includeThreads ? '✅ 包含活动及归档子区' : '⛔ 不包含（论坛帖子仍自动包含）'}`,
         `**本次排除：** ${mentionList(excludedIds(draft), '无')}`,
         '',
@@ -234,13 +237,15 @@ function mainView(guildId: string, actorId: string, configurable: boolean, notic
 
     const timeMenu = new StringSelectMenuBuilder()
         .setCustomId(ID.TIME)
-        .setPlaceholder('4️⃣ 设置“删除此时间之前的消息”')
+        .setPlaceholder('4️⃣ 设置截止时间或发现方式')
         .addOptions(
             { label: '全部历史', description: '删除任务启动前的全部目标消息', value: 'all', default: draft.cutoffMode === 'all' },
             { label: '一天前', description: '只删除早于一天前的消息', value: '1d', default: draft.cutoffMode === '1d' },
             { label: '七天前', description: '只删除早于七天前的消息', value: '7d', default: draft.cutoffMode === '7d' },
             { label: '三十天前', description: '只删除早于三十天前的消息', value: '30d', default: draft.cutoffMode === '30d' },
             { label: '自定义北京时间', description: '输入 YYYY-MM-DD HH:mm', value: 'custom', default: draft.cutoffMode === 'custom' },
+            { label: '发现方式：索引 + 完整核验', description: '默认；索引缺失时继续扫描 Discord 历史', value: 'discover_full' },
+            { label: '发现方式：仅现有索引', description: '不读取 Discord；未索引消息不会被发现', value: 'index_only' },
         );
 
     const controls = new ActionRowBuilder<ButtonBuilder>().addComponents(
@@ -312,12 +317,13 @@ const INDEX_STATUS_LABEL: Record<GuildMessageIndexStatus, string> = {
 };
 
 function jobStage(job: CleanupJob, scanFinished: boolean): string {
-    if (job.status === 'completed') return '完整核验与删除队列均已结束';
+    if (job.status === 'completed') return job.indexOnly ? '现有索引装载与删除队列均已结束' : '完整核验与删除队列均已结束';
     if (job.status === 'cancelled') return '任务已取消，待删除队列已停止';
     if (job.status === 'failed') return '任务因异常停止';
-    if (job.status === 'paused') return scanFinished ? '扫描已完成，删除队列已暂停' : '扫描器与删除器均已暂停';
-    if (job.status === 'queued') return scanFinished ? '扫描已完成，等待删除器继续' : '等待扫描器与删除器开始或继续';
+    if (job.status === 'paused') return scanFinished ? '消息发现已完成，删除队列已暂停' : '消息发现与删除器均已暂停';
+    if (job.status === 'queued') return scanFinished ? '消息发现已完成，等待删除器继续' : '等待消息发现与删除器开始或继续';
     if (job.scopeChannelIds.length === 0) {
+        if (job.indexOnly) return '正在从现有索引筛选任务范围';
         return job.entireGuild ? '正在展开全服务器范围（包括归档子区与帖子）' : '正在展开所选清理范围';
     }
     if (scanFinished) return '扫描已完成，删除器正在清空待删除队列';
@@ -328,7 +334,9 @@ function jobStage(job: CleanupJob, scanFinished: boolean): string {
 function jobLine(job: CleanupJob): string {
     const active = job.status === 'queued' || job.status === 'running' || job.status === 'paused';
     const scanFinished = job.scanCompletedAt !== null || job.status === 'completed';
-    const foundLabel = scanFinished
+    const foundLabel = job.indexOnly
+        ? '索引命中'
+        : scanFinished
         ? '最终找到'
         : job.status === 'running'
             ? '已发现（仍会增长）'
@@ -343,7 +351,8 @@ function jobLine(job: CleanupJob): string {
     const scope = job.entireGuild
         ? `全服务器 · ${job.scopeCount || '待展开'} 个频道/子区`
         : `${job.scopeCount || '待展开'} 个频道/子区`;
-    return `**${heading}**${warning}\n${counts}\n${stage}　范围 ${scope}${error}`;
+    const mode = job.indexOnly ? '　⚡ 仅现有索引' : '';
+    return `**${heading}**${warning}${mode}\n${counts}\n${stage}　范围 ${scope}${error}`;
 }
 
 function tasksView(guildId: string, configurable: boolean, notice?: string): InteractionUpdateOptions {
@@ -585,7 +594,13 @@ export async function handleCleanupSelect(interaction: AnySelectMenuInteraction)
         return;
     }
     if (interaction.customId === ID.TIME && interaction.isStringSelectMenu()) {
-        const mode = interaction.values[0] as CutoffMode;
+        const selectedMode = interaction.values[0];
+        if (selectedMode === 'discover_full' || selectedMode === 'index_only') {
+            draft.indexOnly = selectedMode === 'index_only';
+            await interaction.update(mainView(guildId, interaction.user.id, canConfigureCleanup(member)));
+            return;
+        }
+        const mode = selectedMode as CutoffMode;
         if (mode === 'custom') {
             await interaction.showModal(timeModal());
             return;
@@ -738,6 +753,7 @@ export async function handleCleanupButton(interaction: ButtonInteraction): Promi
             entireGuild: draft.entireGuild,
             excludedChannelIds: excludedIds(draft),
             includeThreads: draft.includeThreads,
+            indexOnly: draft.indexOnly,
             cutoffAt: cutoff.timestamp,
             cutoffLabel: cutoff.label,
         });

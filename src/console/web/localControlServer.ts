@@ -209,6 +209,7 @@ function stateView(guildId: string): Record<string, unknown> {
         status: latestJob.status,
         entireGuild: latestJob.entireGuild,
         includeThreads: latestJob.includeThreads,
+        indexOnly: latestJob.indexOnly,
         cutoffAt: latestJob.cutoffAt,
         cutoffLabel: latestJob.cutoffLabel,
         scopeCount: latestJob.scopeCount,
@@ -373,6 +374,7 @@ export async function startLocalControlServer(requestedPort = 3210): Promise<Loc
                     entireGuild,
                     excludedChannelIds,
                     includeThreads: body.includeThreads !== false,
+                    indexOnly: body.indexOnly === true,
                     cutoffAt: cutoff.timestamp,
                     cutoffLabel: cutoff.label,
                 });

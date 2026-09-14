@@ -35,6 +35,7 @@ db.exec(`
         entire_guild             INTEGER NOT NULL DEFAULT 0,
         excluded_channel_ids     TEXT NOT NULL DEFAULT '[]',
         include_threads          INTEGER NOT NULL DEFAULT 1,
+        index_only               INTEGER NOT NULL DEFAULT 0,
         cutoff_at                INTEGER NOT NULL,
         cutoff_label             TEXT NOT NULL,
         status                   TEXT NOT NULL DEFAULT 'queued',
@@ -207,6 +208,7 @@ function ensureColumn(table: string, column: string, definition: string): void {
 // 兼容已经存在的任务数据库，启动时原地补齐生产者/消费者所需状态。
 ensureColumn('mc_job', 'scan_completed_at', 'INTEGER');
 ensureColumn('mc_job', 'entire_guild', 'INTEGER NOT NULL DEFAULT 0');
+ensureColumn('mc_job', 'index_only', 'INTEGER NOT NULL DEFAULT 0');
 ensureColumn('mc_job_message', 'attempt_count', 'INTEGER NOT NULL DEFAULT 0');
 ensureColumn('mc_job_message', 'next_attempt_at', 'INTEGER NOT NULL DEFAULT 0');
 ensureColumn('mc_job_message', 'last_error', 'TEXT');
@@ -250,6 +252,7 @@ interface JobRow {
     entire_guild: number;
     excluded_channel_ids: string;
     include_threads: number;
+    index_only: number;
     cutoff_at: number;
     cutoff_label: string;
     status: CleanupJobStatus;
@@ -318,6 +321,7 @@ function mapJob(row: JobRow): CleanupJob {
         entireGuild: Boolean(row.entire_guild),
         excludedChannelIds: parseIds(row.excluded_channel_ids),
         includeThreads: Boolean(row.include_threads),
+        indexOnly: Boolean(row.index_only),
         cutoffAt: row.cutoff_at,
         cutoffLabel: row.cutoff_label,
         status: row.status,
@@ -521,6 +525,7 @@ function taskLogDetails(job: CleanupJob): Record<string, unknown> {
         entire_guild: job.entireGuild,
         excluded_channel_ids: job.excludedChannelIds,
         include_threads: job.includeThreads,
+        index_only: job.indexOnly,
         cutoff_at: job.cutoffAt,
         cutoff_label: job.cutoffLabel,
         status: job.status,
@@ -598,9 +603,9 @@ const createJobTransaction = db.transaction((input: CreateCleanupJobInput): Crea
     const result = db.prepare(`
         INSERT INTO mc_job (
             guild_id, actor_id, target_user_id, selected_channel_ids,
-            entire_guild, excluded_channel_ids, include_threads, cutoff_at, cutoff_label,
+            entire_guild, excluded_channel_ids, include_threads, index_only, cutoff_at, cutoff_label,
             status, scan_mode, created_at, updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued', 'search', ?, ?)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued', 'search', ?, ?)
     `).run(
         input.guildId,
         input.actorId,
@@ -609,6 +614,7 @@ const createJobTransaction = db.transaction((input: CreateCleanupJobInput): Crea
         input.entireGuild ? 1 : 0,
         JSON.stringify([...new Set(input.excludedChannelIds)]),
         input.includeThreads ? 1 : 0,
+        input.indexOnly ? 1 : 0,
         input.cutoffAt,
         input.cutoffLabel,
         now,
@@ -621,11 +627,13 @@ export function createJob(input: CreateCleanupJobInput): CreateCleanupJobResult 
     const result = createJobTransaction(input);
     if (result.created && result.job) {
         appendRuntimeFileRecord('maintenance.task_created', taskLogDetails(result.job));
-        ensureGuildMessageIndexForCleanup(
-            input.guildId,
-            input.actorId,
-            input.entireGuild ? [] : input.selectedChannelIds,
-        );
+        if (!input.indexOnly) {
+            ensureGuildMessageIndexForCleanup(
+                input.guildId,
+                input.actorId,
+                input.entireGuild ? [] : input.selectedChannelIds,
+            );
+        }
     }
     return result;
 }
@@ -1206,6 +1214,13 @@ export function listIndexedCandidates(
     return rows
         .filter(row => allowed.has(row.channel_id))
         .map(row => ({ channelId: row.channel_id, messageId: row.message_id }));
+}
+
+export function listIndexedChannelIds(guildId: string): string[] {
+    const rows = db.prepare(`
+        SELECT DISTINCT channel_id FROM mc_message_cache WHERE guild_id = ?
+    `).all(guildId) as { channel_id: string }[];
+    return rows.map(row => row.channel_id);
 }
 
 export function appendGuildIndexWarning(guildId: string, warning: string): void {

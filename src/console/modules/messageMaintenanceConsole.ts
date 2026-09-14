@@ -135,7 +135,7 @@ function printTask(job: CleanupJob | null, guildId: string, channels: Map<string
     }
 
     const progress = getJobScanProgress(job.id);
-    console.log(`#${job.id}  ${JOB_STATUS[job.status]}  目标 ${job.targetUserId}`);
+    console.log(`#${job.id}  ${JOB_STATUS[job.status]}  目标 ${job.targetUserId}${job.indexOnly ? '  ⚡ 仅现有索引' : ''}`);
     console.log(`发现 ${job.foundCount}  待删除 ${job.pendingCount}  已删除 ${job.deletedCount}  跳过 ${job.skippedCount}  失败 ${job.failedCount}`);
     console.log(`范围 ${job.scopeCount || '待展开'} 个频道/子区  历史读取 ${progress.scannedMessageCount} 条 / ${progress.scannedPageCount} 页`);
     if (job.scanCompletedAt) console.log('扫描器：已经完成');
@@ -252,6 +252,7 @@ async function createTask(context: ConsoleContext, guildId: string): Promise<voi
         includeThreads = (await context.rl.question('普通聊天频道包含子区？[Y/n]：')).trim().toLowerCase() !== 'n';
     }
     const excludedChannelIds = idsFromText(await context.rl.question('排除频道/子区/分类 ID 或链接（可留空）：'));
+    const indexOnly = (await context.rl.question('只删除现有索引中的消息，不扫描 Discord？[y/N]：')).trim().toLowerCase() === 'y';
     const cutoff = await chooseCutoff(context);
     if (!cutoff) {
         await context.pause('截止时间无效，按 Enter 返回...');
@@ -262,6 +263,7 @@ async function createTask(context: ConsoleContext, guildId: string): Promise<voi
     console.log(`范围：${entire ? '全服务器' : selectedChannelIds.join(', ')}`);
     console.log(`截止：${cutoff.label}`);
     console.log(`排除：${excludedChannelIds.length ? excludedChannelIds.join(', ') : '无'}`);
+    console.log(`发现方式：${indexOnly ? '仅使用现有索引' : '索引优先，并完整核验 Discord 历史'}`);
     const confirmed = (await context.rl.question('立即创建？[y/N]：')).trim().toLowerCase() === 'y';
     if (!confirmed) return;
 
@@ -273,6 +275,7 @@ async function createTask(context: ConsoleContext, guildId: string): Promise<voi
         entireGuild: entire,
         excludedChannelIds,
         includeThreads,
+        indexOnly,
         cutoffAt: cutoff.timestamp,
         cutoffLabel: cutoff.label,
     });

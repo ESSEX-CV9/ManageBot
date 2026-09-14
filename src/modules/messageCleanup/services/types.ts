@@ -50,6 +50,7 @@ export interface CleanupJob {
     entireGuild: boolean;
     excludedChannelIds: string[];
     includeThreads: boolean;
+    indexOnly: boolean;
     cutoffAt: number;
     cutoffLabel: string;
     status: CleanupJobStatus;
@@ -80,6 +81,7 @@ export interface CreateCleanupJobInput {
     entireGuild: boolean;
     excludedChannelIds: string[];
     includeThreads: boolean;
+    indexOnly: boolean;
     cutoffAt: number;
     cutoffLabel: string;
 }

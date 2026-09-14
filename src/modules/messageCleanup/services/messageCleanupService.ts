@@ -1,4 +1,4 @@
-import type { Client, Guild, ThreadChannel } from 'discord.js';
+import { ChannelType, type Client, type Guild, type ThreadChannel } from 'discord.js';
 
 import {
     areChannelsIndexedThrough,
@@ -19,6 +19,8 @@ import {
     hasGuildIndexChannelFailures,
     isIndexThreadMarkedOpened,
     isThreadMarkedOpened,
+    listChannelSnapshots,
+    listIndexedChannelIds,
     listIndexedCandidates,
     listPendingMessages,
     listRestorableIndexThreads,
@@ -43,6 +45,7 @@ import {
     updateCursor,
     updateGuildIndexChannelCursor,
     updateScanChannelCursor,
+    type ChannelSnapshot,
 } from './messageCleanupDatabase';
 import type {
     CleanupMessageOutcome,
@@ -77,6 +80,67 @@ function saveCachedGuildSnapshot(guild: Guild): void {
 /** 为本地通用控制台准备服务器与频道名称快照；不会保存消息内容。 */
 export function refreshMessageCleanupConsoleSnapshots(client: Client): void {
     for (const guild of client.guilds.cache.values()) saveCachedGuildSnapshot(guild);
+}
+
+const INDEXED_THREAD_TYPES = new Set<number>([
+    ChannelType.AnnouncementThread,
+    ChannelType.PublicThread,
+    ChannelType.PrivateThread,
+]);
+
+function selectedByHierarchy(
+    channelId: string,
+    selected: ReadonlySet<string>,
+    channels: ReadonlyMap<string, ChannelSnapshot>,
+    includeThreads: boolean,
+): boolean {
+    if (selected.has(channelId)) return true;
+    const channel = channels.get(channelId);
+    if (!channel?.parentId) return false;
+    if (!INDEXED_THREAD_TYPES.has(channel.channelType)) return selected.has(channel.parentId);
+
+    const parent = channels.get(channel.parentId);
+    const parentAlwaysIncludesThreads = parent?.channelType === ChannelType.GuildForum
+        || parent?.channelType === ChannelType.GuildMedia;
+    if (!parentAlwaysIncludesThreads && !includeThreads) return false;
+    return selected.has(channel.parentId)
+        || Boolean(parent?.parentId && selected.has(parent.parentId));
+}
+
+function excludedByHierarchy(
+    channelId: string,
+    excluded: ReadonlySet<string>,
+    channels: ReadonlyMap<string, ChannelSnapshot>,
+): boolean {
+    if (excluded.has(channelId)) return true;
+    const channel = channels.get(channelId);
+    if (!channel?.parentId) return false;
+    if (excluded.has(channel.parentId)) return true;
+    const parent = channels.get(channel.parentId);
+    return Boolean(parent?.parentId && excluded.has(parent.parentId));
+}
+
+function resolveIndexedOnlyScope(job: CleanupJob): { channelIds: string[]; warnings: string[] } {
+    const index = getGuildMessageIndex(job.guildId);
+    const available = new Set([
+        ...(index?.scopeChannelIds ?? []),
+        ...listIndexedChannelIds(job.guildId),
+    ]);
+    const channels = new Map(listChannelSnapshots(job.guildId).map(channel => [channel.channelId, channel]));
+    const selected = new Set(job.selectedChannelIds);
+    const excluded = new Set(job.excludedChannelIds);
+    const channelIds = [...available].filter(channelId => {
+        if (excludedByHierarchy(channelId, excluded, channels)) return false;
+        return job.entireGuild
+            || selectedByHierarchy(channelId, selected, channels, job.includeThreads);
+    });
+    const warnings = ['本任务仅删除现有索引已记录的消息；未被索引覆盖的消息不会扫描，也不会删除。'];
+    if (!index) warnings.push('当前没有服务器索引记录，任务只能使用数据库里残留的可用消息元数据。');
+    else if (channelIds.length > 0 && !areChannelsIndexedThrough(job.guildId, channelIds, job.cutoffAt)) {
+        warnings.push('所选范围尚未完整索引到本次截止时间，最终数量可能少于 Discord 中的实际消息数。');
+    }
+    if (channelIds.length === 0) warnings.push('现有索引中没有符合本次范围的频道。');
+    return { channelIds, warnings };
 }
 
 interface SearchResponse {
@@ -1095,15 +1159,19 @@ export async function executeCleanupJob(client: Client, claimedJob: CleanupJob):
         if (!guild) throw new Error('机器人已不在目标服务器中');
 
         let job = getJob(claimedJob.id)!;
-        ensureGuildMessageIndexForCleanup(
-            job.guildId,
-            job.actorId,
-            job.entireGuild ? [] : job.selectedChannelIds,
-        );
+        if (!job.indexOnly) {
+            ensureGuildMessageIndexForCleanup(
+                job.guildId,
+                job.actorId,
+                job.entireGuild ? [] : job.selectedChannelIds,
+            );
+        }
         if (job.scopeChannelIds.length === 0) {
-            const scope = await resolveCleanupScope(guild, job);
+            const scope = job.indexOnly
+                ? resolveIndexedOnlyScope(job)
+                : await resolveCleanupScope(guild, job);
             setResolvedScope(job.id, scope.channelIds, scope.warnings);
-            if (scope.channelIds.length === 0) {
+            if (!job.indexOnly && scope.channelIds.length === 0) {
                 throw new Error('没有可清理的频道；请检查所选范围、排除项和机器人权限');
             }
             job = getJob(job.id)!;
@@ -1121,6 +1189,11 @@ export async function executeCleanupJob(client: Client, claimedJob: CleanupJob):
         if (indexedCandidates.length > 0) {
             console.log(`[MessageCleanup] 🗂️ 任务 #${job.id} 从全服索引装入 ${indexedCandidates.length} 条候选消息`);
         }
+        if (job.indexOnly) {
+            markScanCompleted(job.id);
+            job = getJob(job.id)!;
+            console.log(`[MessageCleanup] ⚡ 任务 #${job.id} 仅使用现有索引：装入 ${indexedCandidates.length} 条候选消息，不扫描 Discord 历史`);
+        }
 
         const supervise = async (worker: '扫描器' | '删除器', action: () => Promise<void>): Promise<void> => {
             try {
@@ -1135,10 +1208,14 @@ export async function executeCleanupJob(client: Client, claimedJob: CleanupJob):
         };
 
         // 两个 Promise 独立等待各自的 Discord 限流桶；删除器排队不会阻塞扫描器继续翻页。
-        await Promise.all([
-            supervise('扫描器', () => runScanWorker(client, job)),
-            supervise('删除器', () => runDeletionWorker(client, job.id)),
-        ]);
+        if (job.indexOnly) {
+            await supervise('删除器', () => runDeletionWorker(client, job.id));
+        } else {
+            await Promise.all([
+                supervise('扫描器', () => runScanWorker(client, job)),
+                supervise('删除器', () => runDeletionWorker(client, job.id)),
+            ]);
+        }
 
         const current = getJob(job.id);
         if (current?.status === 'running' && current.scanCompletedAt !== null && current.pendingCount === 0) {

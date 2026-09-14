@@ -259,6 +259,10 @@
           <div class="field">
             <div class="check-row"><input id="includeThreads" type="checkbox" checked><label for="includeThreads">普通聊天频道包括子区</label></div>
           </div>
+          <div class="field full">
+            <div class="check-row"><input id="indexOnly" type="checkbox"><label for="indexOnly">仅删除现有索引中的消息，不扫描 Discord 历史</label></div>
+            <div class="card-sub">速度最快且不会重复读取；尚未进入索引的消息不会被发现或删除。</div>
+          </div>
           <div id="scopeField" class="field full">
             <label>指定清理范围（最多 25 个）</label>
             <div class="picker" data-picker="scope">
@@ -397,7 +401,7 @@
     const controls = active ? `
       <button class="button" data-job-action="${job.status === 'paused' ? 'resume' : 'pause'}">${job.status === 'paused' ? '继续' : '暂停'}</button>
       <button class="button danger" data-job-action="cancel">取消</button>` : '';
-    const scanText = job.scanCompletedAt ? '扫描已完成' : job.scanMode === 'search' ? '快速搜索 / 范围展开中' : '完整历史核验中';
+    const scanText = job.indexOnly ? '仅使用现有索引，不扫描 Discord' : job.scanCompletedAt ? '扫描已完成' : job.scanMode === 'search' ? '快速搜索 / 范围展开中' : '完整历史核验中';
     $('#taskCard').innerHTML = `
       <div class="card-head">
         <div><h2>消息任务 <span class="mono">#${job.id}</span></h2><div class="card-sub">目标用户 <span class="mono">${esc(job.targetUserId)}</span></div></div>
@@ -415,6 +419,7 @@
         <span>范围：<b>${number(job.scopeCount)} 个频道/子区</b></span>
         <span>本轮已读：<b>${number(job.progress.scannedMessageCount)} 条 / ${number(job.progress.scannedPageCount)} 页</b></span>
         <span>截止：<b>${esc(job.cutoffLabel)}</b></span>
+        <span>发现方式：<b>${job.indexOnly ? '仅现有索引' : '索引 + Discord 核验'}</b></span>
       </div>
       ${activeRows(job.progress, '扫描中')}
       ${job.warningText ? `<div class="notice">${esc(job.warningText)}</div>` : ''}
@@ -640,7 +645,8 @@
     const entireGuild = $('#entireGuild').checked;
     if (!entireGuild && !selected.scope.size) return showToast('请至少选择一个清理范围', true);
     const rangeText = entireGuild ? '全服务器' : `${selected.scope.size} 个指定范围`;
-    if (!confirm(`创建消息任务？\n目标：${targetId}\n范围：${rangeText}\n排除：${selected.exclude.size} 个范围`)) return;
+    const indexOnly = $('#indexOnly').checked;
+    if (!confirm(`创建消息任务？\n目标：${targetId}\n范围：${rangeText}\n排除：${selected.exclude.size} 个范围\n发现方式：${indexOnly ? '仅现有索引（不扫描）' : '索引 + Discord 完整核验'}`)) return;
     const button = $('#createTaskButton');
     button.disabled = true;
     const ok = await mutate('/api/jobs', {
@@ -650,6 +656,7 @@
       selectedChannelIds: [...selected.scope.keys()],
       excludedChannelIds: [...selected.exclude.keys()],
       includeThreads: $('#includeThreads').checked,
+      indexOnly,
       cutoffMode: $('#cutoffMode').value,
       customCutoff: $('#customCutoff').value,
     }, '任务已创建');
