@@ -109,7 +109,7 @@ PROXY_URL=http://127.0.0.1:7890
 | `npm run dev` | **开发/试用**：直接运行 TS 源码，改代码自动重启 |
 | `npm run build` | 编译到 `dist/` |
 | `npm start` | **生产运行**：运行编译产物（需先 build） |
-| `npm run console` | 打开通用本地管理控制台（与 Bot 主进程共用本地数据库） |
+| `npm run console` | 打开通用本地管理控制台，可选择文字 TUI 或本机 HTML 控制面板 |
 | `npm run typecheck` | 只做类型检查 |
 
 看到 `🤖 机器人已完全启动` 即部署成功，此时斜杠命令已同步到 `GUILD_IDS` 里的服务器。

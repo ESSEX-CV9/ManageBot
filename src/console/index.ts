@@ -4,9 +4,10 @@ import { createInterface } from 'node:readline/promises';
 import { stdin, stdout } from 'node:process';
 
 import messageMaintenanceConsole from './modules/messageMaintenanceConsole';
+import webConsole from './modules/webConsole';
 import type { ConsoleContext, ConsoleModule } from './types';
 
-const modules: ConsoleModule[] = [messageMaintenanceConsole];
+const modules: ConsoleModule[] = [messageMaintenanceConsole, webConsole];
 
 function clear(): void {
     stdout.write('\x1b[2J\x1b[H');

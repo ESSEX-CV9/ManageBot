@@ -61,6 +61,37 @@ function firstId(raw: string): string | null {
     return raw.match(/\d{17,20}/)?.[0] ?? null;
 }
 
+async function askPriorityIds(
+    context: ConsoleContext,
+    current: string[],
+    emptyKeepsCurrent: boolean,
+): Promise<string[]> {
+    console.log('\n一次可以输入最多 25 个频道、分类或论坛。');
+    console.log('可以逐个输入，也可以使用空格、逗号分隔后一次粘贴多个 ID/链接。');
+    if (current.length > 0) console.log(`当前已选择 ${current.length} 个：${current.join(', ')}`);
+    let raw = await context.rl.question(
+        emptyKeepsCurrent ? '新的优先范围（留空保持当前）：' : '新的优先范围（留空即清空）：',
+    );
+    if (!raw.trim()) return emptyKeepsCurrent ? current : [];
+
+    const selected = new Set<string>();
+    while (true) {
+        const before = selected.size;
+        for (const id of idsFromText(raw)) {
+            selected.add(id);
+            if (selected.size >= 25) break;
+        }
+        if (selected.size === before) console.log('没有识别到有效的频道 ID 或链接，请重新输入。');
+        if (selected.size >= 25) {
+            console.log('已达到 25 个优先范围上限。');
+            break;
+        }
+        raw = await context.rl.question(`已选择 ${selected.size} 个；继续输入，或留空完成：`);
+        if (!raw.trim()) break;
+    }
+    return [...selected];
+}
+
 function terminalText(value: string): string {
     return value.replace(/[\u0000-\u001f\u007f-\u009f]/g, ' ');
 }
@@ -289,16 +320,25 @@ async function indexMenu(context: ConsoleContext, guildId: string): Promise<void
         const action = (await context.rl.question('\n操作：')).trim();
         if (action === '0') return;
         if (action === '1') {
-            const raw = await context.rl.question('优先频道/分类/论坛 ID 或链接（留空保持当前设置）：');
-            const priorities = raw.trim() ? idsFromText(raw) : index?.priorityChannelIds ?? [];
+            const priorities = await askPriorityIds(context, index?.priorityChannelIds ?? [], true);
             const result = requestGuildMessageIndex(guildId, LOCAL_ACTOR, priorities);
-            await context.pause(result.created ? '索引已进入队列，按 Enter 继续...' : '已有索引正在运行，按 Enter 继续...');
+            if (!result.created) {
+                const channels = channelMap(guildId);
+                updateGuildIndexPriorities(
+                    guildId,
+                    priorities,
+                    expandedPriorities(result.index.scopeChannelIds, priorities, channels),
+                );
+            }
+            await context.pause(result.created
+                ? `索引已进入队列，优先范围 ${priorities.length} 个。按 Enter 继续...`
+                : `当前索引的优先范围已更新为 ${priorities.length} 个。按 Enter 继续...`);
         } else if (action === '2') {
             if (!index) {
                 await context.pause('尚未建立索引，按 Enter 继续...');
                 continue;
             }
-            const priorities = idsFromText(await context.rl.question('新的优先频道/分类/论坛 ID 或链接（留空即清空）：'));
+            const priorities = await askPriorityIds(context, index.priorityChannelIds, false);
             const channels = channelMap(guildId);
             updateGuildIndexPriorities(
                 guildId,

@@ -1,0 +1,680 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Manage Bot · 本地控制台</title>
+<style>
+  :root {
+    color-scheme: dark;
+    --bg: #090d13;
+    --panel: #101720;
+    --panel-2: #151e29;
+    --panel-3: #1a2633;
+    --line: #263443;
+    --text: #ecf3f8;
+    --muted: #8fa2b3;
+    --faint: #607486;
+    --cyan: #4fd6e8;
+    --blue: #578cff;
+    --green: #48d597;
+    --yellow: #f0bf5a;
+    --red: #ff6b7a;
+    --shadow: 0 18px 45px rgba(0, 0, 0, .25);
+  }
+
+  * { box-sizing: border-box; }
+  html, body { min-height: 100%; }
+  body {
+    margin: 0;
+    background:
+      radial-gradient(circle at 20% -20%, rgba(79, 214, 232, .12), transparent 34rem),
+      radial-gradient(circle at 95% 10%, rgba(87, 140, 255, .10), transparent 28rem),
+      var(--bg);
+    color: var(--text);
+    font: 14px/1.55 "Segoe UI", "Microsoft YaHei", system-ui, sans-serif;
+  }
+  button, input, select { font: inherit; }
+  button { color: inherit; }
+  .mono { font-family: "Cascadia Mono", Consolas, monospace; }
+
+  header {
+    position: sticky;
+    top: 0;
+    z-index: 20;
+    display: flex;
+    align-items: center;
+    gap: 22px;
+    min-height: 68px;
+    padding: 12px 24px;
+    border-bottom: 1px solid rgba(79, 214, 232, .16);
+    background: rgba(9, 13, 19, .88);
+    backdrop-filter: blur(16px);
+  }
+  .brand { display: flex; align-items: center; gap: 11px; min-width: max-content; }
+  .brand-mark {
+    width: 34px;
+    height: 34px;
+    border: 1px solid rgba(79, 214, 232, .45);
+    border-radius: 9px;
+    display: grid;
+    place-items: center;
+    color: var(--cyan);
+    background: linear-gradient(135deg, rgba(79, 214, 232, .15), rgba(87, 140, 255, .08));
+    font: 700 13px "Cascadia Mono", monospace;
+    box-shadow: inset 0 0 20px rgba(79, 214, 232, .08);
+  }
+  .brand strong { display: block; font-size: 15px; letter-spacing: .02em; }
+  .brand small { color: var(--faint); font-size: 11px; letter-spacing: .12em; }
+  .guild-box { min-width: 240px; max-width: 390px; flex: 1; }
+  header select { height: 39px; }
+  .connection { margin-left: auto; display: flex; align-items: center; gap: 8px; color: var(--muted); font-size: 12px; }
+  .connection-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--yellow); box-shadow: 0 0 14px currentColor; }
+  .connection.ok .connection-dot { background: var(--green); }
+  .connection.bad .connection-dot { background: var(--red); }
+
+  .shell { display: grid; grid-template-columns: 210px minmax(0, 1fr); min-height: calc(100vh - 68px); }
+  aside { padding: 20px 14px; border-right: 1px solid var(--line); background: rgba(12, 18, 25, .72); }
+  nav { position: sticky; top: 88px; display: grid; gap: 7px; }
+  nav button {
+    border: 1px solid transparent;
+    background: transparent;
+    border-radius: 8px;
+    padding: 10px 12px;
+    text-align: left;
+    cursor: pointer;
+    color: var(--muted);
+  }
+  nav button:hover { background: var(--panel-2); color: var(--text); }
+  nav button.on { border-color: rgba(79, 214, 232, .30); background: rgba(79, 214, 232, .09); color: var(--cyan); }
+  .local-note { margin-top: 22px; padding: 12px; border-top: 1px solid var(--line); color: var(--faint); font-size: 11px; }
+
+  main { padding: 24px; min-width: 0; }
+  .view { display: none; max-width: 1420px; margin: 0 auto; }
+  .view.on { display: block; }
+  .page-head { display: flex; justify-content: space-between; gap: 20px; align-items: flex-end; margin-bottom: 18px; }
+  h1 { margin: 0; font-size: 22px; font-weight: 650; }
+  .page-head p { margin: 4px 0 0; color: var(--muted); }
+  .updated { color: var(--faint); font-size: 12px; }
+
+  .grid { display: grid; grid-template-columns: repeat(12, minmax(0, 1fr)); gap: 16px; }
+  .span-12 { grid-column: span 12; }
+  .span-8 { grid-column: span 8; }
+  .span-7 { grid-column: span 7; }
+  .span-6 { grid-column: span 6; }
+  .span-5 { grid-column: span 5; }
+  .span-4 { grid-column: span 4; }
+  .card {
+    min-width: 0;
+    padding: 18px;
+    border: 1px solid var(--line);
+    border-radius: 12px;
+    background: linear-gradient(155deg, rgba(21, 30, 41, .96), rgba(14, 21, 30, .96));
+    box-shadow: var(--shadow);
+  }
+  .card-head { display: flex; justify-content: space-between; align-items: flex-start; gap: 14px; margin-bottom: 15px; }
+  .card h2 { margin: 0; font-size: 14px; font-weight: 650; }
+  .card-sub { color: var(--faint); font-size: 12px; margin-top: 3px; }
+  .actions { display: flex; align-items: center; gap: 7px; flex-wrap: wrap; justify-content: flex-end; }
+
+  .pill { display: inline-flex; align-items: center; gap: 6px; padding: 3px 9px; border-radius: 999px; font-size: 12px; border: 1px solid var(--line); color: var(--muted); background: var(--panel); }
+  .pill.running, .pill.queued { color: var(--cyan); border-color: rgba(79, 214, 232, .35); background: rgba(79, 214, 232, .08); }
+  .pill.completed { color: var(--green); border-color: rgba(72, 213, 151, .35); background: rgba(72, 213, 151, .08); }
+  .pill.paused { color: var(--yellow); border-color: rgba(240, 191, 90, .35); background: rgba(240, 191, 90, .08); }
+  .pill.failed, .pill.cancelled { color: var(--red); border-color: rgba(255, 107, 122, .30); background: rgba(255, 107, 122, .07); }
+
+  .metrics { display: grid; grid-template-columns: repeat(5, minmax(95px, 1fr)); gap: 9px; }
+  .metric { padding: 12px; border: 1px solid rgba(38, 52, 67, .9); border-radius: 9px; background: rgba(9, 13, 19, .38); }
+  .metric span { display: block; color: var(--faint); font-size: 11px; }
+  .metric strong { display: block; margin-top: 2px; font: 650 22px/1.25 "Cascadia Mono", Consolas, monospace; }
+  .metric.accent strong { color: var(--cyan); }
+  .metric.good strong { color: var(--green); }
+  .metric.warn strong { color: var(--yellow); }
+  .metric.bad strong { color: var(--red); }
+
+  .details { display: flex; flex-wrap: wrap; gap: 8px 18px; margin: 14px 0; color: var(--muted); font-size: 12px; }
+  .details b { color: var(--text); font-weight: 500; }
+  .bar { height: 7px; overflow: hidden; border-radius: 99px; background: #091018; border: 1px solid #1c2b38; }
+  .bar > i { display: block; height: 100%; min-width: 0; border-radius: inherit; background: linear-gradient(90deg, var(--blue), var(--cyan)); transition: width .35s ease; }
+  .bar-label { display: flex; justify-content: space-between; margin: 7px 1px 5px; color: var(--faint); font-size: 11px; }
+
+  .scan-list { margin-top: 15px; display: grid; gap: 8px; }
+  .scan-row { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 12px; align-items: center; padding: 10px 11px; border-radius: 8px; background: rgba(9, 13, 19, .43); border-left: 2px solid var(--cyan); }
+  .scan-name { overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
+  .scan-count { color: var(--muted); font: 12px "Cascadia Mono", Consolas, monospace; white-space: nowrap; }
+  .pulse { display: inline-block; width: 6px; height: 6px; margin-right: 7px; border-radius: 50%; background: var(--cyan); animation: pulse 1.4s infinite; }
+  @keyframes pulse { 50% { opacity: .25; transform: scale(.75); } }
+
+  .empty { padding: 24px 12px; text-align: center; color: var(--faint); border: 1px dashed var(--line); border-radius: 9px; }
+  .notice { margin-top: 12px; padding: 10px 12px; border-radius: 7px; white-space: pre-wrap; word-break: break-word; color: var(--yellow); background: rgba(240, 191, 90, .07); border: 1px solid rgba(240, 191, 90, .22); }
+  .notice.bad { color: var(--red); background: rgba(255, 107, 122, .07); border-color: rgba(255, 107, 122, .22); }
+
+  label { display: block; margin: 0 0 6px; color: var(--muted); font-size: 12px; }
+  input, select {
+    width: 100%;
+    height: 40px;
+    border: 1px solid var(--line);
+    border-radius: 8px;
+    padding: 0 11px;
+    color: var(--text);
+    background: var(--panel-2);
+  }
+  input:focus, select:focus { outline: none; border-color: var(--cyan); box-shadow: 0 0 0 3px rgba(79, 214, 232, .08); }
+  .form-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 15px; }
+  .field.full { grid-column: 1 / -1; }
+  .check-row { display: flex; align-items: center; gap: 9px; min-height: 40px; }
+  .check-row input { width: 16px; height: 16px; accent-color: var(--cyan); }
+  .check-row label { margin: 0; color: var(--text); font-size: 13px; }
+
+  .button { width: auto; min-height: 36px; padding: 7px 13px; border-radius: 7px; border: 1px solid var(--line); background: var(--panel-2); cursor: pointer; }
+  .button:hover { border-color: var(--cyan); }
+  .button.primary { color: #041014; border-color: var(--cyan); background: var(--cyan); font-weight: 650; }
+  .button.danger { color: var(--red); border-color: rgba(255, 107, 122, .35); background: rgba(255, 107, 122, .06); }
+  .button:disabled { opacity: .42; cursor: not-allowed; }
+  .submit-row { display: flex; justify-content: flex-end; gap: 10px; margin-top: 18px; }
+
+  .picker { border: 1px solid var(--line); border-radius: 10px; padding: 12px; background: rgba(9, 13, 19, .28); }
+  .picker.disabled { opacity: .4; pointer-events: none; }
+  .search-line { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 8px; }
+  .chips { display: flex; flex-wrap: wrap; gap: 6px; min-height: 28px; margin: 10px 0 5px; }
+  .chip { display: inline-flex; align-items: center; gap: 7px; max-width: 100%; padding: 4px 8px; border: 1px solid rgba(79, 214, 232, .25); border-radius: 6px; color: #bdeff5; background: rgba(79, 214, 232, .06); }
+  .chip span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .chip button { border: 0; padding: 0; color: var(--faint); background: none; cursor: pointer; }
+  .picker-foot { display: flex; justify-content: space-between; gap: 10px; color: var(--faint); font-size: 11px; }
+  .link-button { border: 0; background: none; color: var(--muted); cursor: pointer; padding: 0; }
+  .link-button:hover { color: var(--red); }
+  .results { display: none; max-height: 260px; overflow: auto; margin-top: 10px; border-top: 1px solid var(--line); }
+  .results.show { display: block; }
+  .result { display: flex; justify-content: space-between; gap: 12px; align-items: center; padding: 8px 2px; border-bottom: 1px solid rgba(38, 52, 67, .55); }
+  .result-name { min-width: 0; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
+  .result small { display: block; color: var(--faint); }
+  .type { color: var(--faint); font-size: 10px; border: 1px solid var(--line); border-radius: 4px; padding: 1px 5px; margin-left: 6px; }
+
+  #toast { position: fixed; right: 22px; bottom: 22px; z-index: 50; max-width: 420px; padding: 12px 15px; border: 1px solid rgba(72, 213, 151, .35); border-radius: 9px; background: #11251e; color: #a8f3d1; box-shadow: var(--shadow); opacity: 0; pointer-events: none; transform: translateY(8px); transition: .2s ease; }
+  #toast.show { opacity: 1; transform: none; }
+  #toast.bad { color: #ffc2c8; border-color: rgba(255, 107, 122, .4); background: #2a151a; }
+
+  @media (max-width: 980px) {
+    .shell { grid-template-columns: 1fr; }
+    aside { border-right: 0; border-bottom: 1px solid var(--line); padding: 9px 16px; }
+    nav { position: static; display: flex; }
+    nav button { flex: 1; text-align: center; }
+    .local-note { display: none; }
+    .span-8, .span-7, .span-6, .span-5, .span-4 { grid-column: span 12; }
+  }
+  @media (max-width: 680px) {
+    header { padding: 10px 14px; flex-wrap: wrap; }
+    .guild-box { order: 3; min-width: 100%; }
+    .connection { margin-left: auto; }
+    main { padding: 16px 12px; }
+    .metrics { grid-template-columns: repeat(2, 1fr); }
+    .form-grid { grid-template-columns: 1fr; }
+  }
+</style>
+</head>
+<body>
+<header>
+  <div class="brand">
+    <div class="brand-mark">MB</div>
+    <div><strong>Manage Bot</strong><small>LOCAL CONTROL</small></div>
+  </div>
+  <div class="guild-box"><select id="guildSelect" aria-label="选择服务器"><option>正在读取服务器……</option></select></div>
+  <div id="connection" class="connection"><span class="connection-dot"></span><span id="connectionText">正在连接</span></div>
+</header>
+
+<div class="shell">
+  <aside>
+    <nav>
+      <button class="on" data-view="monitor">实时监控</button>
+      <button data-view="create">新建任务</button>
+      <button data-view="index">索引设置</button>
+    </nav>
+    <div class="local-note">仅监听 127.0.0.1<br>访问密钥只在本次运行有效<br>页面不会读取消息正文</div>
+  </aside>
+
+  <main>
+    <section id="view-monitor" class="view on">
+      <div class="page-head">
+        <div><h1>实时监控</h1><p>每秒读取一次本地任务状态，不占用 Discord API。</p></div>
+        <div id="updated" class="updated">尚未刷新</div>
+      </div>
+      <div class="grid">
+        <div id="taskCard" class="card span-12"><div class="empty">正在读取任务……</div></div>
+        <div id="indexCard" class="card span-8"><div class="empty">正在读取索引……</div></div>
+        <div id="runtimeCard" class="card span-4"></div>
+      </div>
+    </section>
+
+    <section id="view-create" class="view">
+      <div class="page-head"><div><h1>新建消息任务</h1><p>目标用户无需仍在服务器内，直接填写用户 ID 即可。</p></div></div>
+      <form id="taskForm" class="card">
+        <div class="form-grid">
+          <div class="field full">
+            <label for="targetUserId">目标用户 ID</label>
+            <input id="targetUserId" autocomplete="off" placeholder="可粘贴用户 ID 或 &lt;@用户ID&gt;" required>
+          </div>
+          <div class="field">
+            <div class="check-row"><input id="entireGuild" type="checkbox" checked><label for="entireGuild">范围为全服务器</label></div>
+          </div>
+          <div class="field">
+            <div class="check-row"><input id="includeThreads" type="checkbox" checked><label for="includeThreads">普通聊天频道包括子区</label></div>
+          </div>
+          <div id="scopeField" class="field full">
+            <label>指定清理范围（最多 25 个）</label>
+            <div class="picker" data-picker="scope">
+              <div class="search-line"><input data-search="scope" placeholder="输入频道名称、ID 或 Discord 链接"><button class="button" type="button" data-find="scope">查找/加入</button></div>
+              <div id="chips-scope" class="chips"></div>
+              <div class="picker-foot"><span id="count-scope">已选择 0/25</span><button class="link-button" type="button" data-clear="scope">清空</button></div>
+              <div id="results-scope" class="results"></div>
+            </div>
+          </div>
+          <div class="field full">
+            <label>保护/排除范围（最多 25 个）</label>
+            <div class="picker" data-picker="exclude">
+              <div class="search-line"><input data-search="exclude" placeholder="输入频道名称、ID 或 Discord 链接"><button class="button" type="button" data-find="exclude">查找/加入</button></div>
+              <div id="chips-exclude" class="chips"></div>
+              <div class="picker-foot"><span id="count-exclude">已选择 0/25</span><button class="link-button" type="button" data-clear="exclude">清空</button></div>
+              <div id="results-exclude" class="results"></div>
+            </div>
+          </div>
+          <div class="field">
+            <label for="cutoffMode">删除此时间之前的消息</label>
+            <select id="cutoffMode">
+              <option value="all">全部历史</option>
+              <option value="1d">一天前</option>
+              <option value="7d">七天前</option>
+              <option value="30d">三十天前</option>
+              <option value="custom">自定义北京时间</option>
+            </select>
+          </div>
+          <div id="customCutoffField" class="field" hidden>
+            <label for="customCutoff">北京时间</label>
+            <input id="customCutoff" type="datetime-local">
+          </div>
+        </div>
+        <div class="submit-row"><button id="createTaskButton" class="button primary" type="submit">确认并创建任务</button></div>
+      </form>
+    </section>
+
+    <section id="view-index" class="view">
+      <div class="page-head"><div><h1>服务器消息索引</h1><p>优先范围先完成，其余频道继续在后台补齐。</p></div></div>
+      <div class="grid">
+        <div class="card span-7">
+          <div class="card-head"><div><h2>优先范围</h2><div class="card-sub">可选择频道、分类或论坛，最多 25 个</div></div></div>
+          <div class="picker" data-picker="priority">
+            <div class="search-line"><input data-search="priority" placeholder="输入频道名称、ID 或 Discord 链接"><button class="button" type="button" data-find="priority">查找/加入</button></div>
+            <div id="chips-priority" class="chips"></div>
+            <div class="picker-foot"><span id="count-priority">已选择 0/25</span><button class="link-button" type="button" data-clear="priority">清空</button></div>
+            <div id="results-priority" class="results"></div>
+          </div>
+          <div class="submit-row">
+            <button id="updatePriorities" class="button" type="button">仅应用优先范围</button>
+            <button id="startIndex" class="button primary" type="button">开始 / 刷新补齐</button>
+          </div>
+        </div>
+        <div id="indexSettingsStatus" class="card span-5"><div class="empty">正在读取索引……</div></div>
+      </div>
+    </section>
+  </main>
+</div>
+
+<div id="toast"></div>
+
+<script>
+(() => {
+  'use strict';
+  const qs = new URLSearchParams(location.search);
+  const suppliedKey = qs.get('key');
+  if (suppliedKey) {
+    sessionStorage.setItem('manage-bot-local-key', suppliedKey);
+    history.replaceState(null, '', location.pathname);
+  }
+  const accessKey = sessionStorage.getItem('manage-bot-local-key') || '';
+  const selected = { scope: new Map(), exclude: new Map(), priority: new Map() };
+  let guildId = '';
+  let state = null;
+  let polling = false;
+  let priorityHydratedGuild = '';
+  let toastTimer = 0;
+
+  const $ = selector => document.querySelector(selector);
+  const esc = value => String(value ?? '')
+    .replaceAll('&', '&amp;').replaceAll('<', '&lt;').replaceAll('>', '&gt;')
+    .replaceAll('"', '&quot;').replaceAll("'", '&#39;');
+  const number = value => Number(value || 0).toLocaleString('zh-CN');
+  const statusNames = {
+    queued: '等待开始', running: '运行中', paused: '已暂停', cancelled: '已取消',
+    completed: '已完成', failed: '失败'
+  };
+  const typeNames = { 0: '文字', 4: '分类', 5: '公告', 10: '公告子区', 11: '子区', 12: '私密子区', 15: '论坛', 16: '媒体' };
+
+  function showToast(message, bad = false) {
+    const toast = $('#toast');
+    toast.textContent = message;
+    toast.className = bad ? 'show bad' : 'show';
+    clearTimeout(toastTimer);
+    toastTimer = setTimeout(() => { toast.className = ''; }, 4200);
+  }
+
+  function setConnection(mode, text) {
+    $('#connection').className = `connection ${mode}`;
+    $('#connectionText').textContent = text;
+  }
+
+  async function api(path, options = {}) {
+    const request = { ...options, headers: { Authorization: `Bearer ${accessKey}`, ...(options.headers || {}) } };
+    if (request.body && typeof request.body !== 'string') {
+      request.headers['Content-Type'] = 'application/json';
+      request.body = JSON.stringify(request.body);
+    }
+    const response = await fetch(path, request);
+    let payload;
+    try { payload = await response.json(); } catch { payload = { error: `HTTP ${response.status}` }; }
+    if (!response.ok) throw new Error(payload.error || `HTTP ${response.status}`);
+    return payload;
+  }
+
+  function statusPill(status) {
+    return `<span class="pill ${esc(status)}">${esc(statusNames[status] || status || '未知')}</span>`;
+  }
+
+  function activeRows(progress, verb) {
+    const rows = progress?.activeChannels || [];
+    if (!rows.length) return '<div class="empty">当前没有正在读取的频道分片</div>';
+    return `<div class="scan-list">${rows.map(row => `
+      <div class="scan-row">
+        <div class="scan-name"><span class="pulse"></span>${esc(verb)}：${esc(row.channel.label)} <span class="mono" style="color:var(--faint)">[${esc(row.channelId)}]</span></div>
+        <div class="scan-count">${number(row.scannedMessageCount)} 条 / ${number(row.scannedPageCount)} 页</div>
+      </div>`).join('')}</div>`;
+  }
+
+  function renderTask(job, activeJobId) {
+    if (!job) {
+      $('#taskCard').innerHTML = `<div class="card-head"><div><h2>消息任务</h2><div class="card-sub">扫描与删除独立运行</div></div></div><div class="empty">尚无任务</div>`;
+      return;
+    }
+    const active = job.id === activeJobId;
+    const controls = active ? `
+      <button class="button" data-job-action="${job.status === 'paused' ? 'resume' : 'pause'}">${job.status === 'paused' ? '继续' : '暂停'}</button>
+      <button class="button danger" data-job-action="cancel">取消</button>` : '';
+    const scanText = job.scanCompletedAt ? '扫描已完成' : job.scanMode === 'search' ? '快速搜索 / 范围展开中' : '完整历史核验中';
+    $('#taskCard').innerHTML = `
+      <div class="card-head">
+        <div><h2>消息任务 <span class="mono">#${job.id}</span></h2><div class="card-sub">目标用户 <span class="mono">${esc(job.targetUserId)}</span></div></div>
+        <div class="actions">${statusPill(job.status)}${controls}</div>
+      </div>
+      <div class="metrics">
+        <div class="metric accent"><span>已发现</span><strong>${number(job.foundCount)}</strong></div>
+        <div class="metric warn"><span>待删除</span><strong>${number(job.pendingCount)}</strong></div>
+        <div class="metric good"><span>已删除</span><strong>${number(job.deletedCount)}</strong></div>
+        <div class="metric"><span>已跳过</span><strong>${number(job.skippedCount)}</strong></div>
+        <div class="metric bad"><span>失败</span><strong>${number(job.failedCount)}</strong></div>
+      </div>
+      <div class="details">
+        <span>扫描器：<b>${esc(scanText)}</b></span>
+        <span>范围：<b>${number(job.scopeCount)} 个频道/子区</b></span>
+        <span>本轮已读：<b>${number(job.progress.scannedMessageCount)} 条 / ${number(job.progress.scannedPageCount)} 页</b></span>
+        <span>截止：<b>${esc(job.cutoffLabel)}</b></span>
+      </div>
+      ${activeRows(job.progress, '扫描中')}
+      ${job.warningText ? `<div class="notice">${esc(job.warningText)}</div>` : ''}
+      ${job.error ? `<div class="notice bad">${esc(job.error)}</div>` : ''}`;
+  }
+
+  function renderIndex(index, targetSelector = '#indexCard') {
+    const target = $(targetSelector);
+    if (!index) {
+      target.innerHTML = `<div class="card-head"><div><h2>服务器消息索引</h2><div class="card-sub">为后续任务提供可复用的消息元数据</div></div></div><div class="empty">尚未建立索引，可到“索引设置”启动</div>`;
+      return;
+    }
+    const total = Number(index.scopeCount || 0);
+    const done = Number(index.completedCount || 0);
+    const percent = total ? Math.min(100, done / total * 100) : 0;
+    const canControl = ['queued', 'running', 'paused'].includes(index.status);
+    const controls = canControl ? `
+      <button class="button" data-index-action="${index.status === 'paused' ? 'resume' : 'pause'}">${index.status === 'paused' ? '继续' : '暂停'}</button>
+      <button class="button danger" data-index-action="cancel">取消</button>` : '';
+    target.innerHTML = `
+      <div class="card-head">
+        <div><h2>服务器消息索引</h2><div class="card-sub">只保存消息 ID、作者 ID、频道和时间</div></div>
+        <div class="actions">${statusPill(index.status)}${controls}</div>
+      </div>
+      <div class="metrics" style="grid-template-columns:repeat(3,minmax(95px,1fr))">
+        <div class="metric accent"><span>已索引消息</span><strong>${number(index.indexedMessageCount)}</strong></div>
+        <div class="metric good"><span>完成范围</span><strong>${number(done)}</strong></div>
+        <div class="metric"><span>总范围</span><strong>${number(total)}</strong></div>
+      </div>
+      <div class="bar-label"><span>频道完成进度</span><span>${percent.toFixed(1)}%</span></div>
+      <div class="bar"><i style="width:${percent}%"></i></div>
+      <div class="details">
+        <span>本轮已读：<b>${number(index.progress.scannedMessageCount)} 条 / ${number(index.progress.scannedPageCount)} 页</b></span>
+        <span>优先范围：<b>${number(index.priorityProgress.completed)}/${number(index.priorityProgress.total)} 个频道/子区</b></span>
+      </div>
+      ${activeRows(index.progress, '建库中')}
+      ${index.warningText ? `<div class="notice">${esc(index.warningText)}</div>` : ''}
+      ${index.error ? `<div class="notice bad">${esc(index.error)}</div>` : ''}`;
+  }
+
+  function renderRuntime(data) {
+    const snapshot = data.guild.updatedAt ? new Date(data.guild.updatedAt).toLocaleString('zh-CN') : '尚无快照';
+    $('#runtimeCard').innerHTML = `
+      <div class="card-head"><div><h2>本地连接</h2><div class="card-sub">监控刷新不访问 Discord API</div></div><span class="pill completed">LOCAL</span></div>
+      <div class="details" style="display:grid;gap:9px;margin-bottom:0">
+        <span>服务器：<b>${esc(data.guild.name)}</b></span>
+        <span>ID：<b class="mono">${esc(data.guild.guildId)}</b></span>
+        <span>频道快照：<b>${esc(snapshot)}</b></span>
+        <span>刷新频率：<b>1 秒</b></span>
+      </div>
+      <div class="notice" style="color:var(--muted);border-color:var(--line);background:rgba(9,13,19,.32)">任务执行依赖另一个正在运行的 Bot 主进程。</div>`;
+  }
+
+  function hydratePriorities(data) {
+    if (priorityHydratedGuild === guildId) return;
+    selected.priority.clear();
+    for (const item of data.index?.priorities || []) selected.priority.set(item.id, item.label);
+    priorityHydratedGuild = guildId;
+    renderSelection('priority');
+  }
+
+  function renderState(data) {
+    state = data;
+    renderTask(data.job, data.activeJobId);
+    renderIndex(data.index);
+    renderIndex(data.index, '#indexSettingsStatus');
+    renderRuntime(data);
+    hydratePriorities(data);
+    $('#updated').textContent = `更新于 ${new Date().toLocaleTimeString('zh-CN')}`;
+  }
+
+  async function refreshState(showErrors = false) {
+    if (!guildId || polling) return;
+    polling = true;
+    try {
+      const data = await api(`/api/state?guildId=${encodeURIComponent(guildId)}`);
+      renderState(data);
+      setConnection('ok', '本地已连接');
+    } catch (error) {
+      setConnection('bad', '连接失败');
+      if (showErrors) showToast(error.message, true);
+    } finally {
+      polling = false;
+    }
+  }
+
+  async function loadGuilds() {
+    try {
+      const payload = await api('/api/guilds');
+      const guilds = payload.guilds || [];
+      if (!guilds.length) {
+        $('#guildSelect').innerHTML = '<option value="">没有服务器快照</option>';
+        setConnection('bad', '请先运行 Bot 主进程');
+        return;
+      }
+      const remembered = localStorage.getItem('manage-bot-local-guild');
+      $('#guildSelect').innerHTML = guilds.map(item => `<option value="${esc(item.guildId)}">${esc(item.name)} · ${esc(item.guildId)}</option>`).join('');
+      guildId = guilds.some(item => item.guildId === remembered) ? remembered : guilds[0].guildId;
+      $('#guildSelect').value = guildId;
+      await refreshState(true);
+    } catch (error) {
+      $('#guildSelect').innerHTML = '<option value="">无法读取服务器</option>';
+      setConnection('bad', accessKey ? '访问失败' : '缺少访问密钥');
+      showToast(error.message, true);
+    }
+  }
+
+  function renderSelection(kind) {
+    const values = selected[kind];
+    $(`#chips-${kind}`).innerHTML = values.size
+      ? [...values].map(([id, label]) => `<span class="chip"><span>${esc(label || id)}</span><button type="button" title="移除" data-remove="${kind}" data-id="${id}">×</button></span>`).join('')
+      : '<span style="color:var(--faint);font-size:12px">尚未选择</span>';
+    $(`#count-${kind}`).textContent = `已选择 ${values.size}/25`;
+  }
+
+  function addSelection(kind, id, label) {
+    if (selected[kind].has(id)) return;
+    if (selected[kind].size >= 25) return showToast('最多只能选择 25 个范围', true);
+    selected[kind].set(id, label || `频道 ${id}`);
+    renderSelection(kind);
+  }
+
+  function idsFromInput(raw) {
+    return [...new Set(String(raw).match(/\d{17,20}/g) || [])];
+  }
+
+  async function findChannels(kind) {
+    if (!guildId) return;
+    const input = $(`[data-search="${kind}"]`);
+    const query = input.value.trim();
+    for (const id of idsFromInput(query)) addSelection(kind, id, `频道 ${id}`);
+    try {
+      const payload = await api(`/api/channels?guildId=${encodeURIComponent(guildId)}&q=${encodeURIComponent(query)}`);
+      const results = $(`#results-${kind}`);
+      results.classList.add('show');
+      results.innerHTML = payload.channels.length ? payload.channels.map(item => `
+        <div class="result">
+          <div class="result-name">${esc(item.label)} <span class="type">${esc(typeNames[item.type] || '频道')}</span><small class="mono">${esc(item.id)}</small></div>
+          <button class="button" type="button" data-add="${kind}" data-id="${item.id}" data-label="${esc(item.label)}">加入</button>
+        </div>`).join('') : '<div class="empty" style="margin-top:10px">没有匹配的频道快照；如果输入中包含 ID，已经直接加入。</div>';
+      if (payload.total > payload.channels.length) {
+        results.insertAdjacentHTML('beforeend', `<div class="card-sub" style="padding:8px 2px">共 ${number(payload.total)} 项，仅显示前 100 项，请继续缩小关键词。</div>`);
+      }
+    } catch (error) { showToast(error.message, true); }
+  }
+
+  async function mutate(path, body, successFallback) {
+    try {
+      const result = await api(path, { method: 'POST', body });
+      showToast(result.message || successFallback);
+      await refreshState(true);
+      return true;
+    } catch (error) {
+      showToast(error.message, true);
+      return false;
+    }
+  }
+
+  document.querySelectorAll('nav button').forEach(button => {
+    button.addEventListener('click', () => {
+      document.querySelectorAll('nav button').forEach(item => item.classList.toggle('on', item === button));
+      document.querySelectorAll('.view').forEach(view => view.classList.toggle('on', view.id === `view-${button.dataset.view}`));
+      refreshState();
+    });
+  });
+
+  $('#guildSelect').addEventListener('change', async event => {
+    guildId = event.target.value;
+    localStorage.setItem('manage-bot-local-guild', guildId);
+    priorityHydratedGuild = '';
+    selected.scope.clear();
+    selected.exclude.clear();
+    renderSelection('scope');
+    renderSelection('exclude');
+    await refreshState(true);
+  });
+
+  document.addEventListener('click', async event => {
+    const button = event.target.closest('button');
+    if (!button) return;
+    if (button.dataset.find) await findChannels(button.dataset.find);
+    if (button.dataset.clear) {
+      selected[button.dataset.clear].clear();
+      renderSelection(button.dataset.clear);
+    }
+    if (button.dataset.remove) {
+      selected[button.dataset.remove].delete(button.dataset.id);
+      renderSelection(button.dataset.remove);
+    }
+    if (button.dataset.add) addSelection(button.dataset.add, button.dataset.id, button.dataset.label);
+    if (button.dataset.jobAction && state?.job) {
+      const action = button.dataset.jobAction;
+      if (action === 'cancel' && !confirm(`取消任务 #${state.job.id}？`)) return;
+      await mutate(`/api/jobs/${state.job.id}/${action}`, { guildId }, '任务状态已更新');
+    }
+    if (button.dataset.indexAction) {
+      const action = button.dataset.indexAction;
+      if (action === 'cancel' && !confirm('取消当前服务器索引任务？已写入的索引数据会保留。')) return;
+      await mutate(`/api/index/${action}`, { guildId }, '索引状态已更新');
+    }
+  });
+
+  document.querySelectorAll('[data-search]').forEach(input => {
+    input.addEventListener('keydown', event => {
+      if (event.key === 'Enter') { event.preventDefault(); findChannels(input.dataset.search); }
+    });
+  });
+
+  $('#entireGuild').addEventListener('change', event => {
+    $('#scopeField').querySelector('.picker').classList.toggle('disabled', event.target.checked);
+  });
+  $('#scopeField').querySelector('.picker').classList.add('disabled');
+  $('#cutoffMode').addEventListener('change', event => {
+    $('#customCutoffField').hidden = event.target.value !== 'custom';
+  });
+
+  $('#taskForm').addEventListener('submit', async event => {
+    event.preventDefault();
+    if (!guildId) return showToast('没有选择服务器', true);
+    const target = $('#targetUserId').value;
+    const targetId = idsFromInput(target)[0];
+    if (!targetId) return showToast('请输入有效的目标用户 ID', true);
+    const entireGuild = $('#entireGuild').checked;
+    if (!entireGuild && !selected.scope.size) return showToast('请至少选择一个清理范围', true);
+    const rangeText = entireGuild ? '全服务器' : `${selected.scope.size} 个指定范围`;
+    if (!confirm(`创建消息任务？\n目标：${targetId}\n范围：${rangeText}\n排除：${selected.exclude.size} 个范围`)) return;
+    const button = $('#createTaskButton');
+    button.disabled = true;
+    const ok = await mutate('/api/jobs', {
+      guildId,
+      targetUserId: targetId,
+      entireGuild,
+      selectedChannelIds: [...selected.scope.keys()],
+      excludedChannelIds: [...selected.exclude.keys()],
+      includeThreads: $('#includeThreads').checked,
+      cutoffMode: $('#cutoffMode').value,
+      customCutoff: $('#customCutoff').value,
+    }, '任务已创建');
+    button.disabled = false;
+    if (ok) {
+      document.querySelector('[data-view="monitor"]').click();
+      $('#targetUserId').value = '';
+    }
+  });
+
+  $('#startIndex').addEventListener('click', async () => {
+    if (!guildId) return;
+    await mutate('/api/index/start', { guildId, priorityChannelIds: [...selected.priority.keys()] }, '索引已启动');
+  });
+  $('#updatePriorities').addEventListener('click', async () => {
+    if (!guildId) return;
+    await mutate('/api/index/priorities', { guildId, priorityChannelIds: [...selected.priority.keys()] }, '优先范围已更新');
+  });
+
+  renderSelection('scope');
+  renderSelection('exclude');
+  renderSelection('priority');
+  loadGuilds();
+  setInterval(() => refreshState(), 1000);
+})();
+</script>
+</body>
+</html>

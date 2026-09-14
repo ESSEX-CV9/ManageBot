@@ -825,7 +825,7 @@ export function updateGuildIndexPriorities(
     selectedChannelIds: string[],
     resolvedPriorityChannelIds: string[],
 ): void {
-    const selected = [...new Set(selectedChannelIds)];
+    const selected = [...new Set(selectedChannelIds)].slice(0, 25);
     const resolved = new Set(resolvedPriorityChannelIds);
     const now = Date.now();
     db.transaction(() => {
@@ -860,7 +860,7 @@ export function requestGuildMessageIndex(
     }
 
     const now = Date.now();
-    const priority = [...new Set(priorityChannelIds)];
+    const priority = [...new Set(priorityChannelIds)].slice(0, 25);
     db.transaction(() => {
         db.prepare('DELETE FROM mc_guild_index_channel WHERE guild_id = ?').run(guildId);
         db.prepare(`
@@ -902,7 +902,7 @@ export function ensureGuildMessageIndexForCleanup(
     if (existing) return existing;
 
     const now = Date.now();
-    const priority = [...new Set(priorityChannelIds)];
+    const priority = [...new Set(priorityChannelIds)].slice(0, 25);
     db.prepare(`
         INSERT OR IGNORE INTO mc_guild_message_index (
             guild_id, status, priority_channel_ids, scope_channel_ids,
