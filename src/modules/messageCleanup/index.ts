@@ -7,6 +7,7 @@ export {
 } from './components/messageCleanupPanel';
 import { startMessageCleanupScheduler } from './services/messageCleanupScheduler';
 import { recordLiveIndexedMessage, removeIndexedMessages } from './services/messageCleanupDatabase';
+import { refreshMessageCleanupConsoleSnapshots } from './services/messageCleanupService';
 
 export function messageCleanupMessageCreateHandler(message: Message): void {
     if (!message.guildId) return;
@@ -30,6 +31,7 @@ export function messageCleanupMessageBulkDeleteHandler(
 }
 
 export async function startMessageCleanupSystem(client: Client): Promise<void> {
+    refreshMessageCleanupConsoleSnapshots(client);
     await startMessageCleanupScheduler(client);
     console.log('🧹 紧急消息冲水模块已加载');
 }

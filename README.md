@@ -109,6 +109,7 @@ PROXY_URL=http://127.0.0.1:7890
 | `npm run dev` | **开发/试用**：直接运行 TS 源码，改代码自动重启 |
 | `npm run build` | 编译到 `dist/` |
 | `npm start` | **生产运行**：运行编译产物（需先 build） |
+| `npm run console` | 打开通用本地管理控制台（与 Bot 主进程共用本地数据库） |
 | `npm run typecheck` | 只做类型检查 |
 
 看到 `🤖 机器人已完全启动` 即部署成功，此时斜杠命令已同步到 `GUILD_IDS` 里的服务器。
@@ -126,6 +127,7 @@ pm2 start dist/core/index.js --name managebot
 
 - `election.sqlite` — 募选模块全部数据（配置、候选池、场次、投票记录）
 - `roleRotation.sqlite` — 分管轮替配置、场次、回答、成员同步与审计记录
+- `messageCleanup.sqlite` — 本地内容维护任务、消息元数据索引及扫描进度
 - `*.json` — 核心与模板模块的轻量设置
 
 **备份 `data/` 目录即可备份全部数据**。迁移服务器时把它一起带走。

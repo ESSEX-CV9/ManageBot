@@ -5,6 +5,7 @@
   "main": "dist/core/index.js",
   "scripts": {
     "dev": "tsx watch src/core/index.ts",
+    "console": "tsx src/console/index.ts",
     "build": "tsc",
     "start": "node --max-old-space-size=1024 dist/core/index.js",
     "typecheck": "tsc --noEmit",

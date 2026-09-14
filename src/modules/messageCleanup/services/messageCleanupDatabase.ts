@@ -94,6 +94,9 @@ db.exec(`
         cursor_id    TEXT,
         status       TEXT NOT NULL DEFAULT 'pending',
         failure_count INTEGER NOT NULL DEFAULT 0,
+        scanned_page_count INTEGER NOT NULL DEFAULT 0,
+        scanned_message_count INTEGER NOT NULL DEFAULT 0,
+        last_scanned_at INTEGER,
         updated_at   INTEGER NOT NULL,
         PRIMARY KEY (job_id, channel_id)
     );
@@ -128,6 +131,9 @@ db.exec(`
         cursor_id     TEXT,
         status        TEXT NOT NULL DEFAULT 'pending',
         failure_count INTEGER NOT NULL DEFAULT 0,
+        scanned_page_count INTEGER NOT NULL DEFAULT 0,
+        scanned_message_count INTEGER NOT NULL DEFAULT 0,
+        last_scanned_at INTEGER,
         updated_at    INTEGER NOT NULL,
         PRIMARY KEY (guild_id, channel_id)
     );
@@ -164,6 +170,26 @@ db.exec(`
         PRIMARY KEY (guild_id, channel_id)
     );
 
+    -- 供本地通用控制台显示服务器、主频道与子区路径，不保存任何消息内容。
+    CREATE TABLE IF NOT EXISTS mc_guild_snapshot (
+        guild_id    TEXT PRIMARY KEY,
+        name        TEXT NOT NULL,
+        updated_at  INTEGER NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS mc_channel_snapshot (
+        guild_id    TEXT NOT NULL,
+        channel_id  TEXT NOT NULL,
+        parent_id   TEXT,
+        name        TEXT NOT NULL,
+        channel_type INTEGER NOT NULL,
+        updated_at  INTEGER NOT NULL,
+        PRIMARY KEY (guild_id, channel_id)
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_mc_channel_snapshot_guild_name
+        ON mc_channel_snapshot(guild_id, name);
+
     -- 面板清空请求只在执行器安全退出前短暂存在，完成后整行移除。
     CREATE TABLE IF NOT EXISTS mc_list_clear (
         guild_id        TEXT PRIMARY KEY,
@@ -185,8 +211,14 @@ ensureColumn('mc_job_message', 'attempt_count', 'INTEGER NOT NULL DEFAULT 0');
 ensureColumn('mc_job_message', 'next_attempt_at', 'INTEGER NOT NULL DEFAULT 0');
 ensureColumn('mc_job_message', 'last_error', 'TEXT');
 ensureColumn('mc_job_scan_channel', 'failure_count', 'INTEGER NOT NULL DEFAULT 0');
+ensureColumn('mc_job_scan_channel', 'scanned_page_count', 'INTEGER NOT NULL DEFAULT 0');
+ensureColumn('mc_job_scan_channel', 'scanned_message_count', 'INTEGER NOT NULL DEFAULT 0');
+ensureColumn('mc_job_scan_channel', 'last_scanned_at', 'INTEGER');
 ensureColumn('mc_guild_message_index', 'priority_channel_ids', "TEXT NOT NULL DEFAULT '[]'");
 ensureColumn('mc_guild_index_channel', 'priority_group', 'INTEGER NOT NULL DEFAULT 1');
+ensureColumn('mc_guild_index_channel', 'scanned_page_count', 'INTEGER NOT NULL DEFAULT 0');
+ensureColumn('mc_guild_index_channel', 'scanned_message_count', 'INTEGER NOT NULL DEFAULT 0');
+ensureColumn('mc_guild_index_channel', 'last_scanned_at', 'INTEGER');
 db.exec(`
     CREATE INDEX IF NOT EXISTS idx_mc_job_message_pending
         ON mc_job_message(job_id, outcome, next_attempt_at, channel_id);
@@ -327,6 +359,156 @@ function mapGuildIndex(row: GuildIndexRow): GuildMessageIndex {
         finishedAt: row.finished_at,
         updatedAt: row.updated_at,
     };
+}
+
+export interface GuildSnapshot {
+    guildId: string;
+    name: string;
+    updatedAt: number;
+}
+
+export interface ChannelSnapshotInput {
+    channelId: string;
+    parentId: string | null;
+    name: string;
+    channelType: number;
+}
+
+export interface ChannelSnapshot extends ChannelSnapshotInput {
+    guildId: string;
+    parentName: string | null;
+    updatedAt: number;
+}
+
+export function saveGuildSnapshot(
+    guildId: string,
+    guildName: string,
+    channels: ChannelSnapshotInput[],
+): void {
+    const now = Date.now();
+    const upsertChannel = db.prepare(`
+        INSERT INTO mc_channel_snapshot (
+            guild_id, channel_id, parent_id, name, channel_type, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?)
+        ON CONFLICT(guild_id, channel_id) DO UPDATE SET
+            parent_id = excluded.parent_id,
+            name = excluded.name,
+            channel_type = excluded.channel_type,
+            updated_at = excluded.updated_at
+    `);
+    db.transaction(() => {
+        db.prepare(`
+            INSERT INTO mc_guild_snapshot (guild_id, name, updated_at)
+            VALUES (?, ?, ?)
+            ON CONFLICT(guild_id) DO UPDATE SET
+                name = excluded.name, updated_at = excluded.updated_at
+        `).run(guildId, guildName, now);
+        for (const channel of channels) {
+            upsertChannel.run(
+                guildId,
+                channel.channelId,
+                channel.parentId,
+                channel.name.slice(0, 200),
+                channel.channelType,
+                now,
+            );
+        }
+    })();
+}
+
+export function listGuildSnapshots(): GuildSnapshot[] {
+    const rows = db.prepare(`
+        SELECT guild_id, name, updated_at FROM mc_guild_snapshot ORDER BY name, guild_id
+    `).all() as { guild_id: string; name: string; updated_at: number }[];
+    return rows.map(row => ({ guildId: row.guild_id, name: row.name, updatedAt: row.updated_at }));
+}
+
+export function listChannelSnapshots(guildId: string): ChannelSnapshot[] {
+    const rows = db.prepare(`
+        SELECT c.guild_id, c.channel_id, c.parent_id, c.name, c.channel_type, c.updated_at,
+               p.name AS parent_name
+        FROM mc_channel_snapshot c
+        LEFT JOIN mc_channel_snapshot p
+          ON p.guild_id = c.guild_id AND p.channel_id = c.parent_id
+        WHERE c.guild_id = ?
+        ORDER BY COALESCE(p.name, ''), c.name, c.channel_id
+    `).all(guildId) as {
+        guild_id: string;
+        channel_id: string;
+        parent_id: string | null;
+        name: string;
+        channel_type: number;
+        updated_at: number;
+        parent_name: string | null;
+    }[];
+    return rows.map(row => ({
+        guildId: row.guild_id,
+        channelId: row.channel_id,
+        parentId: row.parent_id,
+        parentName: row.parent_name,
+        name: row.name,
+        channelType: row.channel_type,
+        updatedAt: row.updated_at,
+    }));
+}
+
+export interface ChannelScanProgress {
+    channelId: string;
+    status: string;
+    scannedPageCount: number;
+    scannedMessageCount: number;
+    lastScannedAt: number | null;
+}
+
+export interface ScanProgressSummary {
+    scannedPageCount: number;
+    scannedMessageCount: number;
+    activeChannels: ChannelScanProgress[];
+}
+
+function scanProgressSummary(
+    table: 'mc_job_scan_channel' | 'mc_guild_index_channel',
+    keyColumn: 'job_id' | 'guild_id',
+    key: number | string,
+): ScanProgressSummary {
+    const total = db.prepare(`
+        SELECT
+            COALESCE(SUM(scanned_page_count), 0) AS pages,
+            COALESCE(SUM(scanned_message_count), 0) AS messages
+        FROM ${table} WHERE ${keyColumn} = ?
+    `).get(key) as { pages: number; messages: number };
+    const active = db.prepare(`
+        SELECT channel_id, status, scanned_page_count, scanned_message_count, last_scanned_at
+        FROM ${table}
+        WHERE ${keyColumn} = ? AND status = 'running'
+        ORDER BY updated_at ASC
+        LIMIT 16
+    `).all(key) as {
+        channel_id: string;
+        status: string;
+        scanned_page_count: number;
+        scanned_message_count: number;
+        last_scanned_at: number | null;
+    }[];
+    return {
+        scannedPageCount: total.pages,
+        scannedMessageCount: total.messages,
+        activeChannels: active.map(row => ({
+            channelId: row.channel_id,
+            status: row.status,
+            scannedPageCount: row.scanned_page_count,
+            scannedMessageCount: row.scanned_message_count,
+            lastScannedAt: row.last_scanned_at,
+        })),
+    };
+}
+
+export function getJobScanProgress(jobId: number): ScanProgressSummary {
+    return scanProgressSummary('mc_job_scan_channel', 'job_id', jobId);
+}
+
+export function getGuildIndexScanProgress(guildId: string): ScanProgressSummary {
+    return scanProgressSummary('mc_guild_index_channel', 'guild_id', guildId);
 }
 
 function taskLogDetails(job: CleanupJob): Record<string, unknown> {
@@ -560,11 +742,21 @@ export function claimScanChannel(jobId: number): CleanupScanChannel | null {
     return claimScanChannelTransaction(jobId);
 }
 
-export function updateScanChannelCursor(jobId: number, channelId: string, cursorId: string): void {
+export function updateScanChannelCursor(
+    jobId: number,
+    channelId: string,
+    cursorId: string,
+    scannedMessages: number,
+): void {
+    const now = Date.now();
     db.prepare(`
-        UPDATE mc_job_scan_channel SET cursor_id = ?, failure_count = 0, updated_at = ?
+        UPDATE mc_job_scan_channel SET
+            cursor_id = ?, failure_count = 0,
+            scanned_page_count = scanned_page_count + 1,
+            scanned_message_count = scanned_message_count + ?,
+            last_scanned_at = ?, updated_at = ?
         WHERE job_id = ? AND channel_id = ? AND status = 'running'
-    `).run(cursorId, Date.now(), jobId, channelId);
+    `).run(cursorId, scannedMessages, now, now, jobId, channelId);
 }
 
 export function releaseScanChannel(jobId: number, channelId: string, failed = false): void {
@@ -868,11 +1060,21 @@ export function claimGuildIndexChannel(guildId: string): GuildIndexChannel | nul
     return claimGuildIndexChannelTransaction(guildId);
 }
 
-export function updateGuildIndexChannelCursor(guildId: string, channelId: string, cursorId: string): void {
+export function updateGuildIndexChannelCursor(
+    guildId: string,
+    channelId: string,
+    cursorId: string,
+    scannedMessages: number,
+): void {
+    const now = Date.now();
     db.prepare(`
-        UPDATE mc_guild_index_channel SET cursor_id = ?, failure_count = 0, updated_at = ?
+        UPDATE mc_guild_index_channel SET
+            cursor_id = ?, failure_count = 0,
+            scanned_page_count = scanned_page_count + 1,
+            scanned_message_count = scanned_message_count + ?,
+            last_scanned_at = ?, updated_at = ?
         WHERE guild_id = ? AND channel_id = ? AND status = 'running'
-    `).run(cursorId, Date.now(), guildId, channelId);
+    `).run(cursorId, scannedMessages, now, now, guildId, channelId);
 }
 
 export function releaseGuildIndexChannel(guildId: string, channelId: string, failed = false): void {

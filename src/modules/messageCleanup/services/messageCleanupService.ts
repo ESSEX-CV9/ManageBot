@@ -1,4 +1,4 @@
-import type { Client, ThreadChannel } from 'discord.js';
+import type { Client, Guild, ThreadChannel } from 'discord.js';
 
 import {
     areChannelsIndexedThrough,
@@ -32,6 +32,7 @@ import {
     recordMessageResults,
     releaseGuildIndexChannel,
     releaseScanChannel,
+    saveGuildSnapshot,
     setGuildIndexScope,
     setGuildMessageIndexStatus,
     setJobStatus,
@@ -58,6 +59,24 @@ interface ApiMessage {
     channel_id: string;
     author?: { id?: string };
     timestamp?: string;
+}
+
+function saveCachedGuildSnapshot(guild: Guild): void {
+    saveGuildSnapshot(
+        guild.id,
+        guild.name,
+        [...guild.channels.cache.values()].map(channel => ({
+            channelId: channel.id,
+            parentId: channel.parentId,
+            name: channel.name,
+            channelType: channel.type,
+        })),
+    );
+}
+
+/** 为本地通用控制台准备服务器与频道名称快照；不会保存消息内容。 */
+export function refreshMessageCleanupConsoleSnapshots(client: Client): void {
+    for (const guild of client.guilds.cache.values()) saveCachedGuildSnapshot(guild);
 }
 
 interface SearchResponse {
@@ -787,7 +806,7 @@ async function scanGuildIndexChannel(
                     break;
                 }
                 cursor = nextCursor;
-                updateGuildIndexChannelCursor(index.guildId, channelId, cursor);
+                updateGuildIndexChannelCursor(index.guildId, channelId, cursor, page.length);
                 if (coveredUntil > 0 && timestampFromSnowflake(nextCursor) < coveredUntil) {
                     result = 'completed';
                     break;
@@ -876,6 +895,7 @@ export async function executeGuildMessageIndex(client: Client, claimedIndex: Gui
             }
             index = getGuildMessageIndex(index.guildId)!;
         }
+        saveCachedGuildSnapshot(guild);
 
         await runGuildIndexWorkers(client, index);
         const current = getGuildMessageIndex(index.guildId);
@@ -945,7 +965,7 @@ async function scanHistoryChannel(
                     break;
                 }
                 cursor = nextCursor;
-                updateScanChannelCursor(initialJob.id, channelId, cursor);
+                updateScanChannelCursor(initialJob.id, channelId, cursor, page.length);
                 if (coveredUntil > 0 && timestampFromSnowflake(nextCursor) < coveredUntil) {
                     result = 'completed';
                     break;
@@ -1088,6 +1108,7 @@ export async function executeCleanupJob(client: Client, claimedJob: CleanupJob):
             }
             job = getJob(job.id)!;
         }
+        saveCachedGuildSnapshot(guild);
 
         if (!stillRunning(job.id)) return;
         const indexedCandidates = listIndexedCandidates(
