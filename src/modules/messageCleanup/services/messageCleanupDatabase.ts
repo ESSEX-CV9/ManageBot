@@ -14,6 +14,9 @@ import type {
 } from './types';
 
 const DB_FILE = path.join(DATA_DIR, 'messageCleanup.sqlite');
+// v2 开始不再对 discord.js 的限流排队使用无法取消请求的外层硬超时。
+// 覆盖水位带版本，避免任何旧版“已完成”状态被新扫描器误信。
+const CURRENT_GUILD_INDEX_INTEGRITY_VERSION = 2;
 const db = new Database(DB_FILE);
 db.pragma('journal_mode = WAL');
 db.pragma('busy_timeout = 5000');
@@ -160,8 +163,16 @@ db.exec(`
         guild_id      TEXT NOT NULL,
         channel_id    TEXT NOT NULL,
         covered_until INTEGER NOT NULL,
+        -- 默认始终是旧版；只有新扫描器显式写入当前版本才算可信。
+        integrity_version INTEGER NOT NULL DEFAULT 1,
         updated_at    INTEGER NOT NULL,
         PRIMARY KEY (guild_id, channel_id)
+    );
+
+    CREATE TABLE IF NOT EXISTS mc_schema_meta (
+        key        TEXT PRIMARY KEY,
+        value      TEXT NOT NULL,
+        updated_at INTEGER NOT NULL
     );
 
     CREATE TABLE IF NOT EXISTS mc_index_opened_thread (
@@ -221,20 +232,63 @@ ensureColumn('mc_guild_index_channel', 'priority_group', 'INTEGER NOT NULL DEFAU
 ensureColumn('mc_guild_index_channel', 'scanned_page_count', 'INTEGER NOT NULL DEFAULT 0');
 ensureColumn('mc_guild_index_channel', 'scanned_message_count', 'INTEGER NOT NULL DEFAULT 0');
 ensureColumn('mc_guild_index_channel', 'last_scanned_at', 'INTEGER');
+// 旧表补列时故意标记为 v1，必须经过新扫描器重新核验才能升级。
+ensureColumn('mc_index_coverage', 'integrity_version', 'INTEGER NOT NULL DEFAULT 1');
 db.exec(`
     CREATE INDEX IF NOT EXISTS idx_mc_job_message_pending
         ON mc_job_message(job_id, outcome, next_attempt_at, channel_id);
-
-    -- 兼容上一版已经完整建好的索引，把其频道完成状态迁移为可复用的覆盖水位。
-    INSERT INTO mc_index_coverage (guild_id, channel_id, covered_until, updated_at)
-    SELECT c.guild_id, c.channel_id, i.cutoff_at, i.updated_at
-    FROM mc_guild_index_channel c
-    JOIN mc_guild_message_index i ON i.guild_id = c.guild_id
-    WHERE c.status = 'completed' AND i.status = 'completed'
-    ON CONFLICT(guild_id, channel_id) DO UPDATE SET
-        covered_until = MAX(mc_index_coverage.covered_until, excluded.covered_until),
-        updated_at = MAX(mc_index_coverage.updated_at, excluded.updated_at);
 `);
+
+function migrateGuildIndexIntegrity(): void {
+    const key = 'guild_index_integrity_version';
+    const row = db.prepare('SELECT value FROM mc_schema_meta WHERE key = ?')
+        .get(key) as { value: string } | undefined;
+    const installedVersion = Number(row?.value ?? 0);
+    if (Number.isFinite(installedVersion) && installedVersion >= CURRENT_GUILD_INDEX_INTEGRITY_VERSION) return;
+
+    const now = Date.now();
+    const result = db.transaction(() => {
+        // 旧版硬超时可能在底层请求仍排队时将频道标记失败，
+        // 因此旧覆盖水位不能用来跳过任何频道。消息缓存保留，重扫会按消息 ID 去重。
+        const invalidatedCoverage = db.prepare(`
+            DELETE FROM mc_index_coverage WHERE integrity_version < ?
+        `).run(CURRENT_GUILD_INDEX_INTEGRITY_VERSION).changes;
+        const resetIndexes = db.prepare(`
+            UPDATE mc_guild_message_index SET
+                status = CASE WHEN status = 'paused' THEN 'paused' ELSE 'queued' END,
+                scope_channel_ids = '[]', scope_count = 0, completed_count = 0,
+                indexed_message_count = (
+                    SELECT COUNT(*) FROM mc_message_cache m
+                    WHERE m.guild_id = mc_guild_message_index.guild_id
+                ),
+                cutoff_at = ?,
+                warning_text = '索引读取完整性已升级：旧版覆盖状态已失效，将从头重新核验。',
+                error = NULL, started_at = NULL, finished_at = NULL, updated_at = ?
+            WHERE status <> 'cancelled'
+        `).run(now, now).changes;
+        db.prepare(`
+            DELETE FROM mc_guild_index_channel
+            WHERE guild_id IN (
+                SELECT guild_id FROM mc_guild_message_index WHERE status <> 'cancelled'
+            )
+        `).run();
+        db.prepare(`
+            INSERT INTO mc_schema_meta (key, value, updated_at)
+            VALUES (?, ?, ?)
+            ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at
+        `).run(key, String(CURRENT_GUILD_INDEX_INTEGRITY_VERSION), now);
+        return { invalidatedCoverage, resetIndexes };
+    })();
+
+    if (result.invalidatedCoverage > 0 || result.resetIndexes > 0) {
+        console.warn(
+            `[MessageCleanup] 索引完整性升级：已撤销 ${result.invalidatedCoverage} 个旧覆盖水位，`
+            + `并将 ${result.resetIndexes} 个索引重置为待完整核验。`,
+        );
+    }
+}
+
+migrateGuildIndexIntegrity();
 
 interface SettingsRow {
     guild_id: string;
@@ -959,27 +1013,35 @@ export function recoverInterruptedGuildIndexes(): number {
 
 export function getIndexedCoverage(guildId: string, channelId: string): number | null {
     const row = db.prepare(`
-        SELECT covered_until FROM mc_index_coverage WHERE guild_id = ? AND channel_id = ?
-    `).get(guildId, channelId) as { covered_until: number } | undefined;
+        SELECT covered_until FROM mc_index_coverage
+        WHERE guild_id = ? AND channel_id = ? AND integrity_version = ?
+    `).get(guildId, channelId, CURRENT_GUILD_INDEX_INTEGRITY_VERSION) as { covered_until: number } | undefined;
     return row?.covered_until ?? null;
 }
 
 function indexedCoverageMap(guildId: string): Map<string, number> {
     const rows = db.prepare(`
-        SELECT channel_id, covered_until FROM mc_index_coverage WHERE guild_id = ?
-    `).all(guildId) as { channel_id: string; covered_until: number }[];
+        SELECT channel_id, covered_until FROM mc_index_coverage
+        WHERE guild_id = ? AND integrity_version = ?
+    `).all(guildId, CURRENT_GUILD_INDEX_INTEGRITY_VERSION) as { channel_id: string; covered_until: number }[];
     return new Map(rows.map(row => [row.channel_id, row.covered_until]));
 }
 
 export function markIndexedCoverage(guildId: string, channelId: string, coveredUntil: number): void {
     const now = Date.now();
     db.prepare(`
-        INSERT INTO mc_index_coverage (guild_id, channel_id, covered_until, updated_at)
-        VALUES (?, ?, ?, ?)
+        INSERT INTO mc_index_coverage (
+            guild_id, channel_id, covered_until, integrity_version, updated_at
+        ) VALUES (?, ?, ?, ?, ?)
         ON CONFLICT(guild_id, channel_id) DO UPDATE SET
-            covered_until = MAX(mc_index_coverage.covered_until, excluded.covered_until),
+            covered_until = CASE
+                WHEN mc_index_coverage.integrity_version = excluded.integrity_version
+                    THEN MAX(mc_index_coverage.covered_until, excluded.covered_until)
+                ELSE excluded.covered_until
+            END,
+            integrity_version = excluded.integrity_version,
             updated_at = excluded.updated_at
-    `).run(guildId, channelId, coveredUntil, now);
+    `).run(guildId, channelId, coveredUntil, CURRENT_GUILD_INDEX_INTEGRITY_VERSION, now);
 }
 
 export function areChannelsIndexedThrough(
@@ -1097,10 +1159,11 @@ export function completeGuildIndexChannel(guildId: string, channelId: string): v
     const index = getGuildMessageIndex(guildId);
     const now = Date.now();
     db.transaction(() => {
-        db.prepare(`
+        const changed = db.prepare(`
             UPDATE mc_guild_index_channel SET status = 'completed', cursor_id = NULL, updated_at = ?
             WHERE guild_id = ? AND channel_id = ? AND status = 'running'
-        `).run(now, guildId, channelId);
+        `).run(now, guildId, channelId).changes;
+        if (changed === 0) return;
         db.prepare(`
             UPDATE mc_guild_message_index SET
                 completed_count = (
@@ -1125,7 +1188,7 @@ export function failGuildIndexChannel(guildId: string, channelId: string): void 
             UPDATE mc_guild_message_index SET
                 completed_count = (
                     SELECT COUNT(*) FROM mc_guild_index_channel
-                    WHERE guild_id = ? AND status IN ('completed', 'failed')
+                    WHERE guild_id = ? AND status = 'completed'
                 ),
                 updated_at = ?
             WHERE guild_id = ?

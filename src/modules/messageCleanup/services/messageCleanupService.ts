@@ -182,7 +182,6 @@ const MIN_HISTORY_GLOBAL_INTERVAL_MS = 75;
 const MAX_HISTORY_GLOBAL_INTERVAL_MS = 2_000;
 const HISTORY_PAGES_PER_SLICE = 10;
 const MAX_HISTORY_CHANNEL_FAILURES = 3;
-const CHANNEL_OPERATION_TIMEOUT_MS = 30_000;
 const DELETE_QUEUE_IDLE_MS = 500;
 const MAX_DELETE_RETRY_DELAY_MS = 5 * 60_000;
 const historyPageIntervalMs = (() => {
@@ -265,19 +264,6 @@ async function wait(ms: number): Promise<void> {
     await new Promise<void>(resolve => setTimeout(resolve, ms));
 }
 
-async function withHardTimeout<T>(promise: Promise<T>, label: string): Promise<T> {
-    let timer: NodeJS.Timeout | null = null;
-    const timeout = new Promise<never>((_resolve, reject) => {
-        timer = setTimeout(() => reject(new Error(`${label} 超过 ${CHANNEL_OPERATION_TIMEOUT_MS / 1000} 秒`)), CHANNEL_OPERATION_TIMEOUT_MS);
-        timer.unref?.();
-    });
-    try {
-        return await Promise.race([promise, timeout]);
-    } finally {
-        if (timer) clearTimeout(timer);
-    }
-}
-
 async function paceHistoryPage(channelId: string): Promise<void> {
     const turn = historyPaceTail.then(async () => {
         const earliestStart = Math.max(
@@ -297,10 +283,9 @@ async function paceHistoryPage(channelId: string): Promise<void> {
 async function fetchThread(client: Client, channelId: string): Promise<ThreadChannel | null> {
     const cached = client.channels.cache.get(channelId);
     if (cached) return cached.isThread() ? cached : null;
-    const channel = await withHardTimeout(
-        client.channels.fetch(channelId, { cache: true, force: true }),
-        `<#${channelId}> 获取频道信息`,
-    );
+    // 不在 discord.js REST 限流队列外再包一层 Promise.race 超时：
+    // 外层超时无法取消已排队的请求，重试反而会制造重复请求。
+    const channel = await client.channels.fetch(channelId, { cache: true, force: true });
     return channel?.isThread() ? channel : null;
 }
 
@@ -700,10 +685,10 @@ async function searchPage(
         query.append('author_id', job.targetUserId);
         for (const channelId of channelIds) query.append('channel_id', channelId);
 
-        const response = await withHardTimeout(
-            client.rest.get(`/guilds/${job.guildId}/messages/search`, { query }) as Promise<SearchResponse>,
-            `服务器 ${job.guildId} 消息搜索`,
-        );
+        const response = await client.rest.get(
+            `/guilds/${job.guildId}/messages/search`,
+            { query },
+        ) as SearchResponse;
         if (response.code === 110000) {
             const seconds = Number(response.retry_after);
             await wait(Number.isFinite(seconds) && seconds > 0
@@ -803,10 +788,9 @@ async function fetchHistoryPage(client: Client, channelId: string, before: strin
     // Discord 会按频道限制历史消息读取。主动摊平分页请求，避免先突发请求再被 SDK 强制等待数秒。
     await paceHistoryPage(channelId);
     const query = new URLSearchParams({ limit: '100', before });
-    const raw = await withHardTimeout(
-        client.rest.get(`/channels/${channelId}/messages`, { query }),
-        `<#${channelId}> 历史消息读取`,
-    );
+    // discord.js 会自行等待限流桶，底层网络请求仍受 Client.rest.timeout 保护。
+    // 这里必须等待同一个 Promise 结束，才能确保一个频道不会在旧请求存活时被重复投递。
+    const raw = await client.rest.get(`/channels/${channelId}/messages`, { query });
     return Array.isArray(raw) ? raw as ApiMessage[] : [];
 }
 

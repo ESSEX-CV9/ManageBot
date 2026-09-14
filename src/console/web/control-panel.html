@@ -388,7 +388,9 @@
     return `<div class="scan-list">${rows.map(row => `
       <div class="scan-row">
         <div class="scan-name"><span class="pulse"></span>${esc(verb)}：${esc(row.channel.label)} <span class="mono" style="color:var(--faint)">[${esc(row.channelId)}]</span></div>
-        <div class="scan-count">${number(row.scannedMessageCount)} 条 / ${number(row.scannedPageCount)} 页</div>
+        <div class="scan-count">${Number(row.scannedPageCount || 0) === 0
+            ? '等待 Discord 返回第一页'
+            : `${number(row.scannedMessageCount)} 条 / ${number(row.scannedPageCount)} 页`}</div>
       </div>`).join('')}</div>`;
   }
 

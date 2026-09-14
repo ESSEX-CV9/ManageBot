@@ -142,7 +142,9 @@ function printTask(job: CleanupJob | null, guildId: string, channels: Map<string
     else if (job.scanMode === 'search' && progress.activeChannels.length === 0) console.log('扫描器：Discord 作者快速搜索/展开范围');
     for (const channel of progress.activeChannels) {
         console.log(`  扫描中：${channelPath(channel.channelId, channels)}`);
-        console.log(`          ${channel.scannedMessageCount} 条 / ${channel.scannedPageCount} 页`);
+        console.log(channel.scannedPageCount === 0
+            ? '          等待 Discord 返回第一页'
+            : `          ${channel.scannedMessageCount} 条 / ${channel.scannedPageCount} 页`);
     }
     if (job.warningText) console.log(`提示：${terminalText(job.warningText).slice(0, 300)}`);
     if (job.error) console.log(`错误：${terminalText(job.error).slice(0, 300)}`);
@@ -160,7 +162,9 @@ function printIndex(index: GuildMessageIndex | null, guildId: string, channels: 
     console.log(`索引现存 ${index.indexedMessageCount} 条  本轮读取 ${progress.scannedMessageCount} 条 / ${progress.scannedPageCount} 页`);
     for (const channel of progress.activeChannels) {
         console.log(`  建库中：${channelPath(channel.channelId, channels)}`);
-        console.log(`          ${channel.scannedMessageCount} 条 / ${channel.scannedPageCount} 页`);
+        console.log(channel.scannedPageCount === 0
+            ? '          等待 Discord 返回第一页'
+            : `          ${channel.scannedMessageCount} 条 / ${channel.scannedPageCount} 页`);
     }
     if (index.warningText) console.log(`提示：${terminalText(index.warningText).slice(0, 300)}`);
     if (index.error) console.log(`错误：${terminalText(index.error).slice(0, 300)}`);
