@@ -282,7 +282,7 @@ function jobStage(job: CleanupJob, scanFinished: boolean): string {
     }
     if (scanFinished) return '扫描已完成，删除器正在清空待删除队列';
     if (job.scanMode === 'search') return '扫描器：快速搜索；删除器：并行工作中';
-    return `扫描器：完整核验 ${Math.min(job.cursorBatch + 1, Math.max(job.scopeCount, 1))}/${Math.max(job.scopeCount, 1)}；删除器：并行工作中`;
+    return `扫描器：完整核验 ${Math.min(job.cursorBatch, Math.max(job.scopeCount, 1))}/${Math.max(job.scopeCount, 1)}；删除器：并行工作中`;
 }
 
 function jobLine(job: CleanupJob): string {

@@ -84,6 +84,21 @@ db.exec(`
     CREATE INDEX IF NOT EXISTS idx_mc_job_message_outcome
         ON mc_job_message(job_id, outcome);
 
+    -- 完整核验按频道独立保存游标，允许多个频道并行且可在重启后准确续跑。
+    CREATE TABLE IF NOT EXISTS mc_job_scan_channel (
+        job_id       INTEGER NOT NULL,
+        channel_id   TEXT NOT NULL,
+        position     INTEGER NOT NULL,
+        cursor_id    TEXT,
+        status       TEXT NOT NULL DEFAULT 'pending',
+        failure_count INTEGER NOT NULL DEFAULT 0,
+        updated_at   INTEGER NOT NULL,
+        PRIMARY KEY (job_id, channel_id)
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_mc_job_scan_channel_status
+        ON mc_job_scan_channel(job_id, status, position);
+
     -- 面板清空请求只在执行器安全退出前短暂存在，完成后整行移除。
     CREATE TABLE IF NOT EXISTS mc_list_clear (
         guild_id        TEXT PRIMARY KEY,
@@ -104,6 +119,7 @@ ensureColumn('mc_job', 'entire_guild', 'INTEGER NOT NULL DEFAULT 0');
 ensureColumn('mc_job_message', 'attempt_count', 'INTEGER NOT NULL DEFAULT 0');
 ensureColumn('mc_job_message', 'next_attempt_at', 'INTEGER NOT NULL DEFAULT 0');
 ensureColumn('mc_job_message', 'last_error', 'TEXT');
+ensureColumn('mc_job_scan_channel', 'failure_count', 'INTEGER NOT NULL DEFAULT 0');
 db.exec(`
     CREATE INDEX IF NOT EXISTS idx_mc_job_message_pending
         ON mc_job_message(job_id, outcome, next_attempt_at, channel_id);
@@ -331,9 +347,16 @@ export function listRunnableJobs(): CleanupJob[] {
 }
 
 export function recoverInterruptedJobs(): number {
-    return db.prepare(`
-        UPDATE mc_job SET status = 'queued', updated_at = ? WHERE status = 'running'
-    `).run(Date.now()).changes;
+    const now = Date.now();
+    return db.transaction(() => {
+        db.prepare(`
+            UPDATE mc_job_scan_channel SET status = 'pending', updated_at = ?
+            WHERE status = 'running'
+        `).run(now);
+        return db.prepare(`
+            UPDATE mc_job SET status = 'queued', updated_at = ? WHERE status = 'running'
+        `).run(now).changes;
+    })();
 }
 
 export function setResolvedScope(jobId: number, channelIds: string[], warnings: string[]): void {
@@ -348,6 +371,105 @@ export function setResolvedScope(jobId: number, channelIds: string[], warnings: 
         Date.now(),
         jobId,
     );
+}
+
+export interface CleanupScanChannel {
+    channelId: string;
+    cursorId: string | null;
+    failureCount: number;
+}
+
+/**
+ * 新任务直接建立逐频道扫描账；旧任务首次升级时把原来的单游标进度迁入账中。
+ */
+export function ensureJobScanChannels(job: CleanupJob): void {
+    const existing = db.prepare('SELECT COUNT(*) AS count FROM mc_job_scan_channel WHERE job_id = ?')
+        .get(job.id) as { count: number };
+    if (existing.count > 0) return;
+
+    const insert = db.prepare(`
+        INSERT OR IGNORE INTO mc_job_scan_channel (
+            job_id, channel_id, position, cursor_id, status, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?)
+    `);
+    const now = Date.now();
+    db.transaction(() => {
+        job.scopeChannelIds.forEach((channelId, position) => {
+            const completed = position < job.cursorBatch;
+            const cursorId = position === job.cursorBatch ? job.cursorId : null;
+            insert.run(job.id, channelId, position, cursorId, completed ? 'completed' : 'pending', now);
+        });
+        db.prepare(`
+            UPDATE mc_job SET
+                cursor_batch = (
+                    SELECT COUNT(*) FROM mc_job_scan_channel
+                    WHERE job_id = ? AND status = 'completed'
+                ),
+                cursor_id = NULL,
+                updated_at = ?
+            WHERE id = ?
+        `).run(job.id, now, job.id);
+    })();
+}
+
+const claimScanChannelTransaction = db.transaction((jobId: number): CleanupScanChannel | null => {
+    const row = db.prepare(`
+        SELECT channel_id, cursor_id, failure_count
+        FROM mc_job_scan_channel
+        WHERE job_id = ? AND status = 'pending'
+        ORDER BY updated_at ASC, position ASC
+        LIMIT 1
+    `).get(jobId) as { channel_id: string; cursor_id: string | null; failure_count: number } | undefined;
+    if (!row) return null;
+    const changed = db.prepare(`
+        UPDATE mc_job_scan_channel SET status = 'running', updated_at = ?
+        WHERE job_id = ? AND channel_id = ? AND status = 'pending'
+    `).run(Date.now(), jobId, row.channel_id).changes;
+    return changed > 0
+        ? { channelId: row.channel_id, cursorId: row.cursor_id, failureCount: row.failure_count }
+        : null;
+});
+
+export function claimScanChannel(jobId: number): CleanupScanChannel | null {
+    return claimScanChannelTransaction(jobId);
+}
+
+export function updateScanChannelCursor(jobId: number, channelId: string, cursorId: string): void {
+    db.prepare(`
+        UPDATE mc_job_scan_channel SET cursor_id = ?, failure_count = 0, updated_at = ?
+        WHERE job_id = ? AND channel_id = ? AND status = 'running'
+    `).run(cursorId, Date.now(), jobId, channelId);
+}
+
+export function releaseScanChannel(jobId: number, channelId: string, failed = false): void {
+    db.prepare(`
+        UPDATE mc_job_scan_channel SET
+            status = 'pending',
+            failure_count = failure_count + ?,
+            updated_at = ?
+        WHERE job_id = ? AND channel_id = ? AND status = 'running'
+    `).run(failed ? 1 : 0, Date.now(), jobId, channelId);
+}
+
+export function completeScanChannel(jobId: number, channelId: string): void {
+    const now = Date.now();
+    db.transaction(() => {
+        db.prepare(`
+            UPDATE mc_job_scan_channel
+            SET status = 'completed', cursor_id = NULL, updated_at = ?
+            WHERE job_id = ? AND channel_id = ? AND status = 'running'
+        `).run(now, jobId, channelId);
+        db.prepare(`
+            UPDATE mc_job SET
+                cursor_batch = (
+                    SELECT COUNT(*) FROM mc_job_scan_channel
+                    WHERE job_id = ? AND status = 'completed'
+                ),
+                cursor_id = NULL,
+                updated_at = ?
+            WHERE id = ?
+        `).run(jobId, now, jobId);
+    })();
 }
 
 export function setScanMode(jobId: number, mode: CleanupScanMode, resetCursor = false): void {
@@ -639,6 +761,10 @@ export function completeJobListClear(request: JobListClearRequest, allowUnrestor
     db.transaction(() => {
         db.prepare(`
             DELETE FROM mc_job_message
+            WHERE job_id IN (SELECT id FROM mc_job WHERE guild_id = ?)
+        `).run(request.guildId);
+        db.prepare(`
+            DELETE FROM mc_job_scan_channel
             WHERE job_id IN (SELECT id FROM mc_job WHERE guild_id = ?)
         `).run(request.guildId);
         db.prepare(`

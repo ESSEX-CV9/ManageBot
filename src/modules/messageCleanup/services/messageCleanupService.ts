@@ -2,6 +2,9 @@ import type { Client, ThreadChannel } from 'discord.js';
 
 import {
     appendWarning,
+    claimScanChannel,
+    completeScanChannel,
+    ensureJobScanChannels,
     getDeletionQueueState,
     getJob,
     isThreadMarkedOpened,
@@ -11,11 +14,13 @@ import {
     markScanCompleted,
     recordMessageCandidates,
     recordMessageResults,
+    releaseScanChannel,
     setJobStatus,
     setResolvedScope,
     setScanMode,
     unmarkThreadOpened,
     updateCursor,
+    updateScanChannelCursor,
 } from './messageCleanupDatabase';
 import type {
     CleanupMessageOutcome,
@@ -38,7 +43,13 @@ interface SearchResponse {
     message?: string;
     retry_after?: number;
     total_results?: number;
+    doing_deep_historical_index?: boolean;
     messages?: ApiMessage[][];
+}
+
+interface SearchPageResult {
+    messages: ApiMessage[];
+    indexing: boolean;
 }
 
 interface DeleteResult {
@@ -52,11 +63,21 @@ interface DeleteResult {
 const SEARCH_CHANNEL_BATCH = 100;
 const SEARCH_INDEX_MAX_ATTEMPTS = 3;
 const SEARCH_INDEX_MAX_WAIT_MS = 5_000;
+const SEARCH_REFRESH_INTERVAL_MS = 60_000;
 const RECENT_MESSAGE_AGE = 14 * 24 * 60 * 60_000;
 const RECENT_SAFETY_MARGIN = 60_000;
 const DEFAULT_HISTORY_PAGE_INTERVAL_MS = 1_100;
 const MIN_HISTORY_PAGE_INTERVAL_MS = 250;
 const MAX_HISTORY_PAGE_INTERVAL_MS = 10_000;
+const DEFAULT_HISTORY_CHANNEL_CONCURRENCY = 8;
+const MIN_HISTORY_CHANNEL_CONCURRENCY = 1;
+const MAX_HISTORY_CHANNEL_CONCURRENCY = 16;
+const DEFAULT_HISTORY_GLOBAL_INTERVAL_MS = 150;
+const MIN_HISTORY_GLOBAL_INTERVAL_MS = 75;
+const MAX_HISTORY_GLOBAL_INTERVAL_MS = 2_000;
+const HISTORY_PAGES_PER_SLICE = 10;
+const MAX_HISTORY_CHANNEL_FAILURES = 3;
+const CHANNEL_OPERATION_TIMEOUT_MS = 30_000;
 const DELETE_QUEUE_IDLE_MS = 500;
 const MAX_DELETE_RETRY_DELAY_MS = 5 * 60_000;
 const historyPageIntervalMs = (() => {
@@ -66,7 +87,23 @@ const historyPageIntervalMs = (() => {
     if (!Number.isFinite(configured)) return DEFAULT_HISTORY_PAGE_INTERVAL_MS;
     return Math.min(Math.max(Math.trunc(configured), MIN_HISTORY_PAGE_INTERVAL_MS), MAX_HISTORY_PAGE_INTERVAL_MS);
 })();
+const historyChannelConcurrency = (() => {
+    const raw = process.env.MESSAGE_CLEANUP_HISTORY_CHANNEL_CONCURRENCY?.trim();
+    if (!raw) return DEFAULT_HISTORY_CHANNEL_CONCURRENCY;
+    const configured = Number(raw);
+    if (!Number.isFinite(configured)) return DEFAULT_HISTORY_CHANNEL_CONCURRENCY;
+    return Math.min(Math.max(Math.trunc(configured), MIN_HISTORY_CHANNEL_CONCURRENCY), MAX_HISTORY_CHANNEL_CONCURRENCY);
+})();
+const historyGlobalIntervalMs = (() => {
+    const raw = process.env.MESSAGE_CLEANUP_HISTORY_GLOBAL_INTERVAL_MS?.trim();
+    if (!raw) return DEFAULT_HISTORY_GLOBAL_INTERVAL_MS;
+    const configured = Number(raw);
+    if (!Number.isFinite(configured)) return DEFAULT_HISTORY_GLOBAL_INTERVAL_MS;
+    return Math.min(Math.max(Math.trunc(configured), MIN_HISTORY_GLOBAL_INTERVAL_MS), MAX_HISTORY_GLOBAL_INTERVAL_MS);
+})();
 const lastHistoryPageStartedAt = new Map<string, number>();
+let lastGlobalHistoryPageStartedAt = 0;
+let historyPaceTail = Promise.resolve();
 
 interface ThreadLeaseState {
     count: number;
@@ -119,15 +156,42 @@ async function wait(ms: number): Promise<void> {
     await new Promise<void>(resolve => setTimeout(resolve, ms));
 }
 
+async function withHardTimeout<T>(promise: Promise<T>, label: string): Promise<T> {
+    let timer: NodeJS.Timeout | null = null;
+    const timeout = new Promise<never>((_resolve, reject) => {
+        timer = setTimeout(() => reject(new Error(`${label} 超过 ${CHANNEL_OPERATION_TIMEOUT_MS / 1000} 秒`)), CHANNEL_OPERATION_TIMEOUT_MS);
+        timer.unref?.();
+    });
+    try {
+        return await Promise.race([promise, timeout]);
+    } finally {
+        if (timer) clearTimeout(timer);
+    }
+}
+
 async function paceHistoryPage(channelId: string): Promise<void> {
-    const earliestStart = (lastHistoryPageStartedAt.get(channelId) ?? 0) + historyPageIntervalMs;
-    const remaining = earliestStart - Date.now();
-    if (remaining > 0) await wait(remaining);
-    lastHistoryPageStartedAt.set(channelId, Date.now());
+    const turn = historyPaceTail.then(async () => {
+        const earliestStart = Math.max(
+            (lastHistoryPageStartedAt.get(channelId) ?? 0) + historyPageIntervalMs,
+            lastGlobalHistoryPageStartedAt + historyGlobalIntervalMs,
+        );
+        const remaining = earliestStart - Date.now();
+        if (remaining > 0) await wait(remaining);
+        const startedAt = Date.now();
+        lastHistoryPageStartedAt.set(channelId, startedAt);
+        lastGlobalHistoryPageStartedAt = startedAt;
+    });
+    historyPaceTail = turn.catch(() => {});
+    await turn;
 }
 
 async function fetchThread(client: Client, channelId: string): Promise<ThreadChannel | null> {
-    const channel = await client.channels.fetch(channelId, { cache: true, force: true });
+    const cached = client.channels.cache.get(channelId);
+    if (cached) return cached.isThread() ? cached : null;
+    const channel = await withHardTimeout(
+        client.channels.fetch(channelId, { cache: true, force: true }),
+        `<#${channelId}> 获取频道信息`,
+    );
     return channel?.isThread() ? channel : null;
 }
 
@@ -437,7 +501,7 @@ async function searchPage(
     job: CleanupJob,
     channelIds: string[],
     maxId: string,
-): Promise<ApiMessage[]> {
+): Promise<SearchPageResult> {
     for (let attempt = 0; attempt < SEARCH_INDEX_MAX_ATTEMPTS; attempt++) {
         const query = new URLSearchParams();
         query.set('limit', '25');
@@ -447,7 +511,10 @@ async function searchPage(
         query.append('author_id', job.targetUserId);
         for (const channelId of channelIds) query.append('channel_id', channelId);
 
-        const response = await client.rest.get(`/guilds/${job.guildId}/messages/search`, { query }) as SearchResponse;
+        const response = await withHardTimeout(
+            client.rest.get(`/guilds/${job.guildId}/messages/search`, { query }) as Promise<SearchResponse>,
+            `服务器 ${job.guildId} 消息搜索`,
+        );
         if (response.code === 110000) {
             const seconds = Number(response.retry_after);
             await wait(Number.isFinite(seconds) && seconds > 0
@@ -455,18 +522,22 @@ async function searchPage(
                 : 2_000);
             continue;
         }
-        return flattenSearchMessages(response, job);
+        return {
+            messages: flattenSearchMessages(response, job),
+            indexing: Boolean(response.doing_deep_historical_index),
+        };
     }
     throw new Error('Discord 消息搜索索引长时间未就绪');
 }
 
-async function runSearchScan(client: Client, initialJob: CleanupJob): Promise<void> {
+async function runSearchScan(client: Client, initialJob: CleanupJob): Promise<boolean> {
     // 全服任务直接使用 Discord 的服务器级作者搜索。候选写库时仍按已解析范围过滤，
     // 因此排除项不会被删除；同时避免给一次搜索附带数百个 channel_id。
     const channelBatches = initialJob.entireGuild
         ? [[]]
         : chunks(initialJob.scopeChannelIds, SEARCH_CHANNEL_BATCH);
     const cutoffId = snowflakeAt(initialJob.cutoffAt);
+    let indexing = false;
 
     for (let batchIndex = initialJob.cursorBatch; batchIndex < channelBatches.length; batchIndex++) {
         let cursor = batchIndex === initialJob.cursorBatch && initialJob.cursorId
@@ -474,21 +545,68 @@ async function runSearchScan(client: Client, initialJob: CleanupJob): Promise<vo
             : cutoffId;
         while (stillRunning(initialJob.id)) {
             const fresh = getJob(initialJob.id)!;
-            const found = await searchPage(client, fresh, channelBatches[batchIndex], cursor);
+            const page = await searchPage(client, fresh, channelBatches[batchIndex], cursor);
+            indexing ||= page.indexing;
+            const found = page.messages;
             if (found.length === 0) break;
 
             const nextCursor = oldestId(found);
             if (nextCursor === cursor) {
                 throw new Error('Discord 消息搜索游标没有继续前进');
             }
-            if (!stillRunning(initialJob.id)) return;
+            if (!stillRunning(initialJob.id)) return indexing;
             recordCandidates(fresh, found);
             updateCursor(initialJob.id, batchIndex, nextCursor);
             cursor = nextCursor;
         }
 
-        if (!stillRunning(initialJob.id)) return;
+        if (!stillRunning(initialJob.id)) return indexing;
         updateCursor(initialJob.id, batchIndex + 1, null);
+    }
+    return indexing;
+}
+
+/**
+ * 完整核验期间的服务器级补扫不写扫描游标，避免和频道核验争用进度。
+ * 如果 Discord 仍在建立历史索引，调用方会稍后重新从截止时间向前扫；候选表会按消息 ID 去重。
+ */
+async function runUntrackedGuildSearchSweep(client: Client, initialJob: CleanupJob): Promise<boolean> {
+    let cursor = snowflakeAt(initialJob.cutoffAt);
+    let indexing = false;
+    while (stillRunning(initialJob.id)) {
+        const fresh = getJob(initialJob.id);
+        if (!fresh) return false;
+        const page = await searchPage(client, fresh, [], cursor);
+        indexing ||= page.indexing;
+        if (page.messages.length === 0) return indexing;
+
+        recordCandidates(fresh, page.messages);
+        const nextCursor = oldestId(page.messages);
+        if (nextCursor === cursor) return indexing;
+        cursor = nextCursor;
+    }
+    return indexing;
+}
+
+async function refreshGuildSearchWhileHistory(
+    client: Client,
+    initialJob: CleanupJob,
+    historyFinished: () => boolean,
+): Promise<void> {
+    let shouldRetry = true;
+    while (shouldRetry && stillRunning(initialJob.id) && !historyFinished()) {
+        try {
+            shouldRetry = await runUntrackedGuildSearchSweep(client, initialJob);
+        } catch (error) {
+            shouldRetry = true;
+            appendWarning(initialJob.id, `服务器消息索引补扫暂不可用，完整核验仍在继续：${errorText(error)}`);
+        }
+        if (!shouldRetry) return;
+
+        const retryAt = Date.now() + SEARCH_REFRESH_INTERVAL_MS;
+        while (Date.now() < retryAt && stillRunning(initialJob.id) && !historyFinished()) {
+            await wait(Math.min(1_000, retryAt - Date.now()));
+        }
     }
 }
 
@@ -496,64 +614,119 @@ async function fetchHistoryPage(client: Client, channelId: string, before: strin
     // Discord 会按频道限制历史消息读取。主动摊平分页请求，避免先突发请求再被 SDK 强制等待数秒。
     await paceHistoryPage(channelId);
     const query = new URLSearchParams({ limit: '100', before });
-    const raw = await client.rest.get(`/channels/${channelId}/messages`, { query });
+    const raw = await withHardTimeout(
+        client.rest.get(`/channels/${channelId}/messages`, { query }),
+        `<#${channelId}> 历史消息读取`,
+    );
     return Array.isArray(raw) ? raw as ApiMessage[] : [];
+}
+
+async function scanHistoryChannel(
+    client: Client,
+    initialJob: CleanupJob,
+    channelId: string,
+    initialCursor: string,
+): Promise<'completed' | 'yielded' | 'retry' | 'stopped'> {
+    let cursor = initialCursor;
+    let result: 'completed' | 'yielded' | 'retry' | 'stopped' = 'stopped';
+    let pagesRead = 0;
+    try {
+        const current = getJob(initialJob.id);
+        if (!current) return 'stopped';
+        await withTemporarilyOpenedThread(client, current, channelId, async () => {
+            while (stillRunning(initialJob.id)) {
+                let page: ApiMessage[];
+                try {
+                    page = await fetchHistoryPage(client, channelId, cursor);
+                } catch (error) {
+                    appendWarning(initialJob.id, `<#${channelId}> 扫描中断：${errorText(error)}`);
+                    result = 'retry';
+                    break;
+                }
+                if (page.length === 0) {
+                    result = 'completed';
+                    break;
+                }
+
+                const fresh = getJob(initialJob.id);
+                if (!fresh || fresh.status !== 'running') return;
+                const candidates = page.filter(message => message.author?.id === fresh.targetUserId);
+                recordCandidates(fresh, candidates);
+
+                const nextCursor = oldestId(page);
+                if (nextCursor === cursor) {
+                    appendWarning(initialJob.id, `<#${channelId}> 扫描游标没有继续前进，已跳过剩余历史`);
+                    result = 'completed';
+                    break;
+                }
+                cursor = nextCursor;
+                updateScanChannelCursor(initialJob.id, channelId, cursor);
+                if (page.length < 100) {
+                    result = 'completed';
+                    break;
+                }
+                pagesRead += 1;
+                if (pagesRead >= HISTORY_PAGES_PER_SLICE) {
+                    result = 'yielded';
+                    break;
+                }
+            }
+        });
+    } catch (error) {
+        appendWarning(initialJob.id, `<#${channelId}> 无法完成归档区域扫描：${errorText(error)}`);
+        result = 'retry';
+    } finally {
+        lastHistoryPageStartedAt.delete(channelId);
+    }
+    return result;
 }
 
 async function runHistoryScan(client: Client, initialJob: CleanupJob): Promise<void> {
     const cutoffId = snowflakeAt(initialJob.cutoffAt);
-    for (let channelIndex = initialJob.cursorBatch; channelIndex < initialJob.scopeChannelIds.length; channelIndex++) {
-        const channelId = initialJob.scopeChannelIds[channelIndex];
-        let cursor = channelIndex === initialJob.cursorBatch && initialJob.cursorId
-            ? initialJob.cursorId
-            : cutoffId;
+    ensureJobScanChannels(initialJob);
 
-        try {
-            await withTemporarilyOpenedThread(client, getJob(initialJob.id)!, channelId, async () => {
-                while (stillRunning(initialJob.id)) {
-                    let page: ApiMessage[];
-                    try {
-                        page = await fetchHistoryPage(client, channelId, cursor);
-                    } catch (error) {
-                        appendWarning(initialJob.id, `<#${channelId}> 扫描中断：${errorText(error)}`);
-                        break;
-                    }
-                    if (page.length === 0) break;
-
-                    const fresh = getJob(initialJob.id)!;
-                    const candidates = page.filter(message => message.author?.id === fresh.targetUserId);
-                    if (!stillRunning(initialJob.id)) return;
-                    recordCandidates(fresh, candidates);
-
-                    const nextCursor = oldestId(page);
-                    if (nextCursor === cursor) {
-                        appendWarning(initialJob.id, `<#${channelId}> 扫描游标没有继续前进，已跳过剩余历史`);
-                        break;
-                    }
-                    updateCursor(initialJob.id, channelIndex, nextCursor);
-                    cursor = nextCursor;
-                    if (page.length < 100) break;
+    const worker = async (): Promise<void> => {
+        while (stillRunning(initialJob.id)) {
+            const scan = claimScanChannel(initialJob.id);
+            if (!scan) return;
+            const result = await scanHistoryChannel(
+                client,
+                initialJob,
+                scan.channelId,
+                scan.cursorId ?? cutoffId,
+            );
+            if (result === 'completed') {
+                completeScanChannel(initialJob.id, scan.channelId);
+            } else if (result === 'retry') {
+                if (scan.failureCount + 1 >= MAX_HISTORY_CHANNEL_FAILURES) {
+                    appendWarning(
+                        initialJob.id,
+                        `<#${scan.channelId}> 连续 ${MAX_HISTORY_CHANNEL_FAILURES} 次无法读取，已跳过该区域以免拖住整个任务`,
+                    );
+                    completeScanChannel(initialJob.id, scan.channelId);
+                } else {
+                    releaseScanChannel(initialJob.id, scan.channelId, true);
                 }
-            });
-        } catch (error) {
-            appendWarning(initialJob.id, `<#${channelId}> 无法完成归档区域扫描：${errorText(error)}`);
-        } finally {
-            lastHistoryPageStartedAt.delete(channelId);
+            } else {
+                releaseScanChannel(initialJob.id, scan.channelId);
+                if (result === 'stopped') return;
+            }
         }
+    };
 
-        if (!stillRunning(initialJob.id)) return;
-        updateCursor(initialJob.id, channelIndex + 1, null);
-    }
+    await Promise.all(Array.from({ length: historyChannelConcurrency }, () => worker()));
 }
 
 async function runScanWorker(client: Client, initialJob: CleanupJob): Promise<void> {
     if (initialJob.scanCompletedAt !== null) return;
     let job = initialJob;
+    let refreshGuildSearch = job.entireGuild && job.scanMode === 'history';
     if (job.scanMode === 'search') {
         try {
-            await runSearchScan(client, job);
+            refreshGuildSearch = job.entireGuild && await runSearchScan(client, job);
         } catch (error) {
             if (!stillRunning(job.id)) return;
+            refreshGuildSearch = job.entireGuild;
             const warning = `服务器消息快速搜索未完整结束，继续逐频道完整核验：${errorText(error)}`;
             console.warn(`[MessageCleanup] 任务 #${job.id} ${warning}`);
             appendWarning(job.id, warning);
@@ -565,7 +738,16 @@ async function runScanWorker(client: Client, initialJob: CleanupJob): Promise<vo
         job = getJob(job.id)!;
     }
 
-    await runHistoryScan(client, job);
+    let historyFinished = false;
+    const history = runHistoryScan(client, job).finally(() => { historyFinished = true; });
+    if (refreshGuildSearch) {
+        await Promise.all([
+            history,
+            refreshGuildSearchWhileHistory(client, job, () => historyFinished),
+        ]);
+    } else {
+        await history;
+    }
     if (stillRunning(job.id)) {
         markScanCompleted(job.id);
         const scanned = getJob(job.id)!;
