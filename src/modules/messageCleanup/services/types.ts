@@ -8,6 +8,32 @@ export type CleanupJobStatus =
 
 export type CleanupScanMode = 'search' | 'history';
 
+export type GuildMessageIndexStatus =
+    | 'queued'
+    | 'running'
+    | 'paused'
+    | 'cancelled'
+    | 'completed'
+    | 'failed';
+
+export interface GuildMessageIndex {
+    guildId: string;
+    status: GuildMessageIndexStatus;
+    priorityChannelIds: string[];
+    scopeChannelIds: string[];
+    scopeCount: number;
+    completedCount: number;
+    indexedMessageCount: number;
+    cutoffAt: number;
+    warningText: string | null;
+    error: string | null;
+    createdBy: string;
+    createdAt: number;
+    startedAt: number | null;
+    finishedAt: number | null;
+    updatedAt: number;
+}
+
 export interface CleanupSettings {
     guildId: string;
     manageRoleIds: string[];

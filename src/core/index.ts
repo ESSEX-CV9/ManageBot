@@ -52,7 +52,11 @@ import {
 
 // 6. 紧急消息冲水模块
 import messageCleanupCommand from '../modules/messageCleanup/commands/messageCleanupCommand';
-import { startMessageCleanupSystem } from '../modules/messageCleanup';
+import {
+    messageCleanupMessageBulkDeleteHandler,
+    messageCleanupMessageDeleteHandler,
+    startMessageCleanupSystem,
+} from '../modules/messageCleanup';
 
 // --- 进程级兜底日志（避免“无响应但控制台无日志”难以排查） ---
 const FATAL_EXIT_ON_EXCEPTION = String(process.env.FATAL_EXIT_ON_EXCEPTION || '').toLowerCase() === 'true';
@@ -175,6 +179,8 @@ client.once(Events.ClientReady, async (readyClient) => {
 
 client.on(Events.InteractionCreate, interactionCreateHandler);
 client.on(Events.MessageCreate, messageCreateHandler);
+client.on(Events.MessageDelete, messageCleanupMessageDeleteHandler);
+client.on(Events.MessageBulkDelete, messageCleanupMessageBulkDeleteHandler);
 client.on(Events.GuildMemberUpdate, handleRoleRotationMemberUpdate);
 client.on(Events.GuildMemberRemove, handleRoleRotationMemberRemove);
 

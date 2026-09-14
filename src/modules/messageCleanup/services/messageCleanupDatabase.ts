@@ -9,6 +9,8 @@ import type {
     CleanupScanMode,
     CleanupSettings,
     CreateCleanupJobInput,
+    GuildMessageIndex,
+    GuildMessageIndexStatus,
 } from './types';
 
 const DB_FILE = path.join(DATA_DIR, 'messageCleanup.sqlite');
@@ -99,6 +101,69 @@ db.exec(`
     CREATE INDEX IF NOT EXISTS idx_mc_job_scan_channel_status
         ON mc_job_scan_channel(job_id, status, position);
 
+    -- 服务器级消息元数据索引：不保存内容，只保存后续按作者定位消息所需字段。
+    CREATE TABLE IF NOT EXISTS mc_guild_message_index (
+        guild_id              TEXT PRIMARY KEY,
+        status                TEXT NOT NULL DEFAULT 'queued',
+        priority_channel_ids  TEXT NOT NULL DEFAULT '[]',
+        scope_channel_ids     TEXT NOT NULL DEFAULT '[]',
+        scope_count           INTEGER NOT NULL DEFAULT 0,
+        completed_count       INTEGER NOT NULL DEFAULT 0,
+        indexed_message_count INTEGER NOT NULL DEFAULT 0,
+        cutoff_at             INTEGER NOT NULL,
+        warning_text          TEXT,
+        error                 TEXT,
+        created_by            TEXT NOT NULL,
+        created_at            INTEGER NOT NULL,
+        started_at            INTEGER,
+        finished_at           INTEGER,
+        updated_at            INTEGER NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS mc_guild_index_channel (
+        guild_id      TEXT NOT NULL,
+        channel_id    TEXT NOT NULL,
+        position      INTEGER NOT NULL,
+        priority_group INTEGER NOT NULL DEFAULT 1,
+        cursor_id     TEXT,
+        status        TEXT NOT NULL DEFAULT 'pending',
+        failure_count INTEGER NOT NULL DEFAULT 0,
+        updated_at    INTEGER NOT NULL,
+        PRIMARY KEY (guild_id, channel_id)
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_mc_guild_index_channel_status
+        ON mc_guild_index_channel(guild_id, status, updated_at, position);
+
+    CREATE TABLE IF NOT EXISTS mc_message_cache (
+        guild_id    TEXT NOT NULL,
+        channel_id  TEXT NOT NULL,
+        message_id  TEXT NOT NULL,
+        author_id   TEXT NOT NULL,
+        created_at  INTEGER NOT NULL,
+        indexed_at  INTEGER NOT NULL,
+        PRIMARY KEY (guild_id, message_id)
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_mc_message_cache_author
+        ON mc_message_cache(guild_id, author_id, created_at);
+
+    -- covered_until 表示该频道所有早于此时刻的历史均已写入索引，可按频道增量补扫。
+    CREATE TABLE IF NOT EXISTS mc_index_coverage (
+        guild_id      TEXT NOT NULL,
+        channel_id    TEXT NOT NULL,
+        covered_until INTEGER NOT NULL,
+        updated_at    INTEGER NOT NULL,
+        PRIMARY KEY (guild_id, channel_id)
+    );
+
+    CREATE TABLE IF NOT EXISTS mc_index_opened_thread (
+        guild_id    TEXT NOT NULL,
+        channel_id  TEXT NOT NULL,
+        opened_at   INTEGER NOT NULL,
+        PRIMARY KEY (guild_id, channel_id)
+    );
+
     -- 面板清空请求只在执行器安全退出前短暂存在，完成后整行移除。
     CREATE TABLE IF NOT EXISTS mc_list_clear (
         guild_id        TEXT PRIMARY KEY,
@@ -120,9 +185,21 @@ ensureColumn('mc_job_message', 'attempt_count', 'INTEGER NOT NULL DEFAULT 0');
 ensureColumn('mc_job_message', 'next_attempt_at', 'INTEGER NOT NULL DEFAULT 0');
 ensureColumn('mc_job_message', 'last_error', 'TEXT');
 ensureColumn('mc_job_scan_channel', 'failure_count', 'INTEGER NOT NULL DEFAULT 0');
+ensureColumn('mc_guild_message_index', 'priority_channel_ids', "TEXT NOT NULL DEFAULT '[]'");
+ensureColumn('mc_guild_index_channel', 'priority_group', 'INTEGER NOT NULL DEFAULT 1');
 db.exec(`
     CREATE INDEX IF NOT EXISTS idx_mc_job_message_pending
         ON mc_job_message(job_id, outcome, next_attempt_at, channel_id);
+
+    -- 兼容上一版已经完整建好的索引，把其频道完成状态迁移为可复用的覆盖水位。
+    INSERT INTO mc_index_coverage (guild_id, channel_id, covered_until, updated_at)
+    SELECT c.guild_id, c.channel_id, i.cutoff_at, i.updated_at
+    FROM mc_guild_index_channel c
+    JOIN mc_guild_message_index i ON i.guild_id = c.guild_id
+    WHERE c.status = 'completed' AND i.status = 'completed'
+    ON CONFLICT(guild_id, channel_id) DO UPDATE SET
+        covered_until = MAX(mc_index_coverage.covered_until, excluded.covered_until),
+        updated_at = MAX(mc_index_coverage.updated_at, excluded.updated_at);
 `);
 
 interface SettingsRow {
@@ -156,6 +233,24 @@ interface JobRow {
     failed_count: number;
     warning_text: string | null;
     error: string | null;
+    created_at: number;
+    started_at: number | null;
+    finished_at: number | null;
+    updated_at: number;
+}
+
+interface GuildIndexRow {
+    guild_id: string;
+    status: GuildMessageIndexStatus;
+    priority_channel_ids: string;
+    scope_channel_ids: string;
+    scope_count: number;
+    completed_count: number;
+    indexed_message_count: number;
+    cutoff_at: number;
+    warning_text: string | null;
+    error: string | null;
+    created_by: string;
     created_at: number;
     started_at: number | null;
     finished_at: number | null;
@@ -207,6 +302,26 @@ function mapJob(row: JobRow): CleanupJob {
         failedCount: row.failed_count,
         warningText: row.warning_text,
         error: row.error,
+        createdAt: row.created_at,
+        startedAt: row.started_at,
+        finishedAt: row.finished_at,
+        updatedAt: row.updated_at,
+    };
+}
+
+function mapGuildIndex(row: GuildIndexRow): GuildMessageIndex {
+    return {
+        guildId: row.guild_id,
+        status: row.status,
+        priorityChannelIds: parseIds(row.priority_channel_ids),
+        scopeChannelIds: parseIds(row.scope_channel_ids),
+        scopeCount: row.scope_count,
+        completedCount: row.completed_count,
+        indexedMessageCount: row.indexed_message_count,
+        cutoffAt: row.cutoff_at,
+        warningText: row.warning_text,
+        error: row.error,
+        createdBy: row.created_by,
         createdAt: row.created_at,
         startedAt: row.started_at,
         finishedAt: row.finished_at,
@@ -322,7 +437,14 @@ const createJobTransaction = db.transaction((input: CreateCleanupJobInput): Crea
 
 export function createJob(input: CreateCleanupJobInput): CreateCleanupJobResult {
     const result = createJobTransaction(input);
-    if (result.created && result.job) appendRuntimeFileRecord('maintenance.task_created', taskLogDetails(result.job));
+    if (result.created && result.job) {
+        appendRuntimeFileRecord('maintenance.task_created', taskLogDetails(result.job));
+        ensureGuildMessageIndexForCleanup(
+            input.guildId,
+            input.actorId,
+            input.entireGuild ? [] : input.selectedChannelIds,
+        );
+    }
     return result;
 }
 
@@ -382,7 +504,7 @@ export interface CleanupScanChannel {
 /**
  * 新任务直接建立逐频道扫描账；旧任务首次升级时把原来的单游标进度迁入账中。
  */
-export function ensureJobScanChannels(job: CleanupJob): void {
+export function ensureJobScanChannels(job: CleanupJob, acceptIndexedBase = false): void {
     const existing = db.prepare('SELECT COUNT(*) AS count FROM mc_job_scan_channel WHERE job_id = ?')
         .get(job.id) as { count: number };
     if (existing.count > 0) return;
@@ -393,9 +515,13 @@ export function ensureJobScanChannels(job: CleanupJob): void {
         ) VALUES (?, ?, ?, ?, ?, ?)
     `);
     const now = Date.now();
+    const coverage = indexedCoverageMap(job.guildId);
     db.transaction(() => {
         job.scopeChannelIds.forEach((channelId, position) => {
-            const completed = position < job.cursorBatch;
+            const coveredUntil = coverage.get(channelId) ?? 0;
+            const completed = coveredUntil >= job.cutoffAt
+                || (acceptIndexedBase && coveredUntil > 0)
+                || position < job.cursorBatch;
             const cursorId = position === job.cursorBatch ? job.cursorId : null;
             insert.run(job.id, channelId, position, cursorId, completed ? 'completed' : 'pending', now);
         });
@@ -470,6 +596,502 @@ export function completeScanChannel(jobId: number, channelId: string): void {
             WHERE id = ?
         `).run(jobId, now, jobId);
     })();
+}
+
+export interface IndexedMessageRef {
+    channelId: string;
+    messageId: string;
+    authorId: string;
+    createdAt: number;
+}
+
+export interface GuildIndexChannel {
+    channelId: string;
+    cursorId: string | null;
+    failureCount: number;
+}
+
+export function getGuildMessageIndex(guildId: string): GuildMessageIndex | null {
+    const row = db.prepare('SELECT * FROM mc_guild_message_index WHERE guild_id = ?')
+        .get(guildId) as GuildIndexRow | undefined;
+    return row ? mapGuildIndex(row) : null;
+}
+
+export function getGuildIndexPriorityProgress(guildId: string): { completed: number; total: number } {
+    const row = db.prepare(`
+        SELECT
+            COUNT(*) AS total,
+            SUM(CASE WHEN status = 'completed' THEN 1 ELSE 0 END) AS completed
+        FROM mc_guild_index_channel
+        WHERE guild_id = ? AND priority_group = 0
+    `).get(guildId) as { total: number; completed: number | null };
+    return { completed: row.completed ?? 0, total: row.total };
+}
+
+export function updateGuildIndexPriorities(
+    guildId: string,
+    selectedChannelIds: string[],
+    resolvedPriorityChannelIds: string[],
+): void {
+    const selected = [...new Set(selectedChannelIds)];
+    const resolved = new Set(resolvedPriorityChannelIds);
+    const now = Date.now();
+    db.transaction(() => {
+        db.prepare(`
+            UPDATE mc_guild_message_index SET priority_channel_ids = ?, updated_at = ?
+            WHERE guild_id = ?
+        `).run(JSON.stringify(selected), now, guildId);
+        db.prepare(`
+            UPDATE mc_guild_index_channel SET priority_group = 1 WHERE guild_id = ?
+        `).run(guildId);
+        const prioritize = db.prepare(`
+            UPDATE mc_guild_index_channel SET priority_group = 0, updated_at = ?
+            WHERE guild_id = ? AND channel_id = ?
+        `);
+        for (const channelId of resolved) prioritize.run(now, guildId, channelId);
+    })();
+}
+
+export interface RequestGuildIndexResult {
+    index: GuildMessageIndex;
+    created: boolean;
+}
+
+export function requestGuildMessageIndex(
+    guildId: string,
+    actorId: string,
+    priorityChannelIds: string[] = [],
+): RequestGuildIndexResult {
+    const existing = getGuildMessageIndex(guildId);
+    if (existing && ['queued', 'running', 'paused'].includes(existing.status)) {
+        return { index: existing, created: false };
+    }
+
+    const now = Date.now();
+    const priority = [...new Set(priorityChannelIds)];
+    db.transaction(() => {
+        db.prepare('DELETE FROM mc_guild_index_channel WHERE guild_id = ?').run(guildId);
+        db.prepare(`
+            INSERT INTO mc_guild_message_index (
+                guild_id, status, priority_channel_ids, scope_channel_ids, scope_count, completed_count,
+                indexed_message_count, cutoff_at, warning_text, error,
+                created_by, created_at, started_at, finished_at, updated_at
+            ) VALUES (
+                ?, 'queued', ?, '[]', 0, 0,
+                (SELECT COUNT(*) FROM mc_message_cache WHERE guild_id = ?),
+                ?, NULL, NULL, ?, ?, NULL, NULL, ?
+            )
+            ON CONFLICT(guild_id) DO UPDATE SET
+                status = 'queued', priority_channel_ids = excluded.priority_channel_ids,
+                scope_channel_ids = '[]', scope_count = 0,
+                completed_count = 0, indexed_message_count = excluded.indexed_message_count,
+                cutoff_at = excluded.cutoff_at, warning_text = NULL, error = NULL,
+                created_by = excluded.created_by, created_at = excluded.created_at,
+                started_at = NULL, finished_at = NULL, updated_at = excluded.updated_at
+        `).run(guildId, JSON.stringify(priority), guildId, now, actorId, now, now);
+    })();
+    const index = getGuildMessageIndex(guildId)!;
+    appendRuntimeFileRecord('maintenance.guild_index_requested', {
+        guild_id: guildId,
+        action_by: actorId,
+        cutoff_at: now,
+        priority_channel_ids: priority,
+    });
+    return { index, created: true };
+}
+
+/** 第一次冲水时自动建立可续跑的索引任务；已有索引时绝不覆盖用户的暂停/取消决定。 */
+export function ensureGuildMessageIndexForCleanup(
+    guildId: string,
+    actorId: string,
+    priorityChannelIds: string[] = [],
+): GuildMessageIndex {
+    const existing = getGuildMessageIndex(guildId);
+    if (existing) return existing;
+
+    const now = Date.now();
+    const priority = [...new Set(priorityChannelIds)];
+    db.prepare(`
+        INSERT OR IGNORE INTO mc_guild_message_index (
+            guild_id, status, priority_channel_ids, scope_channel_ids,
+            scope_count, completed_count, indexed_message_count, cutoff_at,
+            warning_text, error, created_by, created_at, started_at, finished_at, updated_at
+        ) VALUES (?, 'queued', ?, '[]', 0, 0, 0, ?, NULL, NULL, ?, ?, NULL, NULL, ?)
+    `).run(guildId, JSON.stringify(priority), now, actorId, now, now);
+    const index = getGuildMessageIndex(guildId)!;
+    appendRuntimeFileRecord('maintenance.guild_index_auto_created', {
+        guild_id: guildId,
+        action_by: actorId,
+        cleanup_priority_channel_ids: priority,
+        cutoff_at: now,
+    });
+    return index;
+}
+
+export function listRunnableGuildIndexes(): GuildMessageIndex[] {
+    const rows = db.prepare(`
+        SELECT * FROM mc_guild_message_index WHERE status = 'queued' ORDER BY created_at ASC
+    `).all() as GuildIndexRow[];
+    return rows.map(mapGuildIndex);
+}
+
+export function claimGuildMessageIndex(guildId: string): GuildMessageIndex | null {
+    const now = Date.now();
+    const changed = db.prepare(`
+        UPDATE mc_guild_message_index SET
+            status = 'running', started_at = COALESCE(started_at, ?), error = NULL, updated_at = ?
+        WHERE guild_id = ? AND status = 'queued'
+    `).run(now, now, guildId).changes;
+    return changed > 0 ? getGuildMessageIndex(guildId) : null;
+}
+
+export function recoverInterruptedGuildIndexes(): number {
+    const now = Date.now();
+    return db.transaction(() => {
+        db.prepare(`
+            UPDATE mc_guild_index_channel SET status = 'pending', updated_at = ? WHERE status = 'running'
+        `).run(now);
+        return db.prepare(`
+            UPDATE mc_guild_message_index SET status = 'queued', updated_at = ? WHERE status = 'running'
+        `).run(now).changes;
+    })();
+}
+
+export function getIndexedCoverage(guildId: string, channelId: string): number | null {
+    const row = db.prepare(`
+        SELECT covered_until FROM mc_index_coverage WHERE guild_id = ? AND channel_id = ?
+    `).get(guildId, channelId) as { covered_until: number } | undefined;
+    return row?.covered_until ?? null;
+}
+
+function indexedCoverageMap(guildId: string): Map<string, number> {
+    const rows = db.prepare(`
+        SELECT channel_id, covered_until FROM mc_index_coverage WHERE guild_id = ?
+    `).all(guildId) as { channel_id: string; covered_until: number }[];
+    return new Map(rows.map(row => [row.channel_id, row.covered_until]));
+}
+
+export function markIndexedCoverage(guildId: string, channelId: string, coveredUntil: number): void {
+    const now = Date.now();
+    db.prepare(`
+        INSERT INTO mc_index_coverage (guild_id, channel_id, covered_until, updated_at)
+        VALUES (?, ?, ?, ?)
+        ON CONFLICT(guild_id, channel_id) DO UPDATE SET
+            covered_until = MAX(mc_index_coverage.covered_until, excluded.covered_until),
+            updated_at = excluded.updated_at
+    `).run(guildId, channelId, coveredUntil, now);
+}
+
+export function areChannelsIndexedThrough(
+    guildId: string,
+    channelIds: string[],
+    cutoffAt: number,
+): boolean {
+    if (channelIds.length === 0) return false;
+    const coverage = indexedCoverageMap(guildId);
+    return channelIds.every(channelId => (coverage.get(channelId) ?? 0) >= cutoffAt);
+}
+
+export function doChannelsHaveIndexedBase(guildId: string, channelIds: string[]): boolean {
+    if (channelIds.length === 0) return false;
+    const coverage = indexedCoverageMap(guildId);
+    return channelIds.every(channelId => (coverage.get(channelId) ?? 0) > 0);
+}
+
+export function setGuildIndexScope(
+    guildId: string,
+    channelIds: string[],
+    priorityChannelIds: string[],
+    warnings: string[],
+): void {
+    const normalized = [...new Set(channelIds)];
+    const priority = new Set(priorityChannelIds);
+    const index = getGuildMessageIndex(guildId);
+    if (!index) return;
+    const coverage = indexedCoverageMap(guildId);
+    const now = Date.now();
+    const insert = db.prepare(`
+        INSERT INTO mc_guild_index_channel (
+            guild_id, channel_id, position, priority_group, cursor_id, status, failure_count, updated_at
+        ) VALUES (?, ?, ?, ?, NULL, ?, 0, ?)
+    `);
+    db.transaction(() => {
+        db.prepare('DELETE FROM mc_guild_index_channel WHERE guild_id = ?').run(guildId);
+        let completedCount = 0;
+        normalized.forEach((channelId, position) => {
+            const completed = (coverage.get(channelId) ?? 0) >= index.cutoffAt;
+            if (completed) completedCount += 1;
+            insert.run(
+                guildId,
+                channelId,
+                position,
+                priority.has(channelId) ? 0 : 1,
+                completed ? 'completed' : 'pending',
+                now,
+            );
+        });
+        db.prepare(`
+            UPDATE mc_guild_message_index SET
+                scope_channel_ids = ?, scope_count = ?, completed_count = ?,
+                warning_text = ?, updated_at = ?
+            WHERE guild_id = ?
+        `).run(
+            JSON.stringify(normalized),
+            normalized.length,
+            completedCount,
+            warnings.length ? warnings.join('\n').slice(0, 4000) : null,
+            now,
+            guildId,
+        );
+    })();
+}
+
+const claimGuildIndexChannelTransaction = db.transaction((guildId: string): GuildIndexChannel | null => {
+    const row = db.prepare(`
+        SELECT channel_id, cursor_id, failure_count
+        FROM mc_guild_index_channel
+        WHERE guild_id = ? AND status = 'pending'
+        ORDER BY priority_group ASC, updated_at ASC, position ASC
+        LIMIT 1
+    `).get(guildId) as { channel_id: string; cursor_id: string | null; failure_count: number } | undefined;
+    if (!row) return null;
+    const changed = db.prepare(`
+        UPDATE mc_guild_index_channel SET status = 'running', updated_at = ?
+        WHERE guild_id = ? AND channel_id = ? AND status = 'pending'
+    `).run(Date.now(), guildId, row.channel_id).changes;
+    return changed > 0
+        ? { channelId: row.channel_id, cursorId: row.cursor_id, failureCount: row.failure_count }
+        : null;
+});
+
+export function claimGuildIndexChannel(guildId: string): GuildIndexChannel | null {
+    return claimGuildIndexChannelTransaction(guildId);
+}
+
+export function updateGuildIndexChannelCursor(guildId: string, channelId: string, cursorId: string): void {
+    db.prepare(`
+        UPDATE mc_guild_index_channel SET cursor_id = ?, failure_count = 0, updated_at = ?
+        WHERE guild_id = ? AND channel_id = ? AND status = 'running'
+    `).run(cursorId, Date.now(), guildId, channelId);
+}
+
+export function releaseGuildIndexChannel(guildId: string, channelId: string, failed = false): void {
+    db.prepare(`
+        UPDATE mc_guild_index_channel SET
+            status = 'pending', failure_count = failure_count + ?, updated_at = ?
+        WHERE guild_id = ? AND channel_id = ? AND status = 'running'
+    `).run(failed ? 1 : 0, Date.now(), guildId, channelId);
+}
+
+export function completeGuildIndexChannel(guildId: string, channelId: string): void {
+    const index = getGuildMessageIndex(guildId);
+    const now = Date.now();
+    db.transaction(() => {
+        db.prepare(`
+            UPDATE mc_guild_index_channel SET status = 'completed', cursor_id = NULL, updated_at = ?
+            WHERE guild_id = ? AND channel_id = ? AND status = 'running'
+        `).run(now, guildId, channelId);
+        db.prepare(`
+            UPDATE mc_guild_message_index SET
+                completed_count = (
+                    SELECT COUNT(*) FROM mc_guild_index_channel
+                    WHERE guild_id = ? AND status = 'completed'
+                ),
+                updated_at = ?
+            WHERE guild_id = ?
+        `).run(guildId, now, guildId);
+        if (index) markIndexedCoverage(guildId, channelId, index.cutoffAt);
+    })();
+}
+
+export function failGuildIndexChannel(guildId: string, channelId: string): void {
+    const now = Date.now();
+    db.transaction(() => {
+        db.prepare(`
+            UPDATE mc_guild_index_channel SET status = 'failed', updated_at = ?
+            WHERE guild_id = ? AND channel_id = ? AND status = 'running'
+        `).run(now, guildId, channelId);
+        db.prepare(`
+            UPDATE mc_guild_message_index SET
+                completed_count = (
+                    SELECT COUNT(*) FROM mc_guild_index_channel
+                    WHERE guild_id = ? AND status IN ('completed', 'failed')
+                ),
+                updated_at = ?
+            WHERE guild_id = ?
+        `).run(guildId, now, guildId);
+    })();
+}
+
+export function hasGuildIndexChannelFailures(guildId: string): boolean {
+    return Boolean(db.prepare(`
+        SELECT 1 FROM mc_guild_index_channel
+        WHERE guild_id = ? AND status = 'failed' LIMIT 1
+    `).get(guildId));
+}
+
+export function recordIndexedMessages(guildId: string, messages: IndexedMessageRef[]): number {
+    if (messages.length === 0) return 0;
+    const insert = db.prepare(`
+        INSERT OR IGNORE INTO mc_message_cache (
+            guild_id, channel_id, message_id, author_id, created_at, indexed_at
+        ) VALUES (?, ?, ?, ?, ?, ?)
+    `);
+    const now = Date.now();
+    let added = 0;
+    db.transaction(() => {
+        for (const message of messages) {
+            added += insert.run(
+                guildId,
+                message.channelId,
+                message.messageId,
+                message.authorId,
+                message.createdAt,
+                now,
+            ).changes;
+        }
+        if (added > 0) {
+            db.prepare(`
+                UPDATE mc_guild_message_index
+                SET indexed_message_count = indexed_message_count + ?, updated_at = ?
+                WHERE guild_id = ?
+            `).run(added, now, guildId);
+        }
+    })();
+    return added;
+}
+
+export function recordLiveIndexedMessage(message: IndexedMessageRef & { guildId: string }): void {
+    const index = getGuildMessageIndex(message.guildId);
+    if (!index || !['queued', 'running', 'paused', 'completed'].includes(index.status)) return;
+    recordIndexedMessages(message.guildId, [message]);
+}
+
+export function removeIndexedMessages(messageIds: string[]): void {
+    if (messageIds.length === 0) return;
+    const find = db.prepare('SELECT guild_id FROM mc_message_cache WHERE message_id = ?');
+    const remove = db.prepare('DELETE FROM mc_message_cache WHERE message_id = ?');
+    db.transaction(() => {
+        const removedByGuild = new Map<string, number>();
+        for (const messageId of messageIds) {
+            const row = find.get(messageId) as { guild_id: string } | undefined;
+            if (!row || remove.run(messageId).changes === 0) continue;
+            removedByGuild.set(row.guild_id, (removedByGuild.get(row.guild_id) ?? 0) + 1);
+        }
+        const now = Date.now();
+        const decrement = db.prepare(`
+            UPDATE mc_guild_message_index
+            SET indexed_message_count = MAX(0, indexed_message_count - ?), updated_at = ?
+            WHERE guild_id = ?
+        `);
+        for (const [guildId, count] of removedByGuild) decrement.run(count, now, guildId);
+    })();
+}
+
+export function listIndexedCandidates(
+    guildId: string,
+    targetUserId: string,
+    allowedChannelIds: string[],
+    cutoffAt: number,
+): { channelId: string; messageId: string }[] {
+    const allowed = new Set(allowedChannelIds);
+    const rows = db.prepare(`
+        SELECT channel_id, message_id
+        FROM mc_message_cache
+        WHERE guild_id = ? AND author_id = ? AND created_at < ?
+        ORDER BY created_at DESC
+    `).all(guildId, targetUserId, cutoffAt) as { channel_id: string; message_id: string }[];
+    return rows
+        .filter(row => allowed.has(row.channel_id))
+        .map(row => ({ channelId: row.channel_id, messageId: row.message_id }));
+}
+
+export function appendGuildIndexWarning(guildId: string, warning: string): void {
+    const index = getGuildMessageIndex(guildId);
+    const lines = new Set((index?.warningText ?? '').split('\n').filter(Boolean));
+    lines.add(warning);
+    db.prepare(`
+        UPDATE mc_guild_message_index SET warning_text = ?, updated_at = ? WHERE guild_id = ?
+    `).run([...lines].join('\n').slice(0, 4000), Date.now(), guildId);
+}
+
+export function setGuildMessageIndexStatus(
+    guildId: string,
+    status: GuildMessageIndexStatus,
+    error: string | null = null,
+): void {
+    const terminal = ['cancelled', 'completed', 'failed'].includes(status);
+    const now = Date.now();
+    db.prepare(`
+        UPDATE mc_guild_message_index SET
+            status = ?, error = ?,
+            finished_at = CASE WHEN ? THEN ? ELSE finished_at END,
+            updated_at = ?
+        WHERE guild_id = ?
+    `).run(status, error, terminal ? 1 : 0, now, now, guildId);
+    if (terminal) {
+        const index = getGuildMessageIndex(guildId);
+        if (index) appendRuntimeFileRecord(`maintenance.guild_index_${status}`, { ...index });
+    }
+}
+
+export function pauseGuildMessageIndex(guildId: string): boolean {
+    return db.prepare(`
+        UPDATE mc_guild_message_index SET status = 'paused', updated_at = ?
+        WHERE guild_id = ? AND status IN ('queued', 'running')
+    `).run(Date.now(), guildId).changes > 0;
+}
+
+/** 紧急清理到来时让正在运行的索引安全退回队列，清理结束后调度器会自动续跑。 */
+export function yieldGuildMessageIndex(guildId: string): boolean {
+    return db.prepare(`
+        UPDATE mc_guild_message_index SET status = 'queued', updated_at = ?
+        WHERE guild_id = ? AND status = 'running'
+    `).run(Date.now(), guildId).changes > 0;
+}
+
+export function resumeGuildMessageIndex(guildId: string): boolean {
+    return db.prepare(`
+        UPDATE mc_guild_message_index SET status = 'queued', updated_at = ?
+        WHERE guild_id = ? AND status = 'paused'
+    `).run(Date.now(), guildId).changes > 0;
+}
+
+export function cancelGuildMessageIndex(guildId: string): boolean {
+    const now = Date.now();
+    return db.prepare(`
+        UPDATE mc_guild_message_index SET status = 'cancelled', finished_at = ?, updated_at = ?
+        WHERE guild_id = ? AND status IN ('queued', 'running', 'paused')
+    `).run(now, now, guildId).changes > 0;
+}
+
+export function markIndexThreadOpened(guildId: string, channelId: string): void {
+    db.prepare(`
+        INSERT INTO mc_index_opened_thread (guild_id, channel_id, opened_at)
+        VALUES (?, ?, ?) ON CONFLICT(guild_id, channel_id) DO NOTHING
+    `).run(guildId, channelId, Date.now());
+}
+
+export function unmarkIndexThreadOpened(guildId: string, channelId: string): void {
+    db.prepare('DELETE FROM mc_index_opened_thread WHERE guild_id = ? AND channel_id = ?')
+        .run(guildId, channelId);
+}
+
+export function isIndexThreadMarkedOpened(guildId: string, channelId: string): boolean {
+    return Boolean(db.prepare(`
+        SELECT 1 FROM mc_index_opened_thread WHERE guild_id = ? AND channel_id = ?
+    `).get(guildId, channelId));
+}
+
+export function listRestorableIndexThreads(): { guildId: string; channelId: string }[] {
+    const rows = db.prepare(`
+        SELECT t.guild_id, t.channel_id
+        FROM mc_index_opened_thread t
+        LEFT JOIN mc_guild_message_index i ON i.guild_id = t.guild_id
+        WHERE i.status IS NULL OR i.status <> 'running'
+        ORDER BY t.opened_at ASC
+    `).all() as { guild_id: string; channel_id: string }[];
+    return rows.map(row => ({ guildId: row.guild_id, channelId: row.channel_id }));
 }
 
 export function setScanMode(jobId: number, mode: CleanupScanMode, resetCursor = false): void {
@@ -572,6 +1194,11 @@ const recordResultsTransaction = db.transaction((jobId: number, results: Cleanup
 export function recordMessageResults(jobId: number, results: CleanupMessageResult[]): void {
     if (results.length === 0) return;
     recordResultsTransaction(jobId, results);
+    removeIndexedMessages(
+        results
+            .filter(result => result.outcome === 'deleted' || result.outcome === 'skipped')
+            .map(result => result.messageId),
+    );
 }
 
 interface PendingMessageRow {

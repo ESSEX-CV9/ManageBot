@@ -10,12 +10,19 @@ import {
     type ThreadChannel,
 } from 'discord.js';
 
-import type { CleanupJob } from './types';
-
 type ParentChannel = TextChannel | NewsChannel | ForumChannel | MediaChannel;
+
+export interface CleanupScopeSpec {
+    selectedChannelIds: string[];
+    entireGuild: boolean;
+    excludedChannelIds: string[];
+    includeThreads: boolean;
+    priorityChannelIds?: string[];
+}
 
 export interface ScopeResolution {
     channelIds: string[];
+    priorityChannelIds: string[];
     warnings: string[];
 }
 
@@ -98,7 +105,7 @@ async function fetchAllArchived(parent: ParentChannel, type: 'public' | 'private
     return [...result.values()];
 }
 
-export async function resolveCleanupScope(guild: Guild, job: CleanupJob): Promise<ScopeResolution> {
+export async function resolveCleanupScope(guild: Guild, job: CleanupScopeSpec): Promise<ScopeResolution> {
     const warnings: string[] = [];
     const selected = new Set(job.selectedChannelIds);
     const excluded = new Set(job.excludedChannelIds);
@@ -204,5 +211,32 @@ export async function resolveCleanupScope(guild: Guild, job: CleanupJob): Promis
         resolved.add(thread.id);
     }
 
-    return { channelIds: [...resolved].sort(), warnings: [...new Set(warnings)] };
+    const prioritySelections = new Set(job.priorityChannelIds ?? []);
+    const priorityResolved = new Set<string>();
+    if (prioritySelections.size > 0) {
+        for (const parent of parents.values()) {
+            if (!resolved.has(parent.id)) continue;
+            if (prioritySelections.has(parent.id)
+                || (parent.parentId && prioritySelections.has(parent.parentId))) {
+                priorityResolved.add(parent.id);
+            }
+        }
+        for (const thread of allThreads.values()) {
+            if (!resolved.has(thread.id)) continue;
+            const parentCategoryId = thread.parent?.parentId
+                ?? (thread.parentId ? parents.get(thread.parentId)?.parentId : null);
+            if (prioritySelections.has(thread.id)
+                || (thread.parentId && prioritySelections.has(thread.parentId))
+                || (parentCategoryId && prioritySelections.has(parentCategoryId))) {
+                priorityResolved.add(thread.id);
+            }
+        }
+    }
+
+    const priorityChannelIds = [...priorityResolved].sort();
+    const channelIds = [
+        ...priorityChannelIds,
+        ...[...resolved].filter(id => !priorityResolved.has(id)).sort(),
+    ];
+    return { channelIds, priorityChannelIds, warnings: [...new Set(warnings)] };
 }

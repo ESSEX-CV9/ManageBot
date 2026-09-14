@@ -5,9 +5,15 @@
 // 接入新模块：import 其 handler 并在下方加一个 try/catch 调用。
 
 import type { Message } from 'discord.js';
+import { messageCleanupMessageCreateHandler } from '../../modules/messageCleanup';
 import { templateMessageCreateHandler } from '../../modules/template';
 
 export async function messageCreateHandler(message: Message): Promise<void> {
+    try {
+        messageCleanupMessageCreateHandler(message);
+    } catch (error) {
+        console.error('更新冲水消息索引时出错:', error);
+    }
     try {
         await templateMessageCreateHandler(message);
     } catch (error) {

@@ -1,25 +1,46 @@
 import type { Client, ThreadChannel } from 'discord.js';
 
 import {
+    areChannelsIndexedThrough,
+    appendGuildIndexWarning,
     appendWarning,
+    claimGuildIndexChannel,
     claimScanChannel,
+    completeGuildIndexChannel,
     completeScanChannel,
+    doChannelsHaveIndexedBase,
+    ensureGuildMessageIndexForCleanup,
     ensureJobScanChannels,
+    failGuildIndexChannel,
     getDeletionQueueState,
+    getGuildMessageIndex,
+    getIndexedCoverage,
     getJob,
+    hasGuildIndexChannelFailures,
+    isIndexThreadMarkedOpened,
     isThreadMarkedOpened,
+    listIndexedCandidates,
     listPendingMessages,
+    listRestorableIndexThreads,
     listRestorableOpenedThreads,
+    markIndexThreadOpened,
+    markIndexedCoverage,
     markThreadOpened,
     markScanCompleted,
+    recordIndexedMessages,
     recordMessageCandidates,
     recordMessageResults,
+    releaseGuildIndexChannel,
     releaseScanChannel,
+    setGuildIndexScope,
+    setGuildMessageIndexStatus,
     setJobStatus,
     setResolvedScope,
     setScanMode,
+    unmarkIndexThreadOpened,
     unmarkThreadOpened,
     updateCursor,
+    updateGuildIndexChannelCursor,
     updateScanChannelCursor,
 } from './messageCleanupDatabase';
 import type {
@@ -30,6 +51,7 @@ import type {
 import { snowflakeAt, timestampFromSnowflake } from './cleanupTime';
 import { resolveCleanupScope } from './scopeResolver';
 import type { CleanupJob } from './types';
+import type { GuildMessageIndex } from './types';
 
 interface ApiMessage {
     id: string;
@@ -150,6 +172,10 @@ function oldestId(messages: ApiMessage[]): string {
 
 function stillRunning(jobId: number): boolean {
     return getJob(jobId)?.status === 'running';
+}
+
+function indexStillRunning(guildId: string): boolean {
+    return getGuildMessageIndex(guildId)?.status === 'running';
 }
 
 async function wait(ms: number): Promise<void> {
@@ -289,6 +315,86 @@ export async function restoreDanglingArchivedThreads(
     for (const record of listRestorableOpenedThreads()) {
         if (skipGuildIds.has(record.guildId)) continue;
         await restoreMarkedThread(client, record.jobId, record.channelId);
+    }
+}
+
+async function restoreMarkedIndexThread(client: Client, guildId: string, channelId: string): Promise<boolean> {
+    try {
+        const thread = await fetchThread(client, channelId);
+        if (!thread) {
+            unmarkIndexThreadOpened(guildId, channelId);
+            return true;
+        }
+        if (!thread.archived) {
+            await thread.setArchived(true, '恢复全服消息索引前的归档状态');
+        }
+        unmarkIndexThreadOpened(guildId, channelId);
+        return true;
+    } catch (error) {
+        appendGuildIndexWarning(guildId, `<#${channelId}> 建库后重新归档失败，将由后台继续重试：${errorText(error)}`);
+        return false;
+    }
+}
+
+async function withTemporarilyOpenedIndexThread<T>(
+    client: Client,
+    guildId: string,
+    channelId: string,
+    action: () => Promise<T>,
+): Promise<T> {
+    const leaseKey = `index:${guildId}:${channelId}`;
+    let released = false;
+    const release = await withThreadTransitionLock(leaseKey, async (): Promise<(() => Promise<void>) | null> => {
+        const existing = threadLeases.get(leaseKey);
+        if (existing) {
+            existing.count += 1;
+        } else {
+            const thread = await fetchThread(client, channelId).catch(() => null);
+            if (!thread) return null;
+
+            const alreadyMarked = isIndexThreadMarkedOpened(guildId, channelId);
+            const restoreArchived = thread.archived || alreadyMarked;
+            if (thread.archived) {
+                markIndexThreadOpened(guildId, channelId);
+                try {
+                    await thread.setArchived(false, '临时建立全服消息索引');
+                } catch (error) {
+                    await restoreMarkedIndexThread(client, guildId, channelId);
+                    throw new Error(`<#${channelId}> 无法临时打开：${errorText(error)}`, { cause: error });
+                }
+            }
+            threadLeases.set(leaseKey, { count: 1, restoreArchived });
+        }
+
+        return async (): Promise<void> => {
+            if (released) return;
+            released = true;
+            await withThreadTransitionLock(leaseKey, async () => {
+                const state = threadLeases.get(leaseKey);
+                if (!state) return;
+                state.count -= 1;
+                if (state.count > 0) return;
+                threadLeases.delete(leaseKey);
+                if (state.restoreArchived) await restoreMarkedIndexThread(client, guildId, channelId);
+            });
+        };
+    });
+
+    try {
+        return await action();
+    } finally {
+        await release?.();
+    }
+}
+
+/** 恢复被暂停、取消或进程重启打断的全服索引所临时打开的归档区域。 */
+export async function restoreDanglingIndexThreads(
+    client: Client,
+    skipGuildIds: ReadonlySet<string> = new Set(),
+): Promise<void> {
+    for (const record of listRestorableIndexThreads()) {
+        if (skipGuildIds.has(record.guildId)) continue;
+        await restoreMarkedIndexThread(client, record.guildId, record.channelId);
     }
 }
 
@@ -621,15 +727,193 @@ async function fetchHistoryPage(client: Client, channelId: string, before: strin
     return Array.isArray(raw) ? raw as ApiMessage[] : [];
 }
 
+function toIndexedMessages(channelId: string, page: ApiMessage[]): {
+    channelId: string;
+    messageId: string;
+    authorId: string;
+    createdAt: number;
+}[] {
+    const result: { channelId: string; messageId: string; authorId: string; createdAt: number }[] = [];
+    for (const message of page) {
+        const authorId = message.author?.id;
+        if (!authorId || !message.id) continue;
+        try {
+            result.push({
+                channelId,
+                messageId: message.id,
+                authorId,
+                createdAt: timestampFromSnowflake(message.id),
+            });
+        } catch {
+            // 非法消息 ID 不应阻断整个频道的索引。
+        }
+    }
+    return result;
+}
+
+async function scanGuildIndexChannel(
+    client: Client,
+    index: GuildMessageIndex,
+    channelId: string,
+    initialCursor: string,
+): Promise<'completed' | 'abandoned' | 'yielded' | 'retry' | 'stopped'> {
+    let cursor = initialCursor;
+    let result: 'completed' | 'abandoned' | 'yielded' | 'retry' | 'stopped' = 'stopped';
+    let pagesRead = 0;
+    const coveredUntil = getIndexedCoverage(index.guildId, channelId) ?? 0;
+    try {
+        await withTemporarilyOpenedIndexThread(client, index.guildId, channelId, async () => {
+            while (indexStillRunning(index.guildId)) {
+                let page: ApiMessage[];
+                try {
+                    page = await fetchHistoryPage(client, channelId, cursor);
+                } catch (error) {
+                    appendGuildIndexWarning(index.guildId, `<#${channelId}> 索引中断：${errorText(error)}`);
+                    result = 'retry';
+                    break;
+                }
+                if (page.length === 0) {
+                    result = 'completed';
+                    break;
+                }
+
+                if (!indexStillRunning(index.guildId)) return;
+                recordIndexedMessages(index.guildId, toIndexedMessages(channelId, page));
+
+                const nextCursor = oldestId(page);
+                if (nextCursor === cursor) {
+                    appendGuildIndexWarning(index.guildId, `<#${channelId}> 索引游标没有继续前进，已跳过剩余历史`);
+                    result = 'abandoned';
+                    break;
+                }
+                cursor = nextCursor;
+                updateGuildIndexChannelCursor(index.guildId, channelId, cursor);
+                if (coveredUntil > 0 && timestampFromSnowflake(nextCursor) < coveredUntil) {
+                    result = 'completed';
+                    break;
+                }
+                if (page.length < 100) {
+                    result = 'completed';
+                    break;
+                }
+                pagesRead += 1;
+                if (pagesRead >= HISTORY_PAGES_PER_SLICE) {
+                    result = 'yielded';
+                    break;
+                }
+            }
+        });
+    } catch (error) {
+        appendGuildIndexWarning(index.guildId, `<#${channelId}> 无法完成归档区域索引：${errorText(error)}`);
+        result = 'retry';
+    } finally {
+        lastHistoryPageStartedAt.delete(channelId);
+    }
+    return result;
+}
+
+async function runGuildIndexWorkers(client: Client, index: GuildMessageIndex): Promise<void> {
+    const cutoffId = snowflakeAt(index.cutoffAt);
+    const worker = async (): Promise<void> => {
+        while (indexStillRunning(index.guildId)) {
+            const scan = claimGuildIndexChannel(index.guildId);
+            if (!scan) return;
+            const result = await scanGuildIndexChannel(
+                client,
+                index,
+                scan.channelId,
+                scan.cursorId ?? cutoffId,
+            );
+            if (result === 'completed') {
+                completeGuildIndexChannel(index.guildId, scan.channelId);
+            } else if (result === 'abandoned') {
+                failGuildIndexChannel(index.guildId, scan.channelId);
+            } else if (result === 'retry') {
+                if (scan.failureCount + 1 >= MAX_HISTORY_CHANNEL_FAILURES) {
+                    appendGuildIndexWarning(
+                        index.guildId,
+                        `<#${scan.channelId}> 连续 ${MAX_HISTORY_CHANNEL_FAILURES} 次无法读取，已跳过该区域以免拖住整个索引`,
+                    );
+                    failGuildIndexChannel(index.guildId, scan.channelId);
+                } else {
+                    releaseGuildIndexChannel(index.guildId, scan.channelId, true);
+                }
+            } else {
+                releaseGuildIndexChannel(index.guildId, scan.channelId);
+                if (result === 'stopped') return;
+            }
+        }
+    };
+
+    await Promise.all(Array.from({ length: historyChannelConcurrency }, () => worker()));
+}
+
+/** 建立与用户无关的全服务器消息元数据索引，供后续冲水任务复用。 */
+export async function executeGuildMessageIndex(client: Client, claimedIndex: GuildMessageIndex): Promise<void> {
+    try {
+        const guild = client.guilds.cache.get(claimedIndex.guildId)
+            ?? await client.guilds.fetch(claimedIndex.guildId).catch(() => null);
+        if (!guild) throw new Error('机器人已不在目标服务器中');
+
+        let index = getGuildMessageIndex(claimedIndex.guildId);
+        if (!index || index.status !== 'running') return;
+        if (index.scopeChannelIds.length === 0) {
+            const scope = await resolveCleanupScope(guild, {
+                selectedChannelIds: [],
+                entireGuild: true,
+                excludedChannelIds: [],
+                includeThreads: true,
+                priorityChannelIds: index.priorityChannelIds,
+            });
+            setGuildIndexScope(
+                index.guildId,
+                scope.channelIds,
+                scope.priorityChannelIds,
+                scope.warnings,
+            );
+            if (scope.channelIds.length === 0) {
+                throw new Error('没有可建立索引的频道；请检查机器人查看频道、读取历史和管理消息权限');
+            }
+            index = getGuildMessageIndex(index.guildId)!;
+        }
+
+        await runGuildIndexWorkers(client, index);
+        const current = getGuildMessageIndex(index.guildId);
+        if (current?.status === 'running') {
+            if (hasGuildIndexChannelFailures(index.guildId)) {
+                setGuildMessageIndexStatus(
+                    index.guildId,
+                    'failed',
+                    '部分频道/子区连续读取失败；已保留可用的部分索引，请重新建立以补齐。',
+                );
+                return;
+            }
+            setGuildMessageIndexStatus(index.guildId, 'completed');
+            const done = getGuildMessageIndex(index.guildId)!;
+            console.log(
+                `[MessageCleanup] 🗂️ 全服索引完成：${done.guildId}，`
+                + `${done.indexedMessageCount} 条消息，${done.completedCount}/${done.scopeCount} 个频道/子区`,
+            );
+        }
+    } catch (error) {
+        const current = getGuildMessageIndex(claimedIndex.guildId);
+        if (current?.status === 'running') {
+            setGuildMessageIndexStatus(claimedIndex.guildId, 'failed', errorText(error).slice(0, 2000));
+        }
+        console.error(`[MessageCleanup] 全服索引 ${claimedIndex.guildId} 失败：`, error);
+    }
+}
+
 async function scanHistoryChannel(
     client: Client,
     initialJob: CleanupJob,
     channelId: string,
     initialCursor: string,
-): Promise<'completed' | 'yielded' | 'retry' | 'stopped'> {
+): Promise<'completed' | 'abandoned' | 'yielded' | 'retry' | 'stopped'> {
     let cursor = initialCursor;
-    let result: 'completed' | 'yielded' | 'retry' | 'stopped' = 'stopped';
+    let result: 'completed' | 'abandoned' | 'yielded' | 'retry' | 'stopped' = 'stopped';
     let pagesRead = 0;
+    const coveredUntil = getIndexedCoverage(initialJob.guildId, channelId) ?? 0;
     try {
         const current = getJob(initialJob.id);
         if (!current) return 'stopped';
@@ -650,17 +934,22 @@ async function scanHistoryChannel(
 
                 const fresh = getJob(initialJob.id);
                 if (!fresh || fresh.status !== 'running') return;
+                recordIndexedMessages(fresh.guildId, toIndexedMessages(channelId, page));
                 const candidates = page.filter(message => message.author?.id === fresh.targetUserId);
                 recordCandidates(fresh, candidates);
 
                 const nextCursor = oldestId(page);
                 if (nextCursor === cursor) {
                     appendWarning(initialJob.id, `<#${channelId}> 扫描游标没有继续前进，已跳过剩余历史`);
-                    result = 'completed';
+                    result = 'abandoned';
                     break;
                 }
                 cursor = nextCursor;
                 updateScanChannelCursor(initialJob.id, channelId, cursor);
+                if (coveredUntil > 0 && timestampFromSnowflake(nextCursor) < coveredUntil) {
+                    result = 'completed';
+                    break;
+                }
                 if (page.length < 100) {
                     result = 'completed';
                     break;
@@ -681,9 +970,13 @@ async function scanHistoryChannel(
     return result;
 }
 
-async function runHistoryScan(client: Client, initialJob: CleanupJob): Promise<void> {
+async function runHistoryScan(
+    client: Client,
+    initialJob: CleanupJob,
+    acceptIndexedBase = false,
+): Promise<void> {
     const cutoffId = snowflakeAt(initialJob.cutoffAt);
-    ensureJobScanChannels(initialJob);
+    ensureJobScanChannels(initialJob, acceptIndexedBase);
 
     const worker = async (): Promise<void> => {
         while (stillRunning(initialJob.id)) {
@@ -696,6 +989,9 @@ async function runHistoryScan(client: Client, initialJob: CleanupJob): Promise<v
                 scan.cursorId ?? cutoffId,
             );
             if (result === 'completed') {
+                markIndexedCoverage(initialJob.guildId, scan.channelId, initialJob.cutoffAt);
+                completeScanChannel(initialJob.id, scan.channelId);
+            } else if (result === 'abandoned') {
                 completeScanChannel(initialJob.id, scan.channelId);
             } else if (result === 'retry') {
                 if (scan.failureCount + 1 >= MAX_HISTORY_CHANNEL_FAILURES) {
@@ -720,10 +1016,20 @@ async function runHistoryScan(client: Client, initialJob: CleanupJob): Promise<v
 async function runScanWorker(client: Client, initialJob: CleanupJob): Promise<void> {
     if (initialJob.scanCompletedAt !== null) return;
     let job = initialJob;
+    if (areChannelsIndexedThrough(job.guildId, job.scopeChannelIds, job.cutoffAt)) {
+        markScanCompleted(job.id);
+        const scanned = getJob(job.id)!;
+        console.log(`[MessageCleanup] 🔎 任务 #${job.id} 直接使用频道索引：找到 ${scanned.foundCount}，待删除 ${scanned.pendingCount}`);
+        return;
+    }
+    const allChannelsHaveIndexedBase = doChannelsHaveIndexedBase(job.guildId, job.scopeChannelIds);
     let refreshGuildSearch = job.entireGuild && job.scanMode === 'history';
+    let searchCanSupplementIndex = false;
     if (job.scanMode === 'search') {
         try {
-            refreshGuildSearch = job.entireGuild && await runSearchScan(client, job);
+            const discordIndexing = await runSearchScan(client, job);
+            refreshGuildSearch = job.entireGuild && discordIndexing;
+            searchCanSupplementIndex = !discordIndexing;
         } catch (error) {
             if (!stillRunning(job.id)) return;
             refreshGuildSearch = job.entireGuild;
@@ -733,13 +1039,20 @@ async function runScanWorker(client: Client, initialJob: CleanupJob): Promise<vo
         }
 
         if (!stillRunning(job.id)) return;
-        // Discord 搜索只负责加速，绝不能作为“全部找完”的依据；随后逐频道翻到底兜底。
+        if (searchCanSupplementIndex && allChannelsHaveIndexedBase) {
+            markScanCompleted(job.id);
+            const scanned = getJob(job.id)!;
+            console.log(`[MessageCleanup] 🔎 任务 #${job.id} 使用频道索引和增量搜索完成：找到 ${scanned.foundCount}，待删除 ${scanned.pendingCount}`);
+            return;
+        }
+        // 没有完整频道底库，或 Discord 仍在建立搜索索引时，继续逐频道核验兜底。
         setScanMode(job.id, 'history', true);
         job = getJob(job.id)!;
     }
 
     let historyFinished = false;
-    const history = runHistoryScan(client, job).finally(() => { historyFinished = true; });
+    const history = runHistoryScan(client, job, searchCanSupplementIndex)
+        .finally(() => { historyFinished = true; });
     if (refreshGuildSearch) {
         await Promise.all([
             history,
@@ -762,6 +1075,11 @@ export async function executeCleanupJob(client: Client, claimedJob: CleanupJob):
         if (!guild) throw new Error('机器人已不在目标服务器中');
 
         let job = getJob(claimedJob.id)!;
+        ensureGuildMessageIndexForCleanup(
+            job.guildId,
+            job.actorId,
+            job.entireGuild ? [] : job.selectedChannelIds,
+        );
         if (job.scopeChannelIds.length === 0) {
             const scope = await resolveCleanupScope(guild, job);
             setResolvedScope(job.id, scope.channelIds, scope.warnings);
@@ -772,6 +1090,17 @@ export async function executeCleanupJob(client: Client, claimedJob: CleanupJob):
         }
 
         if (!stillRunning(job.id)) return;
+        const indexedCandidates = listIndexedCandidates(
+            job.guildId,
+            job.targetUserId,
+            job.scopeChannelIds,
+            job.cutoffAt,
+        );
+        recordMessageCandidates(job.id, indexedCandidates);
+        if (indexedCandidates.length > 0) {
+            console.log(`[MessageCleanup] 🗂️ 任务 #${job.id} 从全服索引装入 ${indexedCandidates.length} 条候选消息`);
+        }
+
         const supervise = async (worker: '扫描器' | '删除器', action: () => Promise<void>): Promise<void> => {
             try {
                 await action();

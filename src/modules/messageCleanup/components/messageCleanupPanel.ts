@@ -14,6 +14,7 @@ import {
     type AnySelectMenuInteraction,
     type ButtonInteraction,
     type ChatInputCommandInteraction,
+    type Guild,
     type GuildMember,
     type InteractionUpdateOptions,
     type ModalSubmitInteraction,
@@ -21,19 +22,26 @@ import {
 
 import {
     cancelJob,
+    cancelGuildMessageIndex,
     createJob,
     findActiveJob,
+    getGuildIndexPriorityProgress,
+    getGuildMessageIndex,
     getSettings,
     isJobListClearing,
     listJobs,
+    pauseGuildMessageIndex,
     pauseJob,
+    requestGuildMessageIndex,
     requestJobListClear,
+    resumeGuildMessageIndex,
     resumeJob,
     setManageRoleIds,
+    updateGuildIndexPriorities,
 } from '../services/messageCleanupDatabase';
 import { canConfigureCleanup, canManageCleanup } from '../services/messageCleanupPermissions';
 import { formatShanghaiTime, parseCleanupCutoff } from '../services/cleanupTime';
-import type { CleanupJob, CleanupJobStatus } from '../services/types';
+import type { CleanupJob, CleanupJobStatus, GuildMessageIndexStatus } from '../services/types';
 
 const ID = {
     PREFIX: 'mc_',
@@ -53,6 +61,13 @@ const ID = {
     RESUME: 'mc_resume',
     CANCEL: 'mc_cancel',
     CLEAR: 'mc_clear',
+    INDEX: 'mc_index',
+    INDEX_REFRESH: 'mc_index_refresh',
+    INDEX_START: 'mc_index_start',
+    INDEX_PAUSE: 'mc_index_pause',
+    INDEX_RESUME: 'mc_index_resume',
+    INDEX_CANCEL: 'mc_index_cancel',
+    INDEX_PRIORITY: 'mc_index_priority',
     ROLES: 'mc_roles',
     TIME_MODAL: 'mc_time_modal',
     TIME_INPUT: 'mc_time_input',
@@ -73,6 +88,8 @@ interface CleanupDraft {
     includeThreads: boolean;
     cutoffMode: CutoffMode;
     customCutoffAt: number | null;
+    indexPriorityChannelIds: string[];
+    indexPriorityTouched: boolean;
     touchedAt: number;
 }
 
@@ -94,6 +111,8 @@ function freshDraft(): CleanupDraft {
         includeThreads: true,
         cutoffMode: 'all',
         customCutoffAt: null,
+        indexPriorityChannelIds: [],
+        indexPriorityTouched: false,
         touchedAt: Date.now(),
     };
 }
@@ -136,6 +155,18 @@ function mentionList(ids: string[], empty: string): string {
     if (ids.length === 0) return empty;
     const shown = ids.slice(0, 25).map(id => `<#${id}>`).join(' ');
     return ids.length > 25 ? `${shown} 等 ${ids.length} 项` : shown;
+}
+
+function expandPriorityFromCache(guild: Guild, scopeChannelIds: string[], selectedIds: string[]): string[] {
+    const selected = new Set(selectedIds);
+    return scopeChannelIds.filter(channelId => {
+        if (selected.has(channelId)) return true;
+        const channel = guild.channels.cache.get(channelId);
+        if (!channel) return false;
+        if (channel.parentId && selected.has(channel.parentId)) return true;
+        return channel.isThread()
+            && Boolean(channel.parent?.parentId && selected.has(channel.parent.parentId));
+    });
 }
 
 function cutoffForDraft(draft: CleanupDraft, now = Date.now()): { timestamp: number; label: string } {
@@ -271,6 +302,15 @@ const STATUS_LABEL: Record<CleanupJobStatus, string> = {
     failed: '❌ 失败',
 };
 
+const INDEX_STATUS_LABEL: Record<GuildMessageIndexStatus, string> = {
+    queued: '🕐 等待开始',
+    running: '🔄 正在建立',
+    paused: '⏸️ 已暂停',
+    cancelled: '🚫 已取消',
+    completed: '✅ 可用',
+    failed: '❌ 失败',
+};
+
 function jobStage(job: CleanupJob, scanFinished: boolean): string {
     if (job.status === 'completed') return '完整核验与删除队列均已结束';
     if (job.status === 'cancelled') return '任务已取消，待删除队列已停止';
@@ -333,12 +373,88 @@ function tasksView(guildId: string, configurable: boolean, notice?: string): Int
     }
     const navigation = new ActionRowBuilder<ButtonBuilder>().addComponents(
         new ButtonBuilder().setCustomId(ID.HOME).setLabel('返回').setStyle(ButtonStyle.Secondary),
+        new ButtonBuilder().setCustomId(ID.INDEX).setLabel('全服索引').setStyle(ButtonStyle.Secondary),
         new ButtonBuilder().setCustomId(ID.PERMISSIONS).setLabel('权限').setStyle(ButtonStyle.Secondary).setDisabled(!configurable),
     );
 
     return {
         content: (`${notice ? `${notice}\n\n` : ''}## 📋 冲水任务\n_扫描和删除相互独立；“待删除”会持续被后台删除器消费。扫描完成后“最终找到”才是完整数量。_\n\n${lines}${detail}`).slice(0, 2000),
         components: [new ActionRowBuilder<ButtonBuilder>().addComponents(...buttons), navigation],
+    };
+}
+
+function indexView(guildId: string, actorId: string, notice?: string): InteractionUpdateOptions {
+    const index = getGuildMessageIndex(guildId);
+    const priorityProgress = getGuildIndexPriorityProgress(guildId);
+    const draft = getDraft(guildId, actorId);
+    const priorityIds = draft.indexPriorityTouched
+        ? draft.indexPriorityChannelIds
+        : index?.priorityChannelIds ?? [];
+    const detail = index
+        ? [
+            `**状态：** ${INDEX_STATUS_LABEL[index.status]}`,
+            `**进度：** ${index.completedCount}/${index.scopeCount || '待展开'} 个频道/子区`,
+            `**已索引：** ${index.indexedMessageCount} 条消息`,
+            `**优先范围：** ${mentionList(index.priorityChannelIds, '未设置')}`,
+            priorityProgress.total > 0
+                ? `**优先进度：** ${priorityProgress.completed}/${priorityProgress.total} 个频道/子区`
+                : null,
+            `**本轮截止：** ${formatShanghaiTime(index.cutoffAt)}`,
+            index.warningText ? `**提示：** ${index.warningText.slice(0, 650)}` : null,
+            index.error ? `**错误：** ${index.error.slice(0, 650)}` : null,
+        ].filter(Boolean).join('\n')
+        : '_尚未建立索引。_';
+
+    const priorityMenu = new ChannelSelectMenuBuilder()
+        .setCustomId(ID.INDEX_PRIORITY)
+        .setPlaceholder('可选：优先索引频道、分类或论坛（最多 25 个）')
+        .setChannelTypes(...CLEANUP_CHANNEL_TYPES)
+        .setMinValues(0)
+        .setMaxValues(25)
+        .setDisabled(false);
+    if (priorityIds.length > 0) priorityMenu.setDefaultChannels(...priorityIds.slice(0, 25));
+
+    const buttons = [
+        new ButtonBuilder().setCustomId(ID.INDEX_REFRESH).setLabel('刷新').setStyle(ButtonStyle.Primary),
+    ];
+    if (!index || ['cancelled', 'completed', 'failed'].includes(index.status)) {
+        buttons.push(
+            new ButtonBuilder()
+                .setCustomId(ID.INDEX_START)
+                .setLabel(index ? '刷新补齐' : '开始建立')
+                .setStyle(ButtonStyle.Secondary),
+        );
+    } else if (index.status === 'paused') {
+        buttons.push(
+            new ButtonBuilder().setCustomId(ID.INDEX_RESUME).setLabel('继续').setStyle(ButtonStyle.Success),
+            new ButtonBuilder().setCustomId(ID.INDEX_CANCEL).setLabel('取消').setStyle(ButtonStyle.Secondary),
+        );
+    } else {
+        buttons.push(
+            new ButtonBuilder().setCustomId(ID.INDEX_PAUSE).setLabel('暂停').setStyle(ButtonStyle.Secondary),
+            new ButtonBuilder().setCustomId(ID.INDEX_CANCEL).setLabel('取消').setStyle(ButtonStyle.Secondary),
+        );
+    }
+
+    return {
+        content: [
+            notice,
+            '## 🗂️ 全服消息索引',
+            '_首次建立需要完整读取所有可访问频道及帖子；只保存消息 ID、作者 ID、频道和时间，不保存消息内容。_',
+            `**下次建立的优先范围：** ${mentionList(priorityIds, '未设置（按普通顺序扫描）')}`,
+            '',
+            detail,
+            '',
+            '优先范围完成后立即可用；其余范围继续后台扫描。冲水读取的历史页也会同步补入索引。',
+        ].filter(value => value !== null && value !== undefined).join('\n').slice(0, 2000),
+        components: [
+            new ActionRowBuilder<ChannelSelectMenuBuilder>().addComponents(priorityMenu),
+            new ActionRowBuilder<ButtonBuilder>().addComponents(...buttons),
+            new ActionRowBuilder<ButtonBuilder>().addComponents(
+                new ButtonBuilder().setCustomId(ID.TASKS).setLabel('返回任务').setStyle(ButtonStyle.Secondary),
+                new ButtonBuilder().setCustomId(ID.HOME).setLabel('返回面板').setStyle(ButtonStyle.Secondary),
+            ),
+        ],
     };
 }
 
@@ -450,6 +566,24 @@ export async function handleCleanupSelect(interaction: AnySelectMenuInteraction)
         await interaction.update(mainView(guildId, interaction.user.id, canConfigureCleanup(member)));
         return;
     }
+    if (interaction.customId === ID.INDEX_PRIORITY && interaction.isChannelSelectMenu()) {
+        draft.indexPriorityChannelIds = [...interaction.values];
+        draft.indexPriorityTouched = true;
+        const index = getGuildMessageIndex(guildId);
+        if (index && interaction.guild) {
+            updateGuildIndexPriorities(
+                guildId,
+                draft.indexPriorityChannelIds,
+                expandPriorityFromCache(
+                    interaction.guild,
+                    index.scopeChannelIds,
+                    draft.indexPriorityChannelIds,
+                ),
+            );
+        }
+        await interaction.update(indexView(guildId, interaction.user.id));
+        return;
+    }
     if (interaction.customId === ID.TIME && interaction.isStringSelectMenu()) {
         const mode = interaction.values[0] as CutoffMode;
         if (mode === 'custom') {
@@ -511,6 +645,39 @@ export async function handleCleanupButton(interaction: ButtonInteraction): Promi
             return;
         }
         await interaction.update(permissionsView(guildId));
+        return;
+    }
+    if (interaction.customId === ID.INDEX || interaction.customId === ID.INDEX_REFRESH) {
+        await interaction.update(indexView(guildId, interaction.user.id));
+        return;
+    }
+    if (interaction.customId === ID.INDEX_START) {
+        const current = getGuildMessageIndex(guildId);
+        const priorityIds = draft.indexPriorityTouched
+            ? draft.indexPriorityChannelIds
+            : current?.priorityChannelIds ?? [];
+        const result = requestGuildMessageIndex(guildId, interaction.user.id, priorityIds);
+        draft.indexPriorityChannelIds = [...priorityIds];
+        draft.indexPriorityTouched = true;
+        const notice = result.created
+            ? '索引任务已加入后台队列。'
+            : '当前已有索引任务，未重复创建。';
+        await interaction.update(indexView(guildId, interaction.user.id, notice));
+        return;
+    }
+    if (interaction.customId === ID.INDEX_PAUSE) {
+        pauseGuildMessageIndex(guildId);
+        await interaction.update(indexView(guildId, interaction.user.id));
+        return;
+    }
+    if (interaction.customId === ID.INDEX_RESUME) {
+        resumeGuildMessageIndex(guildId);
+        await interaction.update(indexView(guildId, interaction.user.id));
+        return;
+    }
+    if (interaction.customId === ID.INDEX_CANCEL) {
+        cancelGuildMessageIndex(guildId);
+        await interaction.update(indexView(guildId, interaction.user.id));
         return;
     }
     if (interaction.customId === ID.TASKS || interaction.customId === ID.REFRESH) {
