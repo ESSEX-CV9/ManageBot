@@ -92,22 +92,28 @@ export async function resolveCleanupScope(guild: Guild, job: CleanupJob): Promis
         warnings.push(`拉取服务器频道列表失败：${error instanceof Error ? error.message : String(error)}`);
     });
 
-    for (const id of selected) {
-        const channel = guild.channels.cache.get(id) ?? await guild.channels.fetch(id).catch(() => null);
-        if (!channel) {
-            warnings.push(`无法访问所选频道/子区 ${id}`);
-            continue;
+    if (job.entireGuild) {
+        for (const channel of guild.channels.cache.values()) {
+            if (isParentChannel(channel)) parents.set(channel.id, channel);
         }
-        if (channel.type === ChannelType.GuildCategory) {
-            for (const child of guild.channels.cache.values()) {
-                if (child.parentId === channel.id && isParentChannel(child)) parents.set(child.id, child);
+    } else {
+        for (const id of selected) {
+            const channel = guild.channels.cache.get(id) ?? await guild.channels.fetch(id).catch(() => null);
+            if (!channel) {
+                warnings.push(`无法访问所选频道/子区 ${id}`);
+                continue;
             }
-        } else if (channel.isThread()) {
-            directThreads.set(channel.id, channel);
-        } else if (isParentChannel(channel)) {
-            parents.set(channel.id, channel);
-        } else {
-            warnings.push(`<#${id}> 不是可清理的文字频道、论坛、分类或子区`);
+            if (channel.type === ChannelType.GuildCategory) {
+                for (const child of guild.channels.cache.values()) {
+                    if (child.parentId === channel.id && isParentChannel(child)) parents.set(child.id, child);
+                }
+            } else if (channel.isThread()) {
+                directThreads.set(channel.id, channel);
+            } else if (isParentChannel(channel)) {
+                parents.set(channel.id, channel);
+            } else {
+                warnings.push(`<#${id}> 不是可清理的文字频道、论坛、分类或子区`);
+            }
         }
     }
 
@@ -123,8 +129,9 @@ export async function resolveCleanupScope(guild: Guild, job: CleanupJob): Promis
     }
 
     for (const parent of parents.values()) {
+        if (isExcluded(parent, excluded)) continue;
         const isForumLike = parent.type === ChannelType.GuildForum || parent.type === ChannelType.GuildMedia;
-        if (!isForumLike && !isExcluded(parent, excluded)) {
+        if (!isForumLike) {
             const missing = canReadAndDelete(guild, parent);
             if (missing.length === 0) {
                 // 普通文字/公告频道本体有消息；论坛和媒体频道本体没有消息。
@@ -133,7 +140,8 @@ export async function resolveCleanupScope(guild: Guild, job: CleanupJob): Promis
             }
         }
 
-        if (!isForumLike && !job.includeThreads) continue;
+        // “全服务器”就是完整范围，不受面板之前的普通聊天子区开关影响。
+        if (!isForumLike && !job.entireGuild && !job.includeThreads) continue;
 
         if (activeThreads) {
             for (const thread of activeThreads.values()) {

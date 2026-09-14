@@ -21,6 +21,7 @@ export interface CleanupJob {
     actorId: string;
     targetUserId: string;
     selectedChannelIds: string[];
+    entireGuild: boolean;
     excludedChannelIds: string[];
     includeThreads: boolean;
     cutoffAt: number;
@@ -50,6 +51,7 @@ export interface CreateCleanupJobInput {
     actorId: string;
     targetUserId: string;
     selectedChannelIds: string[];
+    entireGuild: boolean;
     excludedChannelIds: string[];
     includeThreads: boolean;
     cutoffAt: number;

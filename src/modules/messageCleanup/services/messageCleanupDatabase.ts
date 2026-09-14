@@ -30,6 +30,7 @@ db.exec(`
         actor_id                 TEXT NOT NULL,
         target_user_id           TEXT NOT NULL,
         selected_channel_ids     TEXT NOT NULL,
+        entire_guild             INTEGER NOT NULL DEFAULT 0,
         excluded_channel_ids     TEXT NOT NULL DEFAULT '[]',
         include_threads          INTEGER NOT NULL DEFAULT 1,
         cutoff_at                INTEGER NOT NULL,
@@ -99,6 +100,7 @@ function ensureColumn(table: string, column: string, definition: string): void {
 
 // 兼容已经存在的任务数据库，启动时原地补齐生产者/消费者所需状态。
 ensureColumn('mc_job', 'scan_completed_at', 'INTEGER');
+ensureColumn('mc_job', 'entire_guild', 'INTEGER NOT NULL DEFAULT 0');
 ensureColumn('mc_job_message', 'attempt_count', 'INTEGER NOT NULL DEFAULT 0');
 ensureColumn('mc_job_message', 'next_attempt_at', 'INTEGER NOT NULL DEFAULT 0');
 ensureColumn('mc_job_message', 'last_error', 'TEXT');
@@ -120,6 +122,7 @@ interface JobRow {
     actor_id: string;
     target_user_id: string;
     selected_channel_ids: string;
+    entire_guild: number;
     excluded_channel_ids: string;
     include_threads: number;
     cutoff_at: number;
@@ -169,6 +172,7 @@ function mapJob(row: JobRow): CleanupJob {
         actorId: row.actor_id,
         targetUserId: row.target_user_id,
         selectedChannelIds: parseIds(row.selected_channel_ids),
+        entireGuild: Boolean(row.entire_guild),
         excludedChannelIds: parseIds(row.excluded_channel_ids),
         includeThreads: Boolean(row.include_threads),
         cutoffAt: row.cutoff_at,
@@ -201,6 +205,7 @@ function taskLogDetails(job: CleanupJob): Record<string, unknown> {
         actor_id: job.actorId,
         target_user_id: job.targetUserId,
         selected_channel_ids: job.selectedChannelIds,
+        entire_guild: job.entireGuild,
         excluded_channel_ids: job.excludedChannelIds,
         include_threads: job.includeThreads,
         cutoff_at: job.cutoffAt,
@@ -280,14 +285,15 @@ const createJobTransaction = db.transaction((input: CreateCleanupJobInput): Crea
     const result = db.prepare(`
         INSERT INTO mc_job (
             guild_id, actor_id, target_user_id, selected_channel_ids,
-            excluded_channel_ids, include_threads, cutoff_at, cutoff_label,
+            entire_guild, excluded_channel_ids, include_threads, cutoff_at, cutoff_label,
             status, scan_mode, created_at, updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'queued', 'search', ?, ?)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued', 'search', ?, ?)
     `).run(
         input.guildId,
         input.actorId,
         input.targetUserId,
         JSON.stringify([...new Set(input.selectedChannelIds)]),
+        input.entireGuild ? 1 : 0,
         JSON.stringify([...new Set(input.excludedChannelIds)]),
         input.includeThreads ? 1 : 0,
         input.cutoffAt,

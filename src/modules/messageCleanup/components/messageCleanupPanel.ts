@@ -42,6 +42,7 @@ const ID = {
     EXCLUDE: 'mc_exclude',
     TIME: 'mc_time',
     TOGGLE_THREADS: 'mc_toggle_threads',
+    TOGGLE_GUILD_SCOPE: 'mc_toggle_guild_scope',
     EDIT_IDS: 'mc_edit_ids',
     START: 'mc_start',
     TASKS: 'mc_tasks',
@@ -66,6 +67,7 @@ interface CleanupDraft {
     targetUserId: string | null;
     targetSelectedViaMenu: boolean;
     selectedChannelIds: string[];
+    entireGuild: boolean;
     excludedSelectedIds: string[];
     excludedManualIds: string[];
     includeThreads: boolean;
@@ -86,6 +88,7 @@ function freshDraft(): CleanupDraft {
         targetUserId: null,
         targetSelectedViaMenu: false,
         selectedChannelIds: [],
+        entireGuild: false,
         excludedSelectedIds: [],
         excludedManualIds: [],
         includeThreads: true,
@@ -166,12 +169,12 @@ function mainView(guildId: string, actorId: string, configurable: boolean, notic
         notice,
         '## 🧹 紧急消息冲水',
         `**目标用户：** ${target}`,
-        `**清理范围：** ${mentionList(draft.selectedChannelIds, '❌ 未选择')}`,
+        `**清理范围：** ${draft.entireGuild ? '🌐 全服务器（所有可访问的文字频道、论坛及帖子）' : mentionList(draft.selectedChannelIds, '❌ 未选择')}`,
         `**截止时间：** ${cutoff.label}`,
-        `**聊天频道子区：** ${draft.includeThreads ? '✅ 包含活动及归档子区' : '⛔ 不包含（论坛帖子仍自动包含）'}`,
+        `**聊天频道子区：** ${draft.entireGuild ? '✅ 全服务器模式固定包含' : draft.includeThreads ? '✅ 包含活动及归档子区' : '⛔ 不包含（论坛帖子仍自动包含）'}`,
         `**本次排除：** ${mentionList(excludedIds(draft), '无')}`,
         '',
-        '只会删除目标用户在上述范围内、早于截止时间的消息。点击“立即开始”即确认执行。',
+        '只会删除目标用户在上述范围内、早于截止时间且不在排除项中的消息。点击“立即开始”即确认执行。',
     ].filter(Boolean).join('\n');
 
     const userMenu = new UserSelectMenuBuilder()
@@ -183,10 +186,11 @@ function mainView(guildId: string, actorId: string, configurable: boolean, notic
 
     const scopeMenu = new ChannelSelectMenuBuilder()
         .setCustomId(ID.SCOPE)
-        .setPlaceholder('2️⃣ 选择要清理的频道、论坛或分类（最多 25 个）')
+        .setPlaceholder(draft.entireGuild ? '2️⃣ 已启用全服务器范围' : '2️⃣ 选择要清理的频道、论坛或分类（最多 25 个）')
         .setChannelTypes(...CLEANUP_CHANNEL_TYPES)
         .setMinValues(0)
-        .setMaxValues(25);
+        .setMaxValues(25)
+        .setDisabled(draft.entireGuild);
     if (draft.selectedChannelIds.length) scopeMenu.setDefaultChannels(...draft.selectedChannelIds.slice(0, 25));
 
     const excludeMenu = new ChannelSelectMenuBuilder()
@@ -212,10 +216,14 @@ function mainView(guildId: string, actorId: string, configurable: boolean, notic
         new ButtonBuilder()
             .setCustomId(ID.TOGGLE_THREADS)
             .setLabel(draft.includeThreads ? '子区：包含' : '子区：不含')
-            .setStyle(draft.includeThreads ? ButtonStyle.Success : ButtonStyle.Secondary),
-        new ButtonBuilder().setCustomId(ID.EDIT_IDS).setLabel('粘贴 ID').setStyle(ButtonStyle.Secondary),
+            .setStyle(draft.includeThreads ? ButtonStyle.Success : ButtonStyle.Secondary)
+            .setDisabled(draft.entireGuild),
+        new ButtonBuilder()
+            .setCustomId(ID.TOGGLE_GUILD_SCOPE)
+            .setLabel(draft.entireGuild ? '范围：全服务器' : '范围：改为全服')
+            .setStyle(draft.entireGuild ? ButtonStyle.Success : ButtonStyle.Secondary),
+        new ButtonBuilder().setCustomId(ID.EDIT_IDS).setLabel('输入用户 ID').setStyle(ButtonStyle.Secondary),
         new ButtonBuilder().setCustomId(ID.TASKS).setLabel('任务').setStyle(ButtonStyle.Secondary),
-        new ButtonBuilder().setCustomId(ID.PERMISSIONS).setLabel('权限').setStyle(ButtonStyle.Secondary).setDisabled(!configurable),
         new ButtonBuilder().setCustomId(ID.START).setLabel('立即开始').setStyle(ButtonStyle.Danger),
     );
 
@@ -289,10 +297,13 @@ function jobLine(job: CleanupJob): string {
     const heading = active
         ? `#${job.id} ${STATUS_LABEL[job.status]}　<@${job.targetUserId}>`
         : STATUS_LABEL[job.status];
-    return `**${heading}**${warning}\n${counts}\n${stage}　范围 ${job.scopeCount || '待展开'} 个频道/子区${error}`;
+    const scope = job.entireGuild
+        ? `全服务器 · ${job.scopeCount || '待展开'} 个频道/子区`
+        : `${job.scopeCount || '待展开'} 个频道/子区`;
+    return `**${heading}**${warning}\n${counts}\n${stage}　范围 ${scope}${error}`;
 }
 
-function tasksView(guildId: string, notice?: string): InteractionUpdateOptions {
+function tasksView(guildId: string, configurable: boolean, notice?: string): InteractionUpdateOptions {
     const clearing = isJobListClearing(guildId);
     const jobs = clearing ? [] : listJobs(guildId, 10);
     const active = clearing ? null : findActiveJob(guildId);
@@ -317,11 +328,14 @@ function tasksView(guildId: string, notice?: string): InteractionUpdateOptions {
     if (jobs.length > 0) {
         buttons.push(new ButtonBuilder().setCustomId(ID.CLEAR).setLabel('清空列表').setStyle(ButtonStyle.Secondary));
     }
-    buttons.push(new ButtonBuilder().setCustomId(ID.HOME).setLabel('返回').setStyle(ButtonStyle.Secondary));
+    const navigation = new ActionRowBuilder<ButtonBuilder>().addComponents(
+        new ButtonBuilder().setCustomId(ID.HOME).setLabel('返回').setStyle(ButtonStyle.Secondary),
+        new ButtonBuilder().setCustomId(ID.PERMISSIONS).setLabel('权限').setStyle(ButtonStyle.Secondary).setDisabled(!configurable),
+    );
 
     return {
         content: (`${notice ? `${notice}\n\n` : ''}## 📋 冲水任务\n_扫描和删除相互独立；“待删除”会持续被后台删除器消费。扫描完成后“最终找到”才是完整数量。_\n\n${lines}${detail}`).slice(0, 2000),
-        components: [new ActionRowBuilder<ButtonBuilder>().addComponents(...buttons)],
+        components: [new ActionRowBuilder<ButtonBuilder>().addComponents(...buttons), navigation],
     };
 }
 
@@ -346,9 +360,9 @@ function idsModal(draft: CleanupDraft): ModalBuilder {
     const target = new TextInputBuilder()
         .setCustomId(ID.TARGET_ID_INPUT)
         .setLabel('目标用户 ID（可用于已退服用户）')
-        .setPlaceholder('留空则保持面板当前选择')
+        .setPlaceholder('粘贴用户 ID 或用户提及；已有目标时留空则保持')
         .setStyle(TextInputStyle.Short)
-        .setRequired(false)
+        .setRequired(!draft.targetUserId)
         .setMaxLength(64);
     if (draft.targetUserId) target.setValue(draft.targetUserId);
 
@@ -363,7 +377,7 @@ function idsModal(draft: CleanupDraft): ModalBuilder {
 
     return new ModalBuilder()
         .setCustomId(ID.IDS_MODAL)
-        .setTitle('粘贴用户或排除范围 ID')
+        .setTitle('输入目标用户 ID')
         .addComponents(
             new ActionRowBuilder<TextInputBuilder>().addComponents(target),
             new ActionRowBuilder<TextInputBuilder>().addComponents(exclusions),
@@ -478,6 +492,12 @@ export async function handleCleanupButton(interaction: ButtonInteraction): Promi
         await interaction.update(mainView(guildId, interaction.user.id, configurable));
         return;
     }
+    if (interaction.customId === ID.TOGGLE_GUILD_SCOPE) {
+        draft.entireGuild = !draft.entireGuild;
+        if (draft.entireGuild) draft.includeThreads = true;
+        await interaction.update(mainView(guildId, interaction.user.id, configurable));
+        return;
+    }
     if (interaction.customId === ID.EDIT_IDS) {
         await interaction.showModal(idsModal(draft));
         return;
@@ -491,35 +511,35 @@ export async function handleCleanupButton(interaction: ButtonInteraction): Promi
         return;
     }
     if (interaction.customId === ID.TASKS || interaction.customId === ID.REFRESH) {
-        await interaction.update(tasksView(guildId));
+        await interaction.update(tasksView(guildId, configurable));
         return;
     }
 
     if (interaction.customId === ID.CLEAR) {
         const result = requestJobListClear(guildId, interaction.user.id);
         if (!result.accepted) {
-            await interaction.update(tasksView(guildId, '列表暂时无法更新，请稍后再试。'));
+            await interaction.update(tasksView(guildId, configurable, '列表暂时无法更新，请稍后再试。'));
             return;
         }
         clearGuildDrafts(guildId);
-        await interaction.update(tasksView(guildId));
+        await interaction.update(tasksView(guildId, configurable));
         return;
     }
 
     const active = findActiveJob(guildId);
     if (interaction.customId === ID.PAUSE) {
         if (active) pauseJob(active.id, interaction.user.id);
-        await interaction.update(tasksView(guildId));
+        await interaction.update(tasksView(guildId, configurable));
         return;
     }
     if (interaction.customId === ID.RESUME) {
         if (active) resumeJob(active.id, interaction.user.id);
-        await interaction.update(tasksView(guildId));
+        await interaction.update(tasksView(guildId, configurable));
         return;
     }
     if (interaction.customId === ID.CANCEL) {
         if (active) cancelJob(active.id, interaction.user.id);
-        await interaction.update(tasksView(guildId));
+        await interaction.update(tasksView(guildId, configurable));
         return;
     }
     if (interaction.customId === ID.START) {
@@ -527,7 +547,7 @@ export async function handleCleanupButton(interaction: ButtonInteraction): Promi
             await interaction.update(mainView(guildId, interaction.user.id, configurable, '❌ 请先选择目标用户。'));
             return;
         }
-        if (draft.selectedChannelIds.length === 0) {
+        if (!draft.entireGuild && draft.selectedChannelIds.length === 0) {
             await interaction.update(mainView(guildId, interaction.user.id, configurable, '❌ 请至少选择一个清理频道、论坛或分类。'));
             return;
         }
@@ -545,6 +565,7 @@ export async function handleCleanupButton(interaction: ButtonInteraction): Promi
             actorId: interaction.user.id,
             targetUserId: draft.targetUserId,
             selectedChannelIds: draft.selectedChannelIds,
+            entireGuild: draft.entireGuild,
             excludedChannelIds: excludedIds(draft),
             includeThreads: draft.includeThreads,
             cutoffAt: cutoff.timestamp,
@@ -557,7 +578,7 @@ export async function handleCleanupButton(interaction: ButtonInteraction): Promi
         const prefix = result.created
             ? `✅ 已启动紧急冲水任务 #${result.job.id}。\n\n`
             : `⚠️ 本服务器已有未结束的任务 #${result.job.id}，未重复创建。\n\n`;
-        const view = tasksView(guildId);
+        const view = tasksView(guildId, configurable);
         await interaction.editReply({ ...view, content: `${prefix}${view.content ?? ''}`.slice(0, 2000) });
     }
 }
