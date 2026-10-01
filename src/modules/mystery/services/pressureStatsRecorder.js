@@ -179,24 +179,26 @@ function recordRiposteKill(stats, userId) {
  */
 function finalizePressureStats(stats, { outcome, aliveIds = [] } = {}) {
     if (!stats?.players || stats.players.size === 0) return [];
+    // 结算可能因数据库错误重试，计算结果不能反过来累加原始检查点。
+    const rows = new Map([...stats.players].map(([userId, row]) => [userId, { ...row }]));
 
     // 冠军算一次胜场 + 一次存活；平局是「子弹打光，大家一起活下来」，
     // 只算存活不算胜场——否则平局会把胜场榜刷得毫无意义。
     for (const userId of aliveIds) {
-        const row = rowFor(stats, userId);
+        const row = rows.get(userId);
         if (!row) continue;
-        row.survived += 1;
-        if (outcome === 'champion') row.wins += 1;
+        row.survived = (Number(row.survived) || 0) + 1;
+        if (outcome === 'champion') row.wins = (Number(row.wins) || 0) + 1;
     }
 
     // 「这一局全程没往枪里加过子弹」是个只有终局才能下结论的判断，和胜场/存活一样放在这里。
     // 存成累加列而不是在称号里查 loads === 0，是为了让「和平主义者」这类成就单调只增：
     // 攒够的和平局数是既成事实，之后再怎么加压也抹不掉。
-    for (const row of stats.players.values()) {
+    for (const row of rows.values()) {
         row.peaceful_games = row.loads === 0 ? 1 : 0;
     }
 
-    return [...stats.players.values()];
+    return [...rows.values()];
 }
 
 module.exports = {

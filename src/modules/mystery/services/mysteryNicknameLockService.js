@@ -1,4 +1,5 @@
 const MAX_TIMER_MS = 2 ** 31 - 1;
+const RESTORE_RETRY_MS = 60 * 1000;
 
 // 普通 Mystery 赢家改名锁集合：互相可覆盖；coward（胆小鬼）优先级最高，不在此集合中。
 const ORDINARY_LOCK_TYPES = Object.freeze(['duel_rename', 'devil_roulette_rename']);
@@ -17,6 +18,7 @@ function createMysteryNicknameLockService({
     const timers = new Map();
     const operationTails = new Map();
     let mutationQueue = Promise.resolve();
+    let timerGeneration = 0;
 
     function logFailure(operation, error) {
         console.error(`[mysteryNicknameLockService] ${operation} failed:`, error);
@@ -39,7 +41,10 @@ function createMysteryNicknameLockService({
     }
 
     function serializeMutation(guildId, userId, operation) {
-        return enqueueMutation(() => enqueue(guildId, userId, operation));
+        return enqueueMutation(() => enqueue(guildId, userId, async () => {
+            await store.load();
+            return operation();
+        }));
     }
 
     function clearTimer(guildId, userId) {
@@ -54,12 +59,12 @@ function createMysteryNicknameLockService({
     // 每个 key 只保留一个 timer；schedule 用 generation 标记当前 timer。
     // 旧 timer callback 若已进入 event loop（clearTimeout 无法取消），
     // 触发时通过 generation 比对安全 no-op，绝不误释放更新后的 lock。
-    function schedule(record) {
+    function schedule(record, minimumDelay = 0) {
         const key = lockKey(record.guildId, record.userId);
         const previous = timers.get(key);
-        const generation = (previous?.generation ?? 0) + 1;
+        const generation = ++timerGeneration;
         if (previous) clearTimeoutImpl(previous.handle);
-        const delay = Math.max(0, Math.min(MAX_TIMER_MS, record.expiresAt - now()));
+        const delay = Math.max(minimumDelay, Math.min(MAX_TIMER_MS, record.expiresAt - now()));
         const handle = setTimeoutImpl(() => {
             const current = timers.get(key);
             if (!current || current.generation !== generation) return false;
@@ -99,19 +104,24 @@ function createMysteryNicknameLockService({
 
     async function fetchMember(guildId, userId) {
         const guild = await fetchGuild(guildId);
-        if (!guild?.members) return null;
+        if (!guild?.members) return { member: null, missing: false };
         const cached = guild.members.cache?.get?.(userId);
-        if (cached) return cached;
+        if (cached) return { member: cached, missing: false };
         try {
-            return await guild.members.fetch?.(userId);
+            return { member: await guild.members.fetch?.(userId), missing: false };
         } catch (error) {
-            return null;
+            // 10007 明确表示成员已离服；网络、权限及服务器不可达都保留重试。
+            return { member: null, missing: error?.code === 10007 };
         }
     }
 
     async function restoreNickname(record, member) {
-        const target = member || await fetchMember(record.guildId, record.userId);
-        if (!target || target.nickname !== record.enforcedNickname) return false;
+        const result = member ? { member, missing: false } : await fetchMember(record.guildId, record.userId);
+        if (result.missing) return true;
+        const target = result.member;
+        if (!target) return false;
+        // 已恢复或已由管理员另行改名时只结束锁，避免覆盖后续昵称。
+        if (target.nickname !== record.enforcedNickname) return true;
         if (managementFailure(target)) return false;
         try {
             await target.setNickname(record.originalNickname ?? null, record.restoreReason);
@@ -125,12 +135,20 @@ function createMysteryNicknameLockService({
     async function releaseLockInternal(record, member) {
         clearTimer(record.guildId, record.userId);
         try {
+            // 提前赎罪也要先持久化“等待恢复”，重启后不再重新施加惩罚。
+            if (record.expiresAt > now()) {
+                record = await store.update(record.guildId, record.userId, draft => ({ ...draft, expiresAt: now() }));
+                if (!record) return false;
+            }
+            if (!await restoreNickname(record, member)) {
+                schedule(record, RESTORE_RETRY_MS);
+                return false;
+            }
             if (!await store.remove(record.guildId, record.userId)) return false;
         } catch (error) {
-            schedule(record);
+            schedule(record, RESTORE_RETRY_MS);
             throw error;
         }
-        await restoreNickname(record, member);
         return true;
     }
 
@@ -423,7 +441,11 @@ function createMysteryNicknameLockService({
                 if (now() >= active.expiresAt) return releaseLockInternal(active);
 
                 schedule(active);
-                const member = await fetchMember(active.guildId, active.userId);
+                const { member, missing } = await fetchMember(active.guildId, active.userId);
+                if (missing) {
+                    clearTimer(active.guildId, active.userId);
+                    return store.remove(active.guildId, active.userId);
+                }
                 if (!member || member.nickname === active.enforcedNickname || managementFailure(member)) return true;
                 try {
                     await member.setNickname(active.enforcedNickname, active.enforceReason);

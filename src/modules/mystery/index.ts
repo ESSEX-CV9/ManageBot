@@ -10,6 +10,9 @@ let commands: readonly Command[] | undefined;
 const activeOperations = new Set<Promise<unknown>>();
 let stopping = false;
 let stopTask: Promise<void> | undefined;
+let ready = false;
+let initializationFailed = false;
+let startTask: Promise<void> | undefined;
 
 async function trackOperation<Result>(operation: () => Promise<Result>): Promise<Result> {
     const task = operation();
@@ -18,10 +21,13 @@ async function trackOperation<Result>(operation: () => Promise<Result>): Promise
     finally { activeOperations.delete(task); }
 }
 
-async function rejectWhileStopping(interaction: ChatInputCommandInteraction | ComponentInteraction): Promise<boolean> {
-    if (!stopping) return false;
-    await interaction.reply({ content: '⏳ 机器人正在重启，请稍后再使用神秘指令。', flags: MessageFlags.Ephemeral });
-    return true;
+async function replyUnavailable(interaction: ChatInputCommandInteraction | ComponentInteraction): Promise<void> {
+    const content = stopping
+        ? '⏳ 机器人正在重启，请稍后再使用神秘指令。'
+        : initializationFailed
+            ? '❌ 神秘数据恢复未完成，功能暂不可用，请联系管理员检查启动日志后重试。'
+            : '⏳ 神秘功能正在恢复数据，请稍后再试。';
+    await interaction.reply({ content, flags: MessageFlags.Ephemeral });
 }
 
 async function prepareMember(interaction: ChatInputCommandInteraction | ComponentInteraction): Promise<boolean> {
@@ -47,7 +53,7 @@ export function getMysteryCommands(): readonly Command[] {
             return {
                 data: command.data,
                 async execute(interaction: ChatInputCommandInteraction): Promise<unknown> {
-                    if (stopping) { await rejectWhileStopping(interaction); return; }
+                    if (stopping || !ready) { await replyUnavailable(interaction); return; }
                     return trackOperation(async () => {
                         if (!await prepareMember(interaction)) return;
                         return command.execute(interaction);
@@ -61,7 +67,7 @@ export function getMysteryCommands(): readonly Command[] {
     return [...commands, {
         data: testCommand.data,
         async execute(interaction: ChatInputCommandInteraction): Promise<unknown> {
-            if (stopping) { await rejectWhileStopping(interaction); return; }
+            if (stopping || !ready) { await replyUnavailable(interaction); return; }
             return trackOperation(async () => {
                 if (!await prepareMember(interaction)) return;
                 return testCommand.execute(interaction);
@@ -81,7 +87,7 @@ export function registerMysteryCommands(client: Client): void {
 export async function handleMysteryComponent(interaction: Interaction): Promise<boolean> {
     if (!(interaction.isButton() || interaction.isAnySelectMenu() || interaction.isModalSubmit())) return false;
     if (!interaction.customId.startsWith('mystery_')) return false;
-    if (stopping) { await rejectWhileStopping(interaction); return true; }
+    if (stopping || !ready) { await replyUnavailable(interaction); return true; }
     return trackOperation(async () => {
         if (!await prepareMember(interaction)) return true;
         if (interaction.customId.startsWith('mystery_namepool:')) {
@@ -94,41 +100,67 @@ export async function handleMysteryComponent(interaction: Interaction): Promise<
 }
 
 export async function handleMysteryMemberUpdate(oldMember: GuildMember | PartialGuildMember, newMember: GuildMember): Promise<void> {
-    if (stopping) return;
+    if (stopping || !ready) return;
     await trackOperation(() => loadFunction<[GuildMember | PartialGuildMember, GuildMember], Promise<void>>('./events/guildMemberUpdate.js', 'mysteryGuildMemberUpdateHandler')(oldMember, newMember));
 }
 
 export async function handleMysteryMemberRemove(member: GuildMember | PartialGuildMember): Promise<void> {
-    if (stopping) return;
+    if (stopping || !ready) return;
     await trackOperation(() => loadFunction<[GuildMember | PartialGuildMember], Promise<void>>('./events/guildMemberRemove.js', 'mysteryGuildMemberRemoveHandler')(member));
 }
 
 export async function startMysterySystem(client: Client<true>): Promise<void> {
     if (stopping) return;
-    return trackOperation(async () => {
+    if (startTask) return startTask;
+    ready = false;
+    initializationFailed = false;
+    startTask = trackOperation(async () => {
         // Nickname locks must be restored before games can settle or replace them.
         await loadFunction<[Client<true>], Promise<void>>('./services/mysteryNicknameLock.js', 'initialize')(client);
+        const failures: unknown[] = [];
         for (const [modulePath, exportName] of [
             ['./services/pressureRouletteGame.js', 'restorePressureGames'],
             ['./services/devilRouletteGame.js', 'restoreActiveGames'],
         ]) {
             try {
-                await loadFunction<[Client<true>], Promise<void>>(modulePath, exportName)(client);
+                const result = await loadFunction<[Client<true>, { deferTimers: boolean }], Promise<unknown>>(modulePath, exportName)(client, { deferTimers: true });
+                if (result && typeof result === 'object' && 'deferred' in result
+                    && typeof result.deferred === 'number' && result.deferred > 0) {
+                    throw new Error(`${modulePath} 仍有 ${result.deferred} 场对局等待恢复。`);
+                }
             } catch (error) {
+                failures.push(error);
                 console.error(`[Mystery] 对局恢复失败 (${exportName})，原有模块继续运行:`, error);
             }
         }
+        if (failures.length) throw new AggregateError(failures, '神秘对局恢复未完成，暂不接受新的操作。');
+        if (stopping) return;
+        // Timers must not punish players while recovery still blocks their buttons.
+        for (const modulePath of ['./services/pressureRouletteGame.js', './services/devilRouletteGame.js']) {
+            loadFunction<[], void>(modulePath, 'resumeRestoredGames')();
+        }
+        ready = true;
         console.log('🎮 神秘指令模块已加载');
+    }).catch(error => {
+        initializationFailed = true;
+        throw error;
+    }).finally(() => {
+        startTask = undefined;
     });
+    return startTask;
 }
 
-export function stopMysterySystem(): Promise<void> {
+export function stopMysterySystem(deadlineAt = Date.now() + 30000): Promise<void> {
     if (stopTask) return stopTask;
     stopping = true;
+    ready = false;
     stopTask = (async () => {
         // Finish accepted writes and replies before snapshotting games and stores.
         await Promise.allSettled([...activeOperations]);
-        const result = await loadFunction<[{ timeoutMs: number }], Promise<ShutdownResult>>('./services/mysteryGameManager.js', 'shutdownAllGames')({ timeoutMs: 8000 });
+        // Share the outer deadline and reserve time for durable flush/disconnect.
+        // The process deadline remains authoritative if accepted work cannot drain.
+        const timeoutMs = Math.max(1, Math.min(8000, deadlineAt - Date.now() - 2000));
+        const result = await loadFunction<[{ timeoutMs: number }], Promise<ShutdownResult>>('./services/mysteryGameManager.js', 'shutdownAllGames')({ timeoutMs });
         const cleanupResults = await Promise.allSettled([
             loadFunction<[], Promise<void>>('./services/duelPunishment.js', 'shutdown')(),
             loadFunction<[], Promise<void>>('./services/mysteryNicknameLock.js', 'shutdown')(),

@@ -19,6 +19,8 @@ function createDevilRouletteResumeStore({ filePath, now = Date.now } = {}) {
     let snapshots = {}; // gameId -> snapshot object
     let writeQueue = Promise.resolve();
     let lastWriteError = null;
+    let loaded = false;
+    let loading = null;
 
     async function ensureDirectory() {
         try {
@@ -61,66 +63,56 @@ function createDevilRouletteResumeStore({ filePath, now = Date.now } = {}) {
         }
     }
 
-    function queueWrite() {
-        writeQueue = writeQueue.then(
-            () => writeSnapshot(),
-            () => writeSnapshot(),
-        );
+    function queueWrite(mutate) {
+        writeQueue = writeQueue.then(async () => {
+            // A first mutation must never replace snapshots that have not been read.
+            await ensureLoaded();
+            mutate();
+            await writeSnapshot();
+        }).catch(error => {
+            lastWriteError = error;
+            logFailure('loading or writing resume data', error);
+        });
         return writeQueue;
     }
 
-    async function backupMalformedFile() {
-        const parsed = path.parse(filePath);
-        const backupPath = path.join(parsed.dir, `${parsed.name}.corrupt-${now()}${parsed.ext}`);
+    async function ensureLoaded(reload = false) {
+        if (loading) return loading;
+        if (loaded && !reload) return;
+        loaded = false;
+        loading = (async () => {
+            let value;
+            try {
+                value = JSON.parse(await fs.readFile(filePath, 'utf8'));
+                if (!value || Array.isArray(value) || typeof value !== 'object') throw new Error('Resume data must be a JSON object');
+            } catch (error) {
+                // Unreadable or malformed data must block recovery and writes; keep the file intact.
+                if (error.code !== 'ENOENT') throw error;
+                value = {};
+            }
+            snapshots = value;
+            loaded = true;
+        })();
         try {
-            await fs.rename(filePath, backupPath);
-            return true;
-        } catch (error) {
-            logFailure('backing up malformed resume file', error);
-            return false;
+            await loading;
+        } finally {
+            loading = null;
         }
     }
 
     async function load() {
-        try {
-            await writeQueue;
-        } catch (error) {
-            logFailure('waiting before resume load', error);
-        }
-        if (!await ensureDirectory()) {
-            snapshots = {};
-            return;
-        }
-        let serialized;
-        try {
-            serialized = await fs.readFile(filePath, 'utf8');
-        } catch (error) {
-            if (error.code !== 'ENOENT') logFailure('reading resume file', error);
-        }
-        if (serialized !== undefined) {
-            try {
-                const value = JSON.parse(serialized);
-                if (!value || Array.isArray(value) || typeof value !== 'object') throw new Error('Resume data must be a JSON object');
-                snapshots = value;
-            } catch (error) {
-                logFailure('parsing resume file', error);
-                await backupMalformedFile();
-                snapshots = {};
-            }
-        }
+        await writeQueue;
+        await ensureLoaded(true);
     }
 
     function save(gameId, snapshot) {
         if (!gameId || !snapshot || typeof snapshot !== 'object') return;
-        snapshots[gameId] = { ...snapshot, savedAt: now() };
-        void queueWrite();
+        const value = { ...snapshot, savedAt: now() };
+        void queueWrite(() => { snapshots[gameId] = value; });
     }
 
     function remove(gameId) {
-        if (gameId && Object.hasOwn(snapshots, gameId)) {
-            delete snapshots[gameId];
-            void queueWrite();
-        }
+        if (gameId) void queueWrite(() => { delete snapshots[gameId]; });
     }
 
     async function list() {

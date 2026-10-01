@@ -382,7 +382,7 @@ class DevilRouletteGame {
 
     persistNow() {
         // 对局快照落盘（断连接续）。写操作内部串行排队，异步完成，不阻塞渲染。
-        if (this.released) return;
+        if (this.released || this.restoring) return;
         try {
             resumeStore.save(this.id, this.serializeGame());
         } catch (error) {
@@ -391,6 +391,7 @@ class DevilRouletteGame {
     }
 
     deletePersisted() {
+        if (this.restoring) return;
         try {
             resumeStore.remove(this.id);
         } catch (error) {
@@ -796,7 +797,7 @@ class DevilRouletteGame {
     armSettlementTimeoutLocked() {
         // 幂等：胜者超时未选才自动禁言。刷新面板/重渲染会重复调用——
         // 若每次都重置，败者可用「🔄 刷新」无限拖延自动施罚。只武装一次。
-        if (this.settlementArmed) return;
+        if (this.settlementArmed || this.recoveryPaused) return;
         this.settlementArmed = true;
         this.cancelTimerLocked();
         this.turnTimer = this.schedule(
@@ -1036,6 +1037,7 @@ class DevilRouletteGame {
 
     armTimerLocked() {
         this.cancelTimerLocked();
+        if (this.recoveryPaused) return;
         if (this.status === 'challenge') {
             this.turnTimer = this.schedule(
                 () => this.challengeTimeout().catch(error => logDiscordFailure(this, 'challenge-timeout', error)),
@@ -1261,7 +1263,7 @@ class DevilRouletteGame {
         return { embed: this.settlementEmbed(), rows, interactive: rows.length > 0 };
     }
 
-    async renderLocked({ armTimer = true } = {}) {
+    async renderLocked({ armTimer = true, preserveOnFailure = false } = {}) {
         // 断连接续：每次渲染前把当前对局状态落盘（renderLocked 是「状态变更后」的集中出口）。
         this.persistNow();
         const first = this.panels.length === 0;
@@ -1302,20 +1304,23 @@ class DevilRouletteGame {
                 } catch (error2) {
                     logDiscordFailure(this, 'render-fallback-retry', error2);
                 }
-                if (entry) this.mainPanelSent = true;
             }
-            // 主面板从未成功建立 → 彻底收尾，避免游戏隐形空转。
-            if (!this.mainPanelSent) {
-                this.teardownNoSend();
-                return false;
+            if (!entry) {
+                // 主面板从未成功建立 → 彻底收尾，避免游戏隐形空转。
+                if (!this.mainPanelSent) {
+                    if (preserveOnFailure) return false;
+                    this.teardownNoSend();
+                    return false;
+                }
+                if (armTimer && ['challenge', 'playing'].includes(this.status)) {
+                    this.armTimerLocked();
+                } else if (this.status === 'ended') {
+                    this.cancelTimerLocked();
+                    this.ensureReleased();
+                }
+                return true;
             }
-            if (armTimer && ['challenge', 'playing'].includes(this.status)) {
-                this.armTimerLocked();
-            } else if (this.status === 'ended') {
-                this.cancelTimerLocked();
-                this.ensureReleased();
-            }
-            return true;
+            // A successful fallback follows the same panel tracking/persistence path below.
         }
 
         try {
@@ -2295,6 +2300,8 @@ function cleanup(game) {
 function attachDevilShutdown(game) {
     game.onShutdown = async () => {
         game.cancelTimerLocked?.();
+        // Durable state must not wait behind slow or unavailable Discord requests.
+        await resumeStore.flush({ strict: true });
         for (const entry of [...(game.panels || [])]) {
             const msg = entry?.message;
             if (!msg || typeof msg.delete !== 'function') continue;
@@ -2302,53 +2309,46 @@ function attachDevilShutdown(game) {
         }
         game.panels = [];
         game.itemPanelEntry = null;
-        try {
-            await resumeStore.flush();
-        } catch (error) {
-            logDiscordFailure(null, 'resume-flush', error);
-        }
     };
     return game;
 }
 
 // 启动时把上次没打完的恶魔轮盘对局接回来（断连接续）。
-async function restoreActiveGames(client) {
-    let snapshots = [];
-    try {
-        snapshots = await resumeStore.list();
-    } catch (error) {
-        logDiscordFailure(null, 'resume-list', error);
-        return 0;
-    }
+async function restoreActiveGames(client, { deferTimers = false } = {}) {
+    // A read failure must propagate to the startup barrier rather than report an empty recovery.
+    const snapshots = await resumeStore.list();
     let restored = 0;
+    let dropped = 0;
+    let deferred = 0;
     for (const snap of snapshots) {
+        let restoredGame = null;
         try {
-            if (!snap || snap.v !== 1 || !snap.id || !snap.guildId || !snap.channelId) continue;
-            if (snap.mode !== 'pvp') { // 仅支持 PvP 快照；其余（异常/损坏数据）直接清掉。
-                resumeStore.remove(snap.id);
+            if (!snap || snap.v !== 1 || !snap.id || !snap.guildId || !snap.channelId
+                || snap.mode !== 'pvp' || !['challenge', 'playing', 'ended'].includes(snap.status)
+                || (snap.status === 'playing' && !snap.state)
+                || (snap.status === 'ended' && (!snap.penaltyPending || snap.penaltyApplied))) {
+                // Only explicit incompatible or completed states are terminal.
+                if (snap?.id) resumeStore.remove(snap.id);
+                dropped += 1;
                 continue;
             }
             if (gameManager.getGame(snap.id)) continue; // 已恢复
             const guild = client.guilds?.cache?.get(snap.guildId)
-                || await client.guilds.fetch(snap.guildId).catch(() => null);
-            if (!guild) {
-                // 机器人已不在该服，快照失去意义，清掉。
-                resumeStore.remove(snap.id);
-                continue;
-            }
+                || await client.guilds.fetch(snap.guildId);
+            if (!guild) throw new Error('Recovery guild is unavailable');
             const channel = guild.channels?.cache?.get(snap.channelId)
-                || await guild.channels.fetch(snap.channelId).catch(() => null);
-            if (!channel || typeof channel.send !== 'function') {
-                resumeStore.remove(snap.id);
-                continue;
-            }
+                || await guild.channels.fetch(snap.channelId);
+            if (!channel || typeof channel.send !== 'function') throw new Error('Recovery channel is unavailable');
             const game = DevilRouletteGame.restore(snap, { guild, channel });
             // 与正常开局一致：把完整实例交给 gameManager（它克隆成普通对象），再补回类原型，
             // 否则 getGame 拿到的是无方法/无 state 的裸对象，点击一律"已失效"。
             const reg = gameManager.createGame(game);
-            if (!reg.ok) continue; // 锁冲突（启动时理论上不会），快照留着下次再试
+            if (!reg.ok) { deferred += 1; continue; } // Keep the snapshot until its locks can be acquired.
             Object.setPrototypeOf(reg.game, DevilRouletteGame.prototype);
-            const restoredGame = reg.game;
+            restoredGame = reg.game;
+            restoredGame.recoveryPaused = deferTimers;
+            // Do not let failed initial rendering overwrite or delete the last good snapshot.
+            restoredGame.restoring = true;
             restoredGame.onMemberInvalidated = async invalidMember => {
                 const invalidUserId = invalidMember?.id || invalidMember?.user?.id;
                 if (invalidUserId) await handleDevilRouletteMemberInvalidated(restoredGame, invalidUserId);
@@ -2360,28 +2360,67 @@ async function restoreActiveGames(client) {
                 if (!pid) continue;
                 await guild.members.fetch(pid).catch(() => {});
             }
-            // 清掉上次进程残留的旧面板（优雅退出已由 onShutdown 删掉，这里兜底非优雅退出的漏网），
-            // 避免频道里留下点了就"已失效"的死面板；随后 renderLocked 发新面板续接。
+            if (!await restoredGame.renderLocked({ preserveOnFailure: true })) {
+                throw new Error('Recovery panel could not be sent');
+            }
+            restoredGame.restoring = false;
+            restoredGame.persistNow();
+            await resumeStore.flush({ strict: true });
+            // Keep old panels until the new panel and its snapshot are both ready.
             for (const msgId of Array.isArray(snap.panelIds) ? snap.panelIds : []) {
                 if (!msgId) continue;
                 await channel.messages.delete(msgId).catch(() => {});
             }
-            await restoredGame.renderLocked();
             restored += 1;
         } catch (error) {
+            const code = Number(error?.code);
+            const pendingPenalty = snap.status === 'ended' && snap.penaltyPending && !snap.penaltyApplied;
+            if (code === 10004 || (code === 10003 && !pendingPenalty)) {
+                // Discord explicitly confirmed this game no longer has its guild/channel.
+                resumeStore.remove(snap.id);
+                dropped += 1;
+            } else {
+                deferred += 1;
+                if (code === 10003 && pendingPenalty) {
+                    console.error(`[DevilRoulette] 对局 ${snap.id} 的频道已删除，但惩罚尚未结清；快照已保留，需要管理员处置后再恢复神秘功能。`);
+                }
+            }
+            if (restoredGame) {
+                restoredGame.restoring = true;
+                restoredGame.released = true;
+                restoredGame.cancelTimerLocked();
+                await gameManager.cleanupGame(restoredGame);
+                // Any partially sent panels are stale; their cleanup must not remove the snapshot.
+                await Promise.allSettled((restoredGame.panels || []).map(entry => entry.message?.edit?.({ components: [] })));
+            }
             logDiscordFailure(null, 'resume-restore', error, snap?.id);
         }
     }
     if (restored > 0) {
         console.log(`[DevilRoulette] 断连接续：恢复 ${restored} 场未完成的对局。`);
     }
-    return restored;
+    await resumeStore.flush({ strict: true });
+    return { restored, dropped, deferred };
+}
+
+// The module startup barrier releases timers only after every recovery has succeeded.
+function resumeRestoredGames() {
+    for (const game of gameManager.listGames()) {
+        if (game.type !== 'devil_roulette' || !game.recoveryPaused || game.released) continue;
+        game.recoveryPaused = false;
+        if (game.status === 'ended' && game.penaltyPending && !game.penaltyApplied) {
+            game.armSettlementTimeoutLocked();
+        } else {
+            game.armTimerLocked();
+        }
+    }
 }
 
 module.exports = {
     startDevilRoulette,
     handleDevilRouletteInteraction,
     restoreActiveGames,
+    resumeRestoredGames,
     // 供 interactionHandler 路由 rename modal 提交。
     RENAME_MODAL_PREFIX,
 };

@@ -19,11 +19,11 @@ const path = require('node:path');
 const DATA_DIR = mysteryDataPath();
 const STORE_FILE = path.join(DATA_DIR, 'pressureActiveGames.json');
 const TEMP_FILE = `${STORE_FILE}.tmp`;
-let lastWriteError = null;
-const failedMutations = new Set();
+const failedMutations = new Map();
+const PRUNE_MUTATION = Symbol('prune-expired-snapshots');
+const CLEAR_MUTATION = Symbol('clear-snapshots');
 
-// 快照格式版本。以后改了对局状态的形状就 +1，旧快照会被整份丢弃
-// （宁可让那一局失效，也不能拿对不上的数据去恢复）。
+// 不支持的版本保留原文件并阻止恢复/写入，交由明确的数据迁移处理。
 const SNAPSHOT_VERSION = 3;
 
 // 超过这个时间的快照不再恢复：多半是机器人停机很久，玩家早就散了，
@@ -41,21 +41,27 @@ function logFailure(action, error) {
 }
 
 function readStore() {
+    let raw;
     try {
-        if (!fs.existsSync(STORE_FILE)) return { version: SNAPSHOT_VERSION, games: {} };
-        const raw = fs.readFileSync(STORE_FILE, 'utf8');
-        if (!raw.trim()) return { version: SNAPSHOT_VERSION, games: {} };
-        const parsed = JSON.parse(raw);
-        if (parsed?.version !== SNAPSHOT_VERSION || !parsed.games) {
-            // 版本对不上就整份作废，别拿旧形状的数据去拼新逻辑。
-            return { version: SNAPSHOT_VERSION, games: {} };
-        }
-        return parsed;
+        raw = fs.readFileSync(STORE_FILE, 'utf8');
     } catch (error) {
-        // 文件损坏（比如上次写到一半断电）时不能让整个机器人起不来。
-        logFailure('读取快照', error);
-        return { version: SNAPSHOT_VERSION, games: {} };
+        // 只有文件不存在能表示空存储；权限/网络/目录错误不能被解释为没有旧对局。
+        if (error?.code === 'ENOENT') return { version: SNAPSHOT_VERSION, games: {} };
+        throw error;
     }
+    if (!raw.trim()) throw new Error('加压轮盘快照文件为空，保留原文件等待恢复');
+    const parsed = JSON.parse(raw);
+    if (parsed?.version !== SNAPSHOT_VERSION) throw new Error('不支持的加压轮盘快照版本，保留原文件等待迁移');
+    if (!parsed.games || typeof parsed.games !== 'object' || Array.isArray(parsed.games)) {
+        throw new Error('加压轮盘快照 games 必须为对象');
+    }
+    return parsed;
+}
+
+function recordFailure(action, error, mutationId) {
+    logFailure(action, error);
+    failedMutations.set(mutationId, error);
+    return false;
 }
 
 function writeStore(store, mutationId) {
@@ -63,35 +69,39 @@ function writeStore(store, mutationId) {
         ensureDir();
         fs.writeFileSync(TEMP_FILE, JSON.stringify(store), 'utf8');
         fs.renameSync(TEMP_FILE, STORE_FILE);
-        if (mutationId === '*') failedMutations.clear();
-        else failedMutations.delete(mutationId);
-        if (failedMutations.size === 0) lastWriteError = null;
+        // 整份写盘不代表之前失败的另一局已补写成功。
+        failedMutations.delete(mutationId);
         return true;
     } catch (error) {
-        logFailure('写入快照', error);
-        lastWriteError = error;
-        failedMutations.add(mutationId);
-        return false;
+        return recordFailure('写入快照', error, mutationId);
     }
 }
 
 /** 存 / 更新一局的快照。 */
 function saveSnapshot(gameId, snapshot) {
     if (!gameId || !snapshot) return false;
-    const store = readStore();
-    store.games[gameId] = snapshot;
-    store.savedAt = Date.now();
-    return writeStore(store, gameId);
+    try {
+        const store = readStore();
+        store.games[gameId] = snapshot;
+        store.savedAt = Date.now();
+        return writeStore(store, gameId);
+    } catch (error) {
+        return recordFailure('读取后保存快照', error, gameId);
+    }
 }
 
 /** 一局结束（或判定为不可恢复）时把它的快照抹掉。 */
 function deleteSnapshot(gameId) {
     if (!gameId) return false;
-    const store = readStore();
-    if (!store.games[gameId]) return false;
-    delete store.games[gameId];
-    store.savedAt = Date.now();
-    return writeStore(store, gameId);
+    try {
+        const store = readStore();
+        if (!store.games[gameId]) return false;
+        delete store.games[gameId];
+        store.savedAt = Date.now();
+        return writeStore(store, gameId);
+    } catch (error) {
+        return recordFailure('读取后删除快照', error, gameId);
+    }
 }
 
 /**
@@ -106,7 +116,8 @@ function loadSnapshots() {
 
     for (const [gameId, snapshot] of Object.entries(store.games)) {
         const savedAt = Number(snapshot?.savedAt) || 0;
-        if (!savedAt || now - savedAt > MAX_SNAPSHOT_AGE_MS) {
+        // 已进入结算的待办没有过期时间：数据库/Discord 暂时失败不能丢掉战绩。
+        if (!savedAt || (!snapshot?.pendingSettlement && now - savedAt > MAX_SNAPSHOT_AGE_MS)) {
             delete store.games[gameId];
             dropped += 1;
             continue;
@@ -114,17 +125,22 @@ function loadSnapshots() {
         fresh.push(snapshot);
     }
 
-    if (dropped > 0) writeStore(store, '*');
+    if (dropped > 0 && !writeStore(store, PRUNE_MUTATION)) throw failedMutations.get(PRUNE_MUTATION);
     return fresh;
 }
 
-/** 恢复流程跑完后整份清空：能捞的已经捞起来了，捞不动的也不该留着下次再试。 */
+/** 显式清空存储；恢复流程必须逐局处理，不能使用此函数。 */
 function clearAll() {
-    return writeStore({ version: SNAPSHOT_VERSION, games: {}, savedAt: Date.now() }, '*');
+    try {
+        readStore();
+        return writeStore({ version: SNAPSHOT_VERSION, games: {}, savedAt: Date.now() }, CLEAR_MUTATION);
+    } catch (error) {
+        return recordFailure('读取后清空快照', error, CLEAR_MUTATION);
+    }
 }
 
 async function flush({ strict = false } = {}) {
-    if (strict && lastWriteError) throw lastWriteError;
+    if (strict && failedMutations.size > 0) throw [...failedMutations.values()].at(-1);
 }
 
 module.exports = {

@@ -82,6 +82,9 @@ const DISCORD_REST_TIMEOUT_MS = (() => {
     const n = Number(process.env.DISCORD_REST_TIMEOUT_MS);
     return Number.isFinite(n) && n > 0 ? n : 15000;
 })();
+const SHUTDOWN_TIMEOUT_MS = process.env.SHUTDOWN_TIMEOUT_MS === undefined
+    ? Math.min(2147483647, Math.max(30000, Math.ceil(DISCORD_REST_TIMEOUT_MS + 15000)))
+    : Number(process.env.SHUTDOWN_TIMEOUT_MS);
 
 const client = new Client({
     intents: [
@@ -182,13 +185,17 @@ client.once(Events.ClientReady, async (readyClient) => {
     await startTitleGuardSystem(readyClient);
     await startRoleRotationSystem(readyClient);
     await startMessageCleanupSystem(readyClient);
+    let mysteryReady = false;
     try {
         await startMysterySystem(readyClient);
+        mysteryReady = true;
     } catch (error) {
         console.error('❌ 神秘模块恢复失败，原有系统继续运行：', error);
     }
 
-    console.log('\n🤖 机器人已完全启动，所有系统正常运行！');
+    console.log(mysteryReady
+        ? '\n🤖 机器人已完全启动，所有系统正常运行！'
+        : '\n🤖 原有系统已启动；神秘功能因恢复未完成暂不可用。');
 });
 
 client.on(Events.InteractionCreate, interactionCreateHandler);
@@ -200,7 +207,7 @@ client.on(Events.GuildMemberRemove, handleRoleRotationMemberRemove);
 client.on(Events.GuildMemberUpdate, handleMysteryMemberUpdate);
 client.on(Events.GuildMemberRemove, handleMysteryMemberRemove);
 
-gracefulShutdown = installGracefulShutdown({ client, cleanup: stopMysterySystem });
+gracefulShutdown = installGracefulShutdown({ client, cleanup: stopMysterySystem, timeoutMs: SHUTDOWN_TIMEOUT_MS });
 
 function normalizeDiscordToken(raw: string | undefined): string {
     if (!raw) return '';

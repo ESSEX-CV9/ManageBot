@@ -85,6 +85,15 @@ function initializeMysteryStatsDatabase() {
 
         CREATE INDEX IF NOT EXISTS idx_pressure_stats_guild
             ON pressure_player_stats (guild_id);
+
+        -- 留下每局结算凭据，防止提交统计后崩溃、旧快照重放时再次累加。
+        -- 与累计表相互独立；管理员清空排行榜也不能使旧快照重新入账。
+        CREATE TABLE IF NOT EXISTS pressure_game_settlements (
+            guild_id TEXT NOT NULL,
+            game_id TEXT NOT NULL,
+            settled_at INTEGER NOT NULL,
+            PRIMARY KEY (guild_id, game_id)
+        );
     `);
 
     // 老库迁移：CREATE TABLE IF NOT EXISTS 不会给已存在的表加列。
@@ -139,7 +148,14 @@ const upsertStatement = statsDb.prepare(`
         last_played_at = excluded.last_played_at
 `);
 
-const recordTransaction = statsDb.transaction((guildId, rows, playedAt) => {
+const settlementStatement = statsDb.prepare(`
+    INSERT INTO pressure_game_settlements (guild_id, game_id, settled_at)
+    VALUES (?, ?, ?) ON CONFLICT(guild_id, game_id) DO NOTHING
+`);
+
+const recordTransaction = statsDb.transaction((guildId, rows, playedAt, gameId) => {
+    // 凭据与所有玩家的累加在同一事务内：任何一行失败，凭据也必须回滚。
+    if (gameId && settlementStatement.run(guildId, gameId, playedAt).changes === 0) return 0;
     for (const row of rows) {
         const params = { guild_id: guildId, user_id: row.userId, played_at: playedAt };
         for (const column of ADDITIVE_COLUMNS) {
@@ -150,6 +166,7 @@ const recordTransaction = statsDb.transaction((guildId, rows, playedAt) => {
         }
         upsertStatement.run(params);
     }
+    return rows.length;
 });
 
 /**
@@ -157,14 +174,14 @@ const recordTransaction = statsDb.transaction((guildId, rows, playedAt) => {
  * @param {string} guildId
  * @param {Array<object>} rows 每个玩家一行，字段名与表列名一致（外加 userId）
  * @param {number} playedAt
+ * @param {string} [gameId] 对局的持久 ID；游戏运行时必须传入，旧调用方式仍兼容
  * @returns {number} 实际写入的玩家数
  */
-function recordPressureGame(guildId, rows, playedAt = Date.now()) {
+function recordPressureGame(guildId, rows, playedAt = Date.now(), gameId) {
     if (!guildId || !Array.isArray(rows) || rows.length === 0) return 0;
     const valid = rows.filter(row => typeof row?.userId === 'string' && row.userId.length > 0);
     if (valid.length === 0) return 0;
-    recordTransaction(guildId, valid, playedAt);
-    return valid.length;
+    return recordTransaction(guildId, valid, playedAt, gameId);
 }
 
 function getPressurePlayerStats(guildId, userId) {

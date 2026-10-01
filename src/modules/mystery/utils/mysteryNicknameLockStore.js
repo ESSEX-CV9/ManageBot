@@ -2,7 +2,6 @@ const fs = require('node:fs/promises');
 const path = require('node:path');
 
 let temporaryFileSequence = 0;
-let corruptionBackupSequence = 0;
 
 // 身份/业务契约字段不允许通过 update 修改；只有显式列出的可变字段可被更新。
 const IMMUTABLE_LOCK_FIELDS = [
@@ -83,30 +82,20 @@ function createMysteryNicknameLockStore({ filePath, fsImpl = fs, now = Date.now 
     }
 
     function queueMutation(operation) {
-        const next = mutationQueue.catch(() => undefined).then(operation);
+        const next = mutationQueue.catch(() => undefined).then(async () => {
+            await ensureLoaded();
+            return operation();
+        });
         mutationQueue = next;
         return next;
     }
 
-    async function backupMalformedFile() {
-        const parsedPath = path.parse(filePath);
-        const suffix = corruptionBackupSequence++;
-        const backupPath = path.join(
-            parsedPath.dir,
-            `${parsedPath.name}.corrupt-${now()}${suffix ? `-${suffix}` : ''}${parsedPath.ext}`
-        );
+    // 仅在串行 mutation 内调用，保证首次写入前读取完整旧记录。
+    // 无法读取或验证时拒绝写入，不能把未知旧状态当作空文件。
+    async function ensureLoaded() {
+        if (loaded) return;
         try {
-            await fsImpl.rename(filePath, backupPath);
-            return true;
-        } catch (error) {
-            logFailure('backing up malformed lock file', error);
-            return false;
-        }
-    }
-
-    function load() {
-        return queueMutation(async () => {
-            await writeQueue;
+            await writeQueue.catch(() => undefined);
             await ensureDirectory();
 
             let parsed = {};
@@ -116,37 +105,40 @@ function createMysteryNicknameLockStore({ filePath, fsImpl = fs, now = Date.now 
                 serialized = await fsImpl.readFile(filePath, 'utf8');
             } catch (error) {
                 if (error.code === 'ENOENT') shouldWrite = true;
-                else logFailure('reading lock file', error);
+                else throw error;
             }
 
             if (serialized !== undefined) {
-                try {
-                    const value = JSON.parse(serialized);
-                    if (!value || Array.isArray(value) || typeof value !== 'object') {
-                        throw new Error('Mystery nickname lock data must be a JSON object');
-                    }
-                    parsed = value;
-                } catch (error) {
-                    logFailure('parsing lock file', error);
-                    shouldWrite = await backupMalformedFile();
+                const value = JSON.parse(serialized);
+                if (!value || Array.isArray(value) || typeof value !== 'object') {
+                    throw new Error('Mystery nickname lock data must be a JSON object');
                 }
+                parsed = value;
             }
 
-            locks = {};
+            const restored = {};
             for (const record of Object.values(parsed)) {
                 const normalized = normalizeRecord(record);
-                if (!normalized) {
-                    shouldWrite = true;
-                    continue;
+                if (!normalized) throw new Error('Invalid persisted mystery nickname lock');
+                const key = buildMysteryNicknameLockKey(normalized.guildId, normalized.userId);
+                if (Object.hasOwn(restored, key)) {
+                    throw new Error('Duplicate persisted mystery nickname lock');
                 }
-                locks[buildMysteryNicknameLockKey(normalized.guildId, normalized.userId)] = normalized;
+                restored[key] = normalized;
                 if (normalized.type !== record.type) shouldWrite = true;
             }
 
-            loaded = true;
+            locks = restored;
             if (shouldWrite) await queueWrite();
-            return list();
-        });
+            loaded = true;
+        } catch (error) {
+            logFailure('loading lock file', error);
+            throw error;
+        }
+    }
+
+    function load() {
+        return queueMutation(() => list());
     }
 
     function isLoaded() {
@@ -179,6 +171,7 @@ function createMysteryNicknameLockStore({ filePath, fsImpl = fs, now = Date.now 
     }
 
     function save(record) {
+        if (!loaded) throw new Error('Nickname lock store must load before a legacy write');
         const normalized = normalizeRecord(record);
         if (!normalized) return null;
         locks[buildMysteryNicknameLockKey(normalized.guildId, normalized.userId)] = normalized;
@@ -203,6 +196,7 @@ function createMysteryNicknameLockStore({ filePath, fsImpl = fs, now = Date.now 
     }
 
     function removeLegacy(guildId, userId) {
+        if (!loaded) throw new Error('Nickname lock store must load before a legacy write');
         const key = buildMysteryNicknameLockKey(guildId, userId);
         if (!Object.hasOwn(locks, key)) return false;
         delete locks[key];
