@@ -705,6 +705,34 @@ function flushPressureStats(game, outcome, finalAliveIds) {
     }
 }
 
+// 待结算快照已固定胜负，写本地统计不依赖原频道仍然存在。
+// 只重建统计累加器，原快照中的摘牌/惩罚待办保持不变，直到 Discord 收尾完成。
+function flushPendingSettlementStats(snapshot) {
+    const pending = snapshot.pendingSettlement;
+    const rows = snapshot.stats?.players;
+    const validId = value => typeof value === 'string' && ID_PATTERN.test(value);
+    if (!pending || typeof pending !== 'object' || Array.isArray(pending)
+        || !['champion', 'draw', 'aborted', 'cancelled'].includes(pending.outcome)
+        || !Array.isArray(pending.aliveIds) || !pending.aliveIds.every(validId)
+        || new Set(pending.aliveIds).size !== pending.aliveIds.length
+        || !Array.isArray(rows) || rows.length === 0
+        || !rows.every(row => row && typeof row === 'object' && !Array.isArray(row) && validId(row.userId))) {
+        throw new Error('加压轮盘待结算快照格式无效，保留原快照等待修复');
+    }
+    const playerIds = new Set(rows.map(row => row.userId));
+    if (playerIds.size !== rows.length || !pending.aliveIds.every(userId => playerIds.has(userId))) {
+        throw new Error('加压轮盘待结算玩家数据无效，保留原快照等待修复');
+    }
+    flushPressureStats({
+        id: snapshot.id,
+        guildId: snapshot.guildId,
+        stats: {
+            startedAt: snapshot.stats.startedAt,
+            players: new Map(rows.map(row => [row.userId, { ...row }])),
+        },
+    }, pending.outcome, pending.aliveIds);
+}
+
 async function settleGame(game, outcome) {
     let claimed = false;
     // 存活名单必须在临界区里就地快照：下面还有 await，
@@ -2275,8 +2303,17 @@ async function reconcileAliveMembers(game) {
 }
 
 async function restoreOneGame(client, snapshot, { deferTimers = false } = {}) {
-    if (!snapshot?.id || !snapshot.guildId || !snapshot.channelId) return false;
-    if (snapshot.state !== 'playing') return false;
+    const pendingSettlement = snapshot?.pendingSettlement != null;
+    if (!snapshot?.id || !snapshot.guildId || !snapshot.channelId || snapshot.state !== 'playing') {
+        if (pendingSettlement) throw new Error('加压轮盘待结算快照身份或状态无效，保留原快照等待修复');
+        return false;
+    }
+    if (pendingSettlement) flushPendingSettlementStats(snapshot);
+
+    const pendingDiscordFailure = cause => new Error(
+        `加压轮盘统计已幂等提交，Discord 收尾仍待处理，保留结算快照 (guild=${snapshot.guildId}, channel=${snapshot.channelId})`,
+        { cause }
+    );
 
     let guild;
     let channel;
@@ -2284,12 +2321,16 @@ async function restoreOneGame(client, snapshot, { deferTimers = false } = {}) {
         guild = await client.guilds.fetch(snapshot.guildId);
         channel = await client.channels.fetch(snapshot.channelId);
     } catch (error) {
-        // Unknown Guild / Unknown Channel 是终止条件；Missing Access、限流和网络失败可重试。
+        // 待结算的昵称/惩罚收尾仍需保留；不能把原频道删除解释为整局已结清。
+        if (pendingSettlement) throw pendingDiscordFailure(error);
+        // 未结束的局：Unknown Guild / Unknown Channel 是终止条件，其他失败可重试。
         if ([10004, 10003].includes(Number(error?.code))) return false;
         throw error;
     }
-    if (!guild) return false;
-    if (!channel || typeof channel.send !== 'function') return false;
+    if (!guild || !channel || typeof channel.send !== 'function') {
+        if (pendingSettlement) throw pendingDiscordFailure(new Error('原服务器或可发言频道不可用'));
+        return false;
+    }
 
     const created = gameManager.createGame(deserializeGame(snapshot, { guild, channel }));
     if (!created.ok) {
@@ -2299,6 +2340,8 @@ async function restoreOneGame(client, snapshot, { deferTimers = false } = {}) {
         throw new Error(`加压轮盘恢复锁冲突: ${created.reason}`);
     }
     const game = attachRuntime(created.game);
+    // 本次恢复已完成统计事务；只清运行时累加器，磁盘原始统计保留供崩溃重放去重。
+    if (pendingSettlement) game.stats = null;
     game.restoring = true;
     game.recoveryPaused = deferTimers;
 

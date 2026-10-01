@@ -107,7 +107,9 @@ function createDevilRouletteResumeStore({ filePath, now = Date.now } = {}) {
 
     function save(gameId, snapshot) {
         if (!gameId || !snapshot || typeof snapshot !== 'object') return;
-        const value = { ...snapshot, savedAt: now() };
+        // The engine's serialized fields still reference live state. Detach them
+        // before queuing, using the same JSON representation that reaches disk.
+        const value = JSON.parse(JSON.stringify({ ...snapshot, savedAt: now() }));
         void queueWrite(() => { snapshots[gameId] = value; });
     }
 
@@ -117,7 +119,8 @@ function createDevilRouletteResumeStore({ filePath, now = Date.now } = {}) {
 
     async function list() {
         await load();
-        return Object.values(snapshots).filter(snapshot => snapshot && typeof snapshot === 'object');
+        // Restored engines may mutate these objects; keep the stored copies private.
+        return JSON.parse(JSON.stringify(Object.values(snapshots).filter(snapshot => snapshot && typeof snapshot === 'object')));
     }
 
     async function flush({ strict = false } = {}) {
