@@ -27,6 +27,8 @@ import {
     handleCleanupSelect,
 } from '../../modules/messageCleanup';
 
+import { handleMysteryComponent } from '../../modules/mystery';
+
 const INTERACTION_DEBUG_LOG = String(process.env.INTERACTION_DEBUG_LOG || '').toLowerCase() === 'true';
 
 export async function interactionCreateHandler(interaction: Interaction): Promise<void> {
@@ -90,6 +92,9 @@ export async function interactionCreateHandler(interaction: Interaction): Promis
             await command.execute(interaction as unknown as ChatInputCommandInteraction);
             return;
         }
+
+        // 神秘模块统一处理自己的按钮 / 菜单 / 弹窗；其他前缀继续原有分发。
+        if (await handleMysteryComponent(interaction)) return;
 
         // 2. 按钮
         if (interaction.isButton()) {

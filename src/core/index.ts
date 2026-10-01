@@ -18,6 +18,7 @@ import { interactionCreateHandler } from './events/interactionCreate';
 import { messageCreateHandler } from './events/messageCreate';
 import { printTimeConfig } from './config/timeconfig';
 import type { Command } from './types';
+import { installGracefulShutdown } from './shutdown';
 
 // 共享命令
 import pingCommand from '../shared/commands/ping';
@@ -58,8 +59,12 @@ import {
     startMessageCleanupSystem,
 } from '../modules/messageCleanup';
 
+// 7. 神秘指令模块
+import { registerMysteryCommands, startMysterySystem, stopMysterySystem, handleMysteryMemberUpdate, handleMysteryMemberRemove } from '../modules/mystery';
+
 // --- 进程级兜底日志（避免“无响应但控制台无日志”难以排查） ---
 const FATAL_EXIT_ON_EXCEPTION = String(process.env.FATAL_EXIT_ON_EXCEPTION || '').toLowerCase() === 'true';
+let gracefulShutdown: ReturnType<typeof installGracefulShutdown> | undefined;
 
 process.on('unhandledRejection', (reason) => {
     console.error('❌ [Process] unhandledRejection:', reason);
@@ -68,7 +73,8 @@ process.on('unhandledRejection', (reason) => {
 process.on('uncaughtException', (err) => {
     console.error('❌ [Process] uncaughtException:', err);
     if (FATAL_EXIT_ON_EXCEPTION) {
-        process.exit(1);
+        if (gracefulShutdown) void gracefulShutdown('uncaughtException', 1);
+        else process.exit(1);
     }
 });
 
@@ -144,6 +150,9 @@ client.commands.set(callFrogCommand.data.name, callFrogCommand);
 // 6. 紧急消息冲水命令注册
 client.commands.set(messageCleanupCommand.data.name, messageCleanupCommand);
 
+// 7. 神秘命令注册（冲突检查不覆盖原命令）
+registerMysteryCommands(client);
+
 // 测试命令仅在测试模式下注册（生产环境不会出现 /募选测试）
 if (isElectionTestMode()) {
     client.commands.set(electionTestCommand.data.name, electionTestCommand);
@@ -173,6 +182,11 @@ client.once(Events.ClientReady, async (readyClient) => {
     await startTitleGuardSystem(readyClient);
     await startRoleRotationSystem(readyClient);
     await startMessageCleanupSystem(readyClient);
+    try {
+        await startMysterySystem(readyClient);
+    } catch (error) {
+        console.error('❌ 神秘模块恢复失败，原有系统继续运行：', error);
+    }
 
     console.log('\n🤖 机器人已完全启动，所有系统正常运行！');
 });
@@ -183,6 +197,10 @@ client.on(Events.MessageDelete, messageCleanupMessageDeleteHandler);
 client.on(Events.MessageBulkDelete, messageCleanupMessageBulkDeleteHandler);
 client.on(Events.GuildMemberUpdate, handleRoleRotationMemberUpdate);
 client.on(Events.GuildMemberRemove, handleRoleRotationMemberRemove);
+client.on(Events.GuildMemberUpdate, handleMysteryMemberUpdate);
+client.on(Events.GuildMemberRemove, handleMysteryMemberRemove);
+
+gracefulShutdown = installGracefulShutdown({ client, cleanup: stopMysterySystem });
 
 function normalizeDiscordToken(raw: string | undefined): string {
     if (!raw) return '';
